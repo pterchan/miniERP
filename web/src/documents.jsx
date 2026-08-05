@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import api from './api'
+import DataTable, { toServerFilters } from './data-table'
 import { buildInventoryByProduct, formatMoney, formatQuantity } from './list-utils'
 import { can, canView } from './roles'
 import {
@@ -41,10 +42,34 @@ function GroupHub({ group, user }) {
 function DocumentList({ docType, user }) {
   const { navigate } = useRouter()
   const cfg = DOC_TYPE_CONFIG[docType]
-  const [rows, setRows] = useState([])
   const [error, setError] = useState(null)
-  useEffect(() => { api.documents({ doc_type: docType }).then(r => setRows(r.items || [])).catch(setError) }, [docType])
-  return <section><PageHeading eyebrow={DOC_GROUP_LABELS[cfg.group]} title={cfg.label} description="自动编号、草稿保存；过账后仅可红冲作废。">{canCreateDoc(user, docType) && <Button className="primary" onClick={() => navigate(`/${cfg.group}/${docType.toLowerCase()}/new`)}>＋ 新建</Button>}</PageHeading><div className="panel"><ErrorBox error={error} />{rows.length ? <div className="record-list">{rows.map(d => <Link className="record-card" key={d.document_id} to={`/${cfg.group}/${docType.toLowerCase()}/${d.document_id}`}><div><strong>{d.doc_no}</strong><span>{d.doc_date} · {d.party_name || '—'} · {d.line_count || 0} 条{d.posted_by ? ` · 过账 ${d.posted_by}` : ''}</span></div><div className="record-value"><Badge tone={badgeTone(d.status)}>{statusLabel(d.status)}</Badge><small>{d.total_amount != null ? `¥ ${formatMoney(d.total_amount)}` : '—'}</small></div></Link>)}</div> : <Empty>暂无单据</Empty>}</div></section>
+  const fetchDocuments = useCallback(p => api.documents({ ...p, doc_type: docType }), [docType])
+  const pageExtra = useMemo(() => ({ docType }), [docType])
+  const columns = useMemo(() => [
+    { key: 'doc_no', label: '单号', filterType: 'text' },
+    { key: 'doc_type_label', label: '类型' },
+    { key: 'doc_date', label: '日期' },
+    { key: 'party_name', label: '往来方', filterType: 'text', value: r => r.party_name || '—' },
+    { key: 'total_amount', label: '金额', align: 'end', value: r => r.total_amount != null ? `¥ ${formatMoney(r.total_amount)}` : '—' },
+    { key: 'status', label: '状态', filterType: 'select', filterOptions: [{ value: 'DRAFT', label: '草稿' }, { value: 'SUBMITTED', label: '已提交' }, { value: 'POSTED', label: '已过账' }, { value: 'REVERSED', label: '已红冲' }], render: r => statusLabel(r.status) },
+    { key: 'line_count', label: '明细数', value: r => r.line_count || 0 },
+    { key: 'posted_by', label: '过账人', value: r => r.posted_by || '—' },
+  ], [])
+  return <section><PageHeading eyebrow={DOC_GROUP_LABELS[cfg.group]} title={cfg.label} description="自动编号、草稿保存；过账后仅可红冲作废。">{canCreateDoc(user, docType) && <Button className="primary" onClick={() => navigate(`/${cfg.group}/${docType.toLowerCase()}/new`)}>＋ 新建</Button>}</PageHeading><div className="panel"><ErrorBox error={error} /><DataTable
+    mode="server"
+    columns={columns}
+    fetchData={fetchDocuments}
+    pageExtra={pageExtra}
+    rowKey={d => String(d.document_id)}
+    rowHref={d => `/${cfg.group}/${docType.toLowerCase()}/${d.document_id}`}
+    onError={setError}
+    exportConfig={{
+      endpoint: '/api/documents/export',
+      filename: cfg.label,
+      allScope: 'server',
+      buildParams: ({ q, filters, sortKey, sortDir }, extra) => ({ doc_type: extra.docType, f: toServerFilters(filters, columns), sort: sortKey || '', order: sortDir }),
+    }}
+  /></div></section>
 }
 
 function DocumentForm({ docType, id, user }) {

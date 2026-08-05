@@ -6,6 +6,8 @@
 
 - `db/migrations/001_inventory.sql`：PostgreSQL DDL、暂存审计层、货品/库位、库存流水、序列资产及四个查询视图。
 - `db/migrations/002_erp_oa.sql`：用户/会话、仓管审批、申请单、不可变审计和单位字典扩展；不做隐式单位换算。
+- `db/migrations/003_full_erp.sql`：RBAC 角色、商品分类、客户/供应商、通用业务单据、应收应付与 BYTEA 附件。
+- `db/migrations/004_product_images.sql`：货品附图元数据表（字节存 MinIO，`product_image` 带审计触发器）。
 - `api/`：FastAPI API；HttpOnly 会话 Cookie + CSRF、仓管/申请人角色、产品搜索、申请审批/放行、冲突和审计接口。
 - `ocr_service/`：独立离线 RapidOCR 产品标签识别服务；不访问商品库、不写数据库，ERP 只通过 `/api/ocr/extract` 薄代理调用。
 - `web/`：Vite/React 响应式桌面/手机界面。
@@ -34,6 +36,8 @@ python3 scripts/import_inventory.py \
 ```sh
 psql "$DATABASE_URL" -f db/migrations/001_inventory.sql
 psql "$DATABASE_URL" -f db/migrations/002_erp_oa.sql
+psql "$DATABASE_URL" -f db/migrations/003_full_erp.sql
+psql "$DATABASE_URL" -f db/migrations/004_product_images.sql
 ```
 
 迁移只创建结构和参考数据，不会凭空生成可信期初余额。审核产品解析、库位、切账日期和期初量后，才可把候选流水转为 `status_id = posted`。余额视图只计算已过账流水；`inventory_snapshot` 仅用于与工作簿现有库存对账。
@@ -45,15 +49,17 @@ python3 -m unittest discover -s tests -v
 python3 -m py_compile scripts/import_inventory.py
 ```
 
+部分测试需要本地具备 `cryptography`、`openpyxl`、`fastapi`、`minio` 等运行依赖（容器内已内置）；建议在 `api/requirements.txt` 的虚拟环境或容器中运行。前端单测在 `web/` 下执行 `npm test`。
+
 ## Docker POC
 
-复制 `.env.example` 为 `.env`，设置数据库、会话和两个初始账号密码后启动：
+复制 `.env.example` 为 `.env`，设置数据库、会话、两个初始账号密码以及 `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY`（MinIO 根凭据：access key 3–20 字符、secret key 8–40 字符）后启动：
 
 ```sh
 docker compose up --build
 ```
 
-浏览器打开 `http://localhost`。数据库容器首次初始化会按文件名顺序执行两份迁移；后续使用同一持久化卷不会重复执行。需要导入工作簿时，在能访问数据库的环境执行：
+浏览器打开 `http://localhost`。数据库容器首次初始化会按文件名顺序执行四份迁移；后续使用同一持久化卷不会重复执行。**已有卷（本地或 UAT）升级时需手动补跑一次 `004`**：`docker compose exec postgres psql -U inventory -d inventory -f /docker-entrypoint-initdb.d/004_product_images.sql`。`minio` 服务随栈启动，货品附图经 API 上传/展示，MinIO 仅内网。需要导入工作簿时，在能访问数据库的环境执行：
 
 ```sh
 IMPORT_WORKBOOK_PASSWORD='在此输入密码' \
@@ -76,7 +82,7 @@ python3 scripts/seed_inventory.py --input /path/to/workbook.xlsx \
 
 ## 远程部署（示例配置）
 
-`deploy/deploy_remote.sh` 使用 SSH 将当前代码上传到 `${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_DIR}`，在本地构建前端静态资源，再启动 PostgreSQL、OCR、API 和 Web 四个服务。目标机不需要从 Docker Hub 拉取 Node/Nginx 镜像；Web 使用已缓存的 Python 基础镜像提供静态文件并反代 `/api`。
+`deploy/deploy_remote.sh` 使用 SSH 将当前代码上传到 `${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_DIR}`，在本地构建前端静态资源，再启动 PostgreSQL、MinIO、OCR、API 和 Web 五个服务。目标机不需要从 Docker Hub 拉取 Node/Nginx 镜像；Web 使用已缓存的 Python 基础镜像提供静态文件并反代 `/api`，MinIO 使用 Compose 中配置的镜像版本。远端 `.env` 会自动生成 MinIO 根凭据。
 
 首次部署并导入加密工作簿：
 

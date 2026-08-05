@@ -4,8 +4,9 @@ import './styles.css'
 import api from './api'
 import { findProductMatches } from './scan-utils'
 import { ScanStateHeading } from './scan-ui'
-import { BalanceList, ProductRows } from './dense-lists'
-import { buildInventoryByProduct, enrichInventoryRows, fetchAllProductPages, formatMoney, formatQuantity } from './list-utils'
+import DataTable, { toServerFilters } from './data-table'
+import ProductGallery from './product-gallery'
+import { buildInventoryByProduct, enrichInventoryRows, fetchAllProductPages, formatInventorySummary, formatMoney, formatQuantity } from './list-utils'
 import { isNavigationItemActive, normalizePath } from './navigation-utils'
 import { ROLE_LABELS, can, canView } from './roles'
 import { documentRoute } from './documents'
@@ -60,37 +61,71 @@ function Layout({ user, children, onLogout }) {
 }
 
 function Dashboard() {
-  const [rows, setRows] = useState([]); const [catalog, setCatalog] = useState([]); const [q, setQ] = useState(''); const [error, setError] = useState(null); const [catalogError, setCatalogError] = useState(false)
+  const [rows, setRows] = useState([]); const [catalog, setCatalog] = useState([]); const [error, setError] = useState(null); const [catalogError, setCatalogError] = useState(false)
   useEffect(() => {
     api.inventory().then(setRows).catch(setError)
     api.productCatalog().then(setCatalog).catch(() => setCatalogError(true))
   }, [])
   const enrichedRows = useMemo(() => enrichInventoryRows(rows, catalog), [rows, catalog])
-  const normalizedQuery = q.trim().toLowerCase()
-  const filtered = enrichedRows.filter(row => !normalizedQuery || [row.identifier, row.product_name, row.manufacturer, row.specification, row.location_name, row.condition_code, row.uom_code].some(value => String(value || '').toLowerCase().includes(normalizedQuery)))
   const productCount = new Set(rows.map(row => row.product_id)).size
   const locationCount = new Set(rows.map(row => row.location_id)).size
-  return <section><PageHeading eyebrow="总览" title="库存工作台" description="按编号、货品、库位、成色和单位查看已过账余额。" /><div className="stats"><div className="stat"><span>库存维度</span><strong>{rows.length}</strong></div><div className="stat teal"><span>货品数</span><strong>{productCount}</strong></div><div className="stat"><span>库位数</span><strong>{locationCount}</strong></div></div><div className="panel"><div className="panel-head"><div><h2>库存余额</h2><p className="muted">余额来自已过账流水；不同单位分别展示。</p></div><input className="search" placeholder="搜索编号、货品、厂家、规格或库位" value={q} onChange={e => setQ(e.target.value)} /></div><ErrorBox error={error} />{catalogError && <div className="alert warning compact">货品编号暂未加载，库存余额仍可正常查看。</div>}{filtered.length ? <BalanceList rows={filtered} LinkComponent={Link} /> : <Empty>没有匹配的库存</Empty>}</div></section>
+  const conditionOptions = useMemo(() => [...new Set(enrichedRows.map(r => r.condition_code).filter(Boolean))].map(c => ({ value: c, label: c })), [enrichedRows])
+  const columns = useMemo(() => [
+    { key: 'identifier', label: '业务编号', value: r => r.identifier || '—' },
+    { key: 'product_name', label: '货品名称', filterType: 'search', searchKeys: ['identifier', 'product_name', 'manufacturer', 'specification', 'location_name', 'condition_code', 'uom_code'] },
+    { key: 'location_name', label: '库位', filterType: 'text', value: r => r.location_name || '—' },
+    { key: 'condition_code', label: '成色', filterType: 'select', filterOptions: conditionOptions, value: r => r.condition_code || '—' },
+    { key: 'on_hand_quantity', label: '现库存', align: 'end', value: r => formatQuantity(r.on_hand_quantity) },
+    { key: 'uom_code', label: '单位', value: r => r.uom_code || '—' },
+  ], [conditionOptions])
+  const inventoryKey = r => `${r.product_id}:${r.location_id}:${r.condition_id}:${r.uom_id}`
+  return <section><PageHeading eyebrow="总览" title="库存工作台" description="按编号、货品、库位、成色和单位查看已过账余额。" /><div className="stats"><div className="stat"><span>库存维度</span><strong>{rows.length}</strong></div><div className="stat teal"><span>货品数</span><strong>{productCount}</strong></div><div className="stat"><span>库位数</span><strong>{locationCount}</strong></div></div><div className="panel"><div className="panel-head"><div><h2>库存余额</h2><p className="muted">余额来自已过账流水；不同单位分别展示。</p></div></div><ErrorBox error={error} />{catalogError && <div className="alert warning compact">货品编号暂未加载，库存余额仍可正常查看。</div>}<DataTable
+    mode="client"
+    columns={columns}
+    rows={enrichedRows}
+    rowKey={inventoryKey}
+    rowHref={r => `/inventory/${r.product_id}/${r.location_id}/${r.condition_id}/${r.uom_id}`}
+    exportConfig={{
+      endpoint: '/api/inventory/balance/export',
+      filename: '库存余额',
+      allScope: 'server',
+      buildParams: ({ q, filters, sortKey, sortDir }) => ({ q, f: toServerFilters(filters, columns), sort: sortKey || '', order: sortDir }),
+    }}
+  /></div></section>
 }
 
 function ProductList({ user }) {
-  const { navigate } = useRouter(); const [q, setQ] = useState(''); const [rows, setRows] = useState([]); const [inventoryRows, setInventoryRows] = useState([]); const [loading, setLoading] = useState(false); const [error, setError] = useState(null); const [inventoryStatus, setInventoryStatus] = useState('loading')
+  const { navigate } = useRouter(); const [inventoryRows, setInventoryRows] = useState([]); const [inventoryStatus, setInventoryStatus] = useState('loading'); const [error, setError] = useState(null)
   useEffect(() => {
     let active = true
     api.inventory().then(result => { if (active) { setInventoryRows(result); setInventoryStatus('ready') } }).catch(() => { if (active) setInventoryStatus('error') })
     return () => { active = false }
   }, [])
-  useEffect(() => {
-    let active = true
-    const id = setTimeout(() => {
-      setLoading(true)
-      setError(null)
-      api.products(q).then(result => { if (active) setRows(result.items || []) }).catch(err => { if (active) setError(err) }).finally(() => { if (active) setLoading(false) })
-    }, 180)
-    return () => { active = false; clearTimeout(id) }
-  }, [q])
   const inventoryByProduct = useMemo(() => buildInventoryByProduct(inventoryRows), [inventoryRows])
-  return <section><PageHeading eyebrow="主数据" title="货品" description="搜索并维护编号、名称、厂家、规格、库存和单位。">{user.role === 'ADMIN' && <Button className="primary" onClick={() => navigate('/products/new')}>＋ 新增货品</Button>}</PageHeading><div className="panel"><input className="search large" placeholder="编号、名称、厂家或型号" value={q} onChange={e => setQ(e.target.value)} />{inventoryStatus === 'error' && <div className="alert warning compact">库存汇总暂未加载，货品主数据仍可正常查看。</div>}{error ? <ErrorBox error={error} /> : loading ? <Empty>搜索中…</Empty> : rows.length ? <ProductRows rows={rows} inventoryByProduct={inventoryByProduct} inventoryAvailable={inventoryStatus === 'ready'} LinkComponent={Link} /> : <Empty>没有匹配的货品</Empty>}</div></section>
+  const inventoryAvailable = inventoryStatus === 'ready'
+  const fetchProducts = useCallback(p => api.products(p), [])
+  const columns = useMemo(() => [
+    { key: 'identifier', label: '业务编号', value: r => r.identifier || '—' },
+    { key: 'display_name', label: '货品名称', filterType: 'search' },
+    { key: 'manufacturer', label: '厂家', filterType: 'text', value: r => r.manufacturer || '—' },
+    { key: 'specification', label: '规格 / 型号', filterType: 'text', value: r => r.specification || '—' },
+    { key: 'stock', label: '现库存', align: 'end', sortable: false, value: r => { const summary = inventoryAvailable ? formatInventorySummary(inventoryByProduct.get(String(r.product_id))) : '—'; return summary === '无库存' ? `无库存 · ${r.uom_code || '—'}` : summary } },
+    { key: 'uom_code', label: '默认单位', value: r => r.uom_code || '—' },
+  ], [inventoryByProduct, inventoryAvailable])
+  return <section><PageHeading eyebrow="主数据" title="货品" description="搜索并维护编号、名称、厂家、规格、库存和单位。">{user.role === 'ADMIN' && <Button className="primary" onClick={() => navigate('/products/new')}>＋ 新增货品</Button>}</PageHeading><div className="panel">{inventoryStatus === 'error' && <div className="alert warning compact">库存汇总暂未加载，货品主数据仍可正常查看。</div>}<ErrorBox error={error} /><DataTable
+    mode="server"
+    columns={columns}
+    fetchData={fetchProducts}
+    rowKey={r => String(r.product_id)}
+    rowHref={r => `/products/${r.product_id}`}
+    onError={setError}
+    exportConfig={{
+      endpoint: '/api/products/export',
+      filename: '货品',
+      allScope: 'server',
+      buildParams: ({ q, filters, sortKey, sortDir }) => ({ q, f: toServerFilters(filters, columns), sort: sortKey || '', order: sortDir }),
+    }}
+  /></div></section>
 }
 
 function ProductForm({ id }) {
@@ -106,7 +141,8 @@ function ProductDetail({ id, user }) {
   const { navigate } = useRouter(); const [data, setData] = useState(null); const [error, setError] = useState(null)
   useEffect(() => { api.product(id).then(setData).catch(setError) }, [id])
   if (error) return <section><Back to="/products" /><ErrorBox error={error} /></section>; if (!data) return <Loading />
-  return <section><Back to="/products" /><PageHeading eyebrow="货品详情" title={data.display_name} description={data.manufacturer || '未填写厂家'}>{user.role === 'ADMIN' && <Button className="primary" onClick={() => navigate(`/products/${id}/edit`)}>编辑</Button>}</PageHeading><div className="detail-grid"><div className="panel"><h2>主数据</h2><dl className="detail-list"><dt>来源编号</dt><dd>{data.primary_identifier?.value_raw || '—'}</dd><dt>规格/型号</dt><dd>{data.specification || '—'}</dd><dt>默认单位</dt><dd>{data.uom_display_name || data.uom_code || '—'}</dd><dt>原始单位</dt><dd>{data.source_uom_raw || '—'}</dd><dt>更新时间</dt><dd>{data.updated_at ? new Date(data.updated_at).toLocaleString() : '—'}</dd></dl>{data.identifier_conflicts?.length > 0 && <div className="alert warning">此编号还被 {data.identifier_conflicts.length} 个货品使用，请在冲突中心或详情中复核。</div>}</div><div className="panel"><h2>历史编号</h2>{data.identifiers?.length ? <div className="tag-list">{data.identifiers.map(x => <Badge key={x.product_identifier_id} tone={x.is_primary ? 'teal' : 'neutral'}>{x.value_raw}</Badge>)}</div> : <Empty>暂无编号</Empty>}</div></div></section>
+  const canEdit = user.role === 'ADMIN' || user.role === 'WAREHOUSE'
+  return <section><Back to="/products" /><PageHeading eyebrow="货品详情" title={data.display_name} description={data.manufacturer || '未填写厂家'}>{user.role === 'ADMIN' && <Button className="primary" onClick={() => navigate(`/products/${id}/edit`)}>编辑</Button>}</PageHeading><div className="detail-grid"><div className="panel"><h2>主数据</h2><dl className="detail-list"><dt>来源编号</dt><dd>{data.primary_identifier?.value_raw || '—'}</dd><dt>规格/型号</dt><dd>{data.specification || '—'}</dd><dt>默认单位</dt><dd>{data.uom_display_name || data.uom_code || '—'}</dd><dt>原始单位</dt><dd>{data.source_uom_raw || '—'}</dd><dt>更新时间</dt><dd>{data.updated_at ? new Date(data.updated_at).toLocaleString() : '—'}</dd></dl>{data.identifier_conflicts?.length > 0 && <div className="alert warning">此编号还被 {data.identifier_conflicts.length} 个货品使用，请在冲突中心或详情中复核。</div>}</div><div className="panel"><h2>历史编号</h2>{data.identifiers?.length ? <div className="tag-list">{data.identifiers.map(x => <Badge key={x.product_identifier_id} tone={x.is_primary ? 'teal' : 'neutral'}>{x.value_raw}</Badge>)}</div> : <Empty>暂无编号</Empty>}</div></div><div className="panel"><h2>图片</h2><ProductGallery productId={id} canEdit={canEdit} /></div></section>
 }
 
 function ScanPicker({ onAdd }) {
@@ -161,8 +197,23 @@ function blobToBase64(blob) { return new Promise((resolve, reject) => { const re
 
 function RequestList({ user }) {
   const { navigate } = useRouter(); const [rows, setRows] = useState([]); const [error, setError] = useState(null)
-  const reload = () => api.requests().then(setRows).catch(setError); useEffect(() => { reload() }, [])
-  return <section><PageHeading eyebrow="OA 流程" title={can(user, 'WAREHOUSE', 'ADMIN') ? '审批队列' : '我的申请'} description="每一条申请都可以进入详情；草稿支持继续编辑。"><Button className="primary" onClick={() => navigate('/requests/new')}>＋ 新建申请</Button></PageHeading><div className="panel"><ErrorBox error={error} />{rows.length ? <div className="record-list">{rows.map(r => <Link className="record-card" key={r.stock_request_id} to={`/requests/${r.stock_request_id}`}><div><strong>{r.request_no}</strong><span>{r.request_type} · {r.requester_display_name || r.requester_username || '—'}</span></div><div className="record-value"><Badge tone={r.status === 'RELEASED' ? 'green' : r.status === 'REJECTED' ? 'red' : 'amber'}>{r.status}</Badge><small>{r.line_count || 0} 条明细</small></div></Link>)}</div> : <Empty>暂无申请</Empty>}</div></section>
+  useEffect(() => { api.requests().then(setRows).catch(setError) }, [])
+  const columns = useMemo(() => [
+    { key: 'request_no', label: '单号', filterType: 'search' },
+    { key: 'request_type', label: '类型', filterType: 'select', filterOptions: [{ value: 'RECEIPT', label: '入库' }, { value: 'ISSUE_OTHER', label: '出库' }, { value: 'TRANSFER', label: '调货' }, { value: 'RETURN', label: '退回' }] },
+    { key: 'requester', label: '申请人', value: r => r.requester_display_name || r.requester_username || '—' },
+    { key: 'status', label: '状态', filterType: 'select', filterOptions: [{ value: 'DRAFT', label: '草稿' }, { value: 'SUBMITTED', label: '已提交' }, { value: 'APPROVED', label: '已审批' }, { value: 'RELEASED', label: '已放行' }, { value: 'REJECTED', label: '已驳回' }] },
+    { key: 'line_count', label: '明细数', value: r => r.line_count || 0 },
+    { key: 'created_at', label: '时间', value: r => r.created_at ? new Date(r.created_at).toLocaleString() : '—' },
+  ], [])
+  return <section><PageHeading eyebrow="OA 流程" title={can(user, 'WAREHOUSE', 'ADMIN') ? '审批队列' : '我的申请'} description="每一条申请都可以进入详情；草稿支持继续编辑。"><Button className="primary" onClick={() => navigate('/requests/new')}>＋ 新建申请</Button></PageHeading><div className="panel"><ErrorBox error={error} /><DataTable
+    mode="client"
+    columns={columns}
+    rows={rows}
+    rowKey={r => String(r.stock_request_id)}
+    rowHref={r => `/requests/${r.stock_request_id}`}
+    exportConfig={{ endpoint: '/api/stock-requests/export', filename: '库存申请', allScope: 'ids' }}
+  /></div></section>
 }
 
 function RequestForm({ id, initial, prefillProductId }) {
@@ -189,7 +240,21 @@ function RequestDetail({ id, user }) {
 
 function AdminPage() {
   const [users, setUsers] = useState([]); const [locations, setLocations] = useState([]); const [error, setError] = useState(null); const { navigate } = useRouter(); const reload = () => Promise.all([api.users(), api.locations()]).then(([u, l]) => { setUsers(u); setLocations(l) }).catch(setError); useEffect(() => { reload() }, [])
-  return <section><PageHeading eyebrow="系统管理" title="用户与库位" description="稳定编码不可改，业务字段修改会留下审计。"><div className="actions"><Button className="primary" onClick={() => navigate('/admin/users/new')}>＋ 用户</Button><Button className="secondary" onClick={() => navigate('/admin/locations/new')}>＋ 库位</Button></div></PageHeading><ErrorBox error={error} /><div className="panel"><h2>用户</h2><div className="record-list">{users.map(u => <Link className="record-card" key={u.user_id} to={`/admin/users/${u.user_id}`}><div><strong>{u.display_name}</strong><span>{u.username} · {ROLE_LABELS[u.role] || u.role}</span></div><Badge tone={u.is_active ? 'green' : 'red'}>{u.is_active ? '启用' : '停用'}</Badge></Link>)}</div></div><div className="panel"><h2>库位</h2><div className="record-list">{locations.map(l => <Link className="record-card" key={l.location_id} to={`/admin/locations/${l.location_id}`}><div><strong>{l.name}</strong><span>{l.code || '无编码'} · {l.location_type}</span></div><Badge tone={l.is_active ? 'green' : 'red'}>{l.is_active ? '启用' : '停用'}</Badge></Link>)}</div></div></section>
+  const userColumns = useMemo(() => [
+    { key: 'display_name', label: '显示名', filterType: 'search', searchKeys: ['display_name', 'username'] },
+    { key: 'username', label: '用户名' },
+    { key: 'role', label: '角色', filterType: 'select', filterOptions: Object.entries(ROLE_LABELS).map(([value, label]) => ({ value, label })) },
+    { key: 'is_active', label: '状态', filterType: 'select', filterOptions: [{ value: 'true', label: '启用' }, { value: 'false', label: '停用' }], value: r => r.is_active, render: r => r.is_active ? '启用' : '停用' },
+    { key: 'created_at', label: '创建时间', value: r => r.created_at ? new Date(r.created_at).toLocaleDateString() : '—' },
+  ], [])
+  const locationColumns = useMemo(() => [
+    { key: 'name', label: '名称', filterType: 'search', searchKeys: ['name', 'code'] },
+    { key: 'code', label: '编码', value: r => r.code || '无编码' },
+    { key: 'location_type', label: '类型', filterType: 'select', filterOptions: [{ value: 'warehouse', label: '仓库' }, { value: 'hospital', label: '医院' }, { value: 'department', label: '科室' }, { value: 'customer', label: '客户' }, { value: 'external', label: '外部' }, { value: 'transit', label: '在途' }, { value: 'other', label: '其他' }] },
+    { key: 'is_company_inventory', label: '公司库存', filterType: 'select', filterOptions: [{ value: 'true', label: '是' }, { value: 'false', label: '否' }], value: r => r.is_company_inventory, render: r => r.is_company_inventory ? '是' : '否' },
+    { key: 'is_active', label: '状态', filterType: 'select', filterOptions: [{ value: 'true', label: '启用' }, { value: 'false', label: '停用' }], value: r => r.is_active, render: r => r.is_active ? '启用' : '停用' },
+  ], [])
+  return <section><PageHeading eyebrow="系统管理" title="用户与库位" description="稳定编码不可改，业务字段修改会留下审计。"><div className="actions"><Button className="primary" onClick={() => navigate('/admin/users/new')}>＋ 用户</Button><Button className="secondary" onClick={() => navigate('/admin/locations/new')}>＋ 库位</Button></div></PageHeading><ErrorBox error={error} /><div className="panel"><h2>用户</h2><DataTable mode="client" columns={userColumns} rows={users} rowKey={u => String(u.user_id)} rowHref={u => `/admin/users/${u.user_id}`} exportConfig={{ endpoint: '/api/admin/users/export', filename: '用户', allScope: 'ids' }} /></div><div className="panel"><h2>库位</h2><DataTable mode="client" columns={locationColumns} rows={locations} rowKey={l => String(l.location_id)} rowHref={l => `/admin/locations/${l.location_id}`} exportConfig={{ endpoint: '/api/locations/export', filename: '库位', allScope: 'ids' }} /></div></section>
 }
 
 function UserForm({ id }) {
@@ -218,7 +283,11 @@ const CONFLICT_TYPE_LABELS = {
   other: '待复核',
 }
 
-function Conflicts() { const [rows, setRows] = useState([]); const [error, setError] = useState(null); useEffect(() => { api.conflicts().then(setRows).catch(setError) }, []); return <section><PageHeading eyebrow="数据治理" title="冲突中心" description="需要人工确认的编号、名称、流水和主数据问题。" /><div className="panel"><ErrorBox error={error} />{rows.length ? <div className="record-list">{rows.map(c => { const summary = [c.source_identifier || c.source_name, c.movement_type_code ? `历史流水 ${c.movement_type_code}` : '', c.resolution_notes].filter(Boolean).join(' · '); return <Link className="record-card" key={c.resolution_case_id} to={`/conflicts/${c.resolution_case_id}`}><div><strong>{CONFLICT_TYPE_LABELS[c.case_type] || c.case_type}</strong><span>{summary || '需要人工确认'}</span></div><Badge tone={c.status_code === 'pending_review' ? 'amber' : 'red'}>{c.status_code === 'pending_review' ? '待处理' : c.status_code}</Badge></Link> })}</div> : <Empty>没有待处理冲突</Empty>}</div></section> }
+function Conflicts() { const [rows, setRows] = useState([]); const [error, setError] = useState(null); useEffect(() => { api.conflicts().then(setRows).catch(setError) }, []); const columns = useMemo(() => [
+  { key: 'case_type', label: '类型', filterType: 'select', filterOptions: Object.entries(CONFLICT_TYPE_LABELS).map(([value, label]) => ({ value, label })), render: r => CONFLICT_TYPE_LABELS[r.case_type] || r.case_type },
+  { key: 'summary', label: '摘要', filterType: 'text', value: r => [r.source_identifier || r.source_name, r.movement_type_code ? `历史流水 ${r.movement_type_code}` : '', r.resolution_notes].filter(Boolean).join(' · ') || '需要人工确认' },
+  { key: 'status_code', label: '状态', filterType: 'select', filterOptions: [{ value: 'pending_review', label: '待处理' }, { value: 'resolved', label: '已处理' }], render: r => r.status_code === 'pending_review' ? '待处理' : r.status_code },
+], []); return <section><PageHeading eyebrow="数据治理" title="冲突中心" description="需要人工确认的编号、名称、流水和主数据问题。" /><div className="panel"><ErrorBox error={error} /><DataTable mode="client" columns={columns} rows={rows} rowKey={c => String(c.resolution_case_id)} rowHref={c => `/conflicts/${c.resolution_case_id}`} exportConfig={{ endpoint: '/api/conflicts/export', filename: '冲突', allScope: 'ids' }} /></div></section> }
 
 function ConflictDetail({ id }) {
   const { navigate } = useRouter()
@@ -243,7 +312,12 @@ function ConflictDetail({ id }) {
   return <section><Back to="/conflicts" /><PageHeading eyebrow="冲突详情" title={title} description={subtitle}><Badge tone={data.status_code === 'pending_review' ? 'amber' : 'red'}>{data.status_code === 'pending_review' ? '待处理' : data.status_code}</Badge></PageHeading><div className="detail-grid"><div className="panel"><h2>来源观测</h2><dl className="detail-list"><dt>编号</dt><dd>{observation.source_identifier_raw || '—'}</dd><dt>名称</dt><dd>{observation.source_name_raw || '—'}</dd><dt>厂家</dt><dd>{observation.manufacturer_raw || '—'}</dd><dt>规格</dt><dd>{observation.specification_raw || '—'}</dd><dt>单位</dt><dd>{observation.uom_raw || '—'}</dd><dt>期初</dt><dd>{observation.opening_quantity != null ? formatQuantity(observation.opening_quantity) : '—'}</dd><dt>现有</dt><dd>{observation.existing_quantity != null ? formatQuantity(observation.existing_quantity) : '—'}</dd></dl></div>{candidate && <div className="panel"><h2>历史流水候选</h2><dl className="detail-list"><dt>类型</dt><dd>{candidate.movement_type_code || '—'}</dd><dt>数量</dt><dd>{candidate.quantity_raw || '—'}</dd><dt>日期</dt><dd>{candidate.movement_date_raw || '—'}</dd><dt>来源</dt><dd>{candidate.source_location_raw || '—'}</dd><dt>目的</dt><dd>{candidate.destination_location_raw || '—'}</dd></dl></div>}<div className="panel"><h2>关联货品</h2>{product ? <dl className="detail-list"><dt>货品</dt><dd><Link className="text-link" to={`/products/${product.product_id}`}>{product.display_name} →</Link></dd><dt>编号</dt><dd>{product.primary_identifier_value || '—'}</dd><dt>厂家</dt><dd>{product.manufacturer || '—'}</dd><dt>规格</dt><dd>{product.specification || '—'}</dd><dt>单位</dt><dd>{product.uom_display_name || product.uom_code || '—'}</dd></dl> : <Empty>尚未关联货品</Empty>}</div><div className="panel"><h2>来源原始数据</h2>{source ? <pre className="json-view">{JSON.stringify({ raw: source.raw_values, display: source.display_values }, null, 2)}</pre> : <Empty>无来源记录</Empty>}</div></div><div className="panel actions-panel"><h2>处理</h2><ErrorBox error={error} />{data.status_code !== 'pending_review' ? <div className="alert">已处理：{data.resolution_notes || '—'}</div> : <><div className="actions"><Button className="secondary" onClick={() => setAction(action === 'link' ? null : 'link')} disabled={busy}>关联现有货品</Button><Button className="secondary" onClick={() => action === 'create' ? setAction(null) : openCreate()} disabled={busy}>按观测新建货品</Button>{product && <Button className="secondary" onClick={() => action === 'edit' ? setAction(null) : openEdit()} disabled={busy}>编辑货品主数据</Button>}</div>{action === 'link' && <div className="picker-field" style={{ marginTop: 10 }}><span className="field-label">搜索并选择货品</span><div className="picker-row"><input value={q} onChange={e => setQ(e.target.value)} placeholder="编号、名称、厂家或型号" /></div>{results.length > 0 && <div className="picker-results">{results.map(p => <button type="button" key={p.product_id} onClick={() => run(() => api.linkConflict(id, { product_id: p.product_id, ...basePayload }))}><strong>{p.display_name}</strong><span>{p.identifier || '无编号'} · {p.specification || '—'}</span></button>)}</div>}</div>}{action === 'create' && <div className="form-grid" style={{ marginTop: 10 }}><Field label="货品名"><input value={form.display_name || ''} onChange={e => patch('display_name', e.target.value)} /></Field><Field label="来源/标签编号"><input value={form.primary_identifier || ''} onChange={e => patch('primary_identifier', e.target.value)} /></Field><Field label="厂家"><input value={form.manufacturer || ''} onChange={e => patch('manufacturer', e.target.value)} /></Field><Field label="规格/型号"><input value={form.specification || ''} onChange={e => patch('specification', e.target.value)} /></Field>{uomSelect}<div className="span-2 actions"><Button className="primary" onClick={() => run(() => api.createConflictProduct(id, { ...form, default_uom_id: form.default_uom_id ? Number(form.default_uom_id) : null, ...basePayload }))} disabled={busy}>新建并处理</Button><Button className="secondary" onClick={() => setAction(null)}>取消</Button></div></div>}{action === 'edit' && <div className="form-grid" style={{ marginTop: 10 }}><Field label="货品名"><input value={form.display_name || ''} onChange={e => patch('display_name', e.target.value)} /></Field><Field label="来源/标签编号"><input value={form.primary_identifier || ''} onChange={e => patch('primary_identifier', e.target.value)} /></Field><Field label="厂家"><input value={form.manufacturer || ''} onChange={e => patch('manufacturer', e.target.value)} /></Field><Field label="规格/型号"><input value={form.specification || ''} onChange={e => patch('specification', e.target.value)} /></Field>{uomSelect}<div className="span-2 actions"><Button className="primary" onClick={() => run(() => api.editConflictProduct(id, { ...form, default_uom_id: form.default_uom_id ? Number(form.default_uom_id) : null, ...basePayload }))} disabled={busy}>保存并处理</Button><Button className="secondary" onClick={() => setAction(null)}>取消</Button></div></div>}<div className="reject-panel" style={{ marginTop: 10 }}><Field label="处理备注"><textarea rows="3" value={note} onChange={e => setNote(e.target.value)} placeholder="填写处理说明后提交" /></Field><div className="actions"><Field label="处理结果"><select value={outcome} onChange={e => setOutcome(e.target.value)}><option value="resolved">已处理</option><option value="duplicate">重复</option><option value="ignored">忽略</option></select></Field><Button className="primary" onClick={() => run(() => api.resolveConflict(id, { resolution_notes: note.trim(), outcome }))} disabled={busy || !note.trim()}>标记已处理</Button></div></div></>}</div></section>
 }
 
-function Audit() { const [rows, setRows] = useState([]); const [error, setError] = useState(null); useEffect(() => { api.audit().then(setRows).catch(setError) }, []); return <section><PageHeading eyebrow="合规" title="操作审计" description="不可变记录，仅管理员可见。" /><div className="panel"><ErrorBox error={error} />{rows.length ? <div className="record-list">{rows.map(a => <Link className="record-card" key={a.audit_event_id} to={`/audit/${a.audit_event_id}`}><div><strong>{a.action}</strong><span>{a.target_table} / {a.target_id || '—'} · {a.created_at ? new Date(a.created_at).toLocaleString() : '—'}</span></div><small className="mono">{a.request_id || '—'}</small></Link>)}</div> : <Empty>暂无审计记录</Empty>}</div></section> }
+function Audit() { const [rows, setRows] = useState([]); const [error, setError] = useState(null); useEffect(() => { api.audit().then(setRows).catch(setError) }, []); const columns = useMemo(() => [
+  { key: 'action', label: '动作', filterType: 'search' },
+  { key: 'target', label: '目标', filterType: 'text', value: r => `${r.target_table || ''} / ${r.target_id ?? '—'}` },
+  { key: 'created_at', label: '时间', value: r => r.created_at ? new Date(r.created_at).toLocaleString() : '—' },
+  { key: 'request_id', label: '请求 ID', value: r => r.request_id || '—' },
+], []); return <section><PageHeading eyebrow="合规" title="操作审计" description="不可变记录，仅管理员可见。" /><div className="panel"><ErrorBox error={error} /><DataTable mode="client" columns={columns} rows={rows} rowKey={a => String(a.audit_event_id)} rowHref={a => `/audit/${a.audit_event_id}`} exportConfig={{ endpoint: '/api/audit/export', filename: '审计日志', allScope: 'ids' }} /></div></section> }
 function AuditDetail({ id }) { const [data, setData] = useState(null); const [error, setError] = useState(null); useEffect(() => { api.auditEvent(id).then(setData).catch(setError) }, [id]); if (!data) return error ? <section><Back to="/audit" /><ErrorBox error={error} /></section> : <Loading />; return <section><Back to="/audit" /><PageHeading eyebrow="审计详情" title={data.action}><Badge>{data.target_table}</Badge></PageHeading><div className="panel"><dl className="detail-list"><dt>目标</dt><dd>{data.target_table} / {data.target_id || '—'}</dd><dt>操作者</dt><dd>{data.actor_name || data.actor_user_id || '—'}</dd><dt>时间</dt><dd>{new Date(data.created_at).toLocaleString()}</dd><dt>请求 ID</dt><dd className="mono">{data.request_id || '—'}</dd></dl><pre className="json-view">{JSON.stringify({ before: data.before_data, after: data.after_data, diff: data.field_diff }, null, 2)}</pre></div></section> }
 
 function InventoryDetail({ ids }) { const { navigate } = useRouter(); const [data, setData] = useState(null); const [error, setError] = useState(null); const [product, setProduct] = useState(null); useEffect(() => { api.inventoryDetail(ids).then(setData).catch(setError); api.product(ids.product_id).then(setProduct).catch(() => {}) }, [ids]); if (!data) return error ? <section><Back to="/" /><ErrorBox error={error} /></section> : <Loading />; return <section><Back to="/" /><PageHeading eyebrow="库存余额详情" title={data.product_name}><Button className="primary" onClick={() => navigate(`/requests/new?product_id=${ids.product_id}`)}>以此货品新建申请</Button></PageHeading><div className="stats"><div className="stat teal"><span>当前数量</span><strong>{formatQuantity(data.on_hand_quantity)} {data.uom_code}</strong></div><div className="stat"><span>库位</span><strong>{data.location_name}</strong></div><div className="stat"><span>成色</span><strong>{data.condition_code}</strong></div></div><div className="panel"><h2>相关流水</h2>{data.movements?.length ? <div className="record-list">{data.movements.map(m => <div className="record-card" key={m.inventory_movement_id}><div><strong>{m.movement_type}</strong><span>{m.source_location_name || '—'} → {m.destination_location_name || '—'}</span></div><div className="record-value"><b>{formatQuantity(m.quantity)}</b><small>{m.movement_date}</small></div></div>)}</div> : <Empty>暂无流水</Empty>}</div>{product && <Link className="text-link" to={`/products/${product.product_id}`}>查看货品主数据 →</Link>}</section> }

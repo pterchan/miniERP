@@ -1,5 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import api from './api'
+import DataTable from './data-table'
 import { formatMoney, formatQuantity } from './list-utils'
 import { canView } from './roles'
 import {
@@ -27,7 +28,17 @@ function CustomerList({ user }) {
   const [rows, setRows] = useState([])
   const [error, setError] = useState(null)
   useEffect(() => { api.customers().then(setRows).catch(setError) }, [])
-  return <section><PageHeading eyebrow="销售" title="客户档案" description="客户名称、联系人、结算方式、等级、欠款上限与应收余额。">{canView(user, 'customers') && <Button className="primary" onClick={() => navigate('/master/customers/new')}>＋ 新增客户</Button>}</PageHeading><div className="panel"><ErrorBox error={error} />{rows.length ? <div className="record-list">{rows.map(c => <Link className="record-card" key={c.customer_id} to={`/master/customers/${c.customer_id}`}><div><strong>{c.name}</strong><span>{c.contact_person || '—'} · {c.phone || '—'} · {c.settlement_method}</span></div><div className="record-value"><Badge tone={c.is_active ? 'green' : 'red'}>{c.is_active ? '启用' : '停用'}</Badge><small>应收 ¥ {formatMoney(c.receivable_balance)}</small></div></Link>)}</div> : <Empty>暂无客户</Empty>}</div></section>
+  const columns = useMemo(() => [
+    { key: 'name', label: '名称', filterType: 'search', searchKeys: ['name', 'contact_person', 'phone', 'address'] },
+    { key: 'contact_person', label: '联系人', filterType: 'text', value: r => r.contact_person || '—' },
+    { key: 'phone', label: '电话', value: r => r.phone || '—' },
+    { key: 'settlement_method', label: '结算方式', filterType: 'select', filterOptions: [{ value: '现结', label: '现结' }, { value: '月结', label: '月结' }] },
+    { key: 'level', label: '等级', value: r => r.level || '—' },
+    { key: 'credit_limit', label: '信用上限', align: 'end', value: r => `¥ ${formatMoney(r.credit_limit)}` },
+    { key: 'receivable_balance', label: '应收', align: 'end', value: r => `¥ ${formatMoney(r.receivable_balance)}` },
+    { key: 'is_active', label: '状态', filterType: 'select', filterOptions: [{ value: 'true', label: '启用' }, { value: 'false', label: '停用' }], value: r => r.is_active, render: r => r.is_active ? '启用' : '停用' },
+  ], [])
+  return <section><PageHeading eyebrow="销售" title="客户档案" description="客户名称、联系人、结算方式、等级、欠款上限与应收余额。">{canView(user, 'customers') && <Button className="primary" onClick={() => navigate('/master/customers/new')}>＋ 新增客户</Button>}</PageHeading><div className="panel"><ErrorBox error={error} /><DataTable mode="client" columns={columns} rows={rows} rowKey={c => String(c.customer_id)} rowHref={c => `/master/customers/${c.customer_id}`} exportConfig={{ endpoint: '/api/customers/export', filename: '客户', allScope: 'ids' }} /></div></section>
 }
 
 function CustomerForm({ id, user }) {
@@ -56,7 +67,15 @@ function SupplierList({ user }) {
   const [rows, setRows] = useState([])
   const [error, setError] = useState(null)
   useEffect(() => { api.suppliers().then(setRows).catch(setError) }, [])
-  return <section><PageHeading eyebrow="采购" title="供应商档案" description="供应商联系方式、账期、采购均价与应付余额。">{canView(user, 'suppliers') && <Button className="primary" onClick={() => navigate('/master/suppliers/new')}>＋ 新增供应商</Button>}</PageHeading><div className="panel"><ErrorBox error={error} />{rows.length ? <div className="record-list">{rows.map(s => <Link className="record-card" key={s.supplier_id} to={`/master/suppliers/${s.supplier_id}`}><div><strong>{s.name}</strong><span>{s.contact_person || '—'} · {s.phone || '—'} · 账期 {s.settlement_days} 天</span></div><div className="record-value"><Badge tone={s.is_active ? 'green' : 'red'}>{s.is_active ? '启用' : '停用'}</Badge><small>应付 ¥ {formatMoney(s.payable_balance)}</small></div></Link>)}</div> : <Empty>暂无供应商</Empty>}</div></section>
+  const columns = useMemo(() => [
+    { key: 'name', label: '名称', filterType: 'search', searchKeys: ['name', 'contact_person', 'phone', 'address'] },
+    { key: 'contact_person', label: '联系人', filterType: 'text', value: r => r.contact_person || '—' },
+    { key: 'phone', label: '电话', value: r => r.phone || '—' },
+    { key: 'settlement_days', label: '账期（天）', align: 'end', value: r => r.settlement_days != null ? r.settlement_days : '—' },
+    { key: 'payable_balance', label: '应付', align: 'end', value: r => `¥ ${formatMoney(r.payable_balance)}` },
+    { key: 'is_active', label: '状态', filterType: 'select', filterOptions: [{ value: 'true', label: '启用' }, { value: 'false', label: '停用' }], value: r => r.is_active, render: r => r.is_active ? '启用' : '停用' },
+  ], [])
+  return <section><PageHeading eyebrow="采购" title="供应商档案" description="供应商联系方式、账期、采购均价与应付余额。">{canView(user, 'suppliers') && <Button className="primary" onClick={() => navigate('/master/suppliers/new')}>＋ 新增供应商</Button>}</PageHeading><div className="panel"><ErrorBox error={error} /><DataTable mode="client" columns={columns} rows={rows} rowKey={s => String(s.supplier_id)} rowHref={s => `/master/suppliers/${s.supplier_id}`} exportConfig={{ endpoint: '/api/suppliers/export', filename: '供应商', allScope: 'ids' }} /></div></section>
 }
 
 function SupplierForm({ id, user }) {

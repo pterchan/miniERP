@@ -6,7 +6,9 @@ class ApiError extends Error {
 
 const api = {
   async request(path, options = {}) {
-    const headers = { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) }
+    // FormData 由浏览器自动带 multipart boundary，不能再设 JSON Content-Type。
+    const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData
+    const headers = { ...(options.body && !isFormData ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) }
     if (options.method && options.method !== 'GET' && options.method !== 'HEAD') {
       const csrf = document.cookie.split('; ').find(x => x.startsWith('erp_csrf='))?.split('=').slice(1).join('=')
       if (csrf) headers['X-CSRF-Token'] = decodeURIComponent(csrf)
@@ -27,7 +29,21 @@ const api = {
   inventory: () => api.request('/inventory/balance'),
   inventoryDetail: (x) => api.request(`/inventory/balance/${x.product_id}/${x.location_id}/${x.condition_id}/${x.uom_id}`),
   adjustInventory: (payload) => api.request('/inventory/adjust', { method: 'POST', body: JSON.stringify(payload) }),
-  products: (q = '', page = 1, pageSize = 30) => api.request(`/products?q=${encodeURIComponent(q)}&page=${page}&page_size=${pageSize}`),
+  products: (q = '', page = 1, pageSize = 30) => {
+    // 兼容旧调用 products(q)/products(q,page,size)；传对象时按 DataTable 参数构造。
+    if (typeof q === 'object' && q !== null) {
+      const p = q
+      const sp = new URLSearchParams()
+      if (p.q) sp.set('q', p.q)
+      if (p.page) sp.set('page', p.page)
+      if (p.page_size) sp.set('page_size', p.page_size)
+      if (p.sort) sp.set('sort', p.sort)
+      if (p.order) sp.set('order', p.order)
+      ;(p.f || []).forEach(x => sp.append('f', x))
+      return api.request(`/products?${sp.toString()}`)
+    }
+    return api.request(`/products?q=${encodeURIComponent(q)}&page=${page}&page_size=${pageSize}`)
+  },
   productCatalog: () => fetchAllProductPages((page, pageSize) => api.products('', page, pageSize)),
   product: (id) => api.request(`/products/${id}`),
   createProduct: (payload) => api.request('/products', { method: 'POST', body: JSON.stringify(payload) }),
@@ -64,6 +80,16 @@ const api = {
   reverseDocument: (id) => api.request(`/documents/${id}/reverse`, { method: 'POST', body: '{}' }),
   addAttachment: (id, payload) => api.request(`/documents/${id}/attachments`, { method: 'POST', body: JSON.stringify(payload) }),
   attachmentUrl: (attachmentId) => `/api/attachments/${attachmentId}`,
+  // 货品附图（MinIO）
+  productImages: (productId) => api.request(`/products/${productId}/images`),
+  uploadProductImages: (productId, files) => {
+    const form = new FormData()
+    files.forEach(file => form.append('files', file))
+    return api.request(`/products/${productId}/images`, { method: 'POST', body: form })
+  },
+  productImageContent: (imageId) => `/api/product-images/${imageId}/content`,
+  updateProductImage: (imageId, payload) => api.request(`/product-images/${imageId}`, { method: 'PUT', body: JSON.stringify(payload) }),
+  deleteProductImage: (imageId) => api.request(`/product-images/${imageId}`, { method: 'DELETE' }),
   // 主数据
   categories: () => api.request('/categories'),
   createCategory: (payload) => api.request('/categories', { method: 'POST', body: JSON.stringify(payload) }),

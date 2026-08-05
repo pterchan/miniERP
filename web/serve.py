@@ -11,7 +11,7 @@ from pathlib import Path
 
 API_ORIGIN = os.getenv("WEB_API_ORIGIN", "http://api:8000")
 DIST = Path(os.getenv("WEB_DIST", "/app/dist")).resolve()
-MAX_PROXY_BODY = 14 * 1024 * 1024
+MAX_PROXY_BODY = 25 * 1024 * 1024
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",

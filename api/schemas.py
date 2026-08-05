@@ -362,3 +362,9 @@ class DepartmentIn(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     sort_order: int = 0
     is_active: bool = True
+
+
+class ImageUpdateIn(BaseModel):
+    """Update metadata of a product image (sort order / filename)."""
+    sort_order: int | None = Field(default=None, ge=0)
+    filename: str | None = Field(default=None, min_length=1, max_length=255)

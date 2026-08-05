@@ -6,11 +6,13 @@ import unicodedata
 from decimal import Decimal
 from typing import Any, Callable
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import documents, master, reports
+from . import documents, images, master, reports
 from .db import audit, connection, ensure_bootstrap_users, fetch_all, fetch_one
+from .export import export_response, export_rows_by_ids
+from .list_params import clamp_page, clamp_page_size, parse_composite_ids, parse_filters, parse_ids, parse_sort
 from .helpers import _condition_id, _line_uom_id, _movement_id, _request_meta, _status_id
 from .ocr_client import OCRProxyError, forward_ocr
 from .permissions import CSRF_COOKIE, SESSION_COOKIE, _csrf, require_roles, require_user
@@ -49,6 +51,7 @@ app.add_middleware(
 
 app.include_router(documents.router)
 app.include_router(documents.attachments_router)
+app.include_router(images.router)
 app.include_router(master.router)
 app.include_router(reports.router)
 
@@ -62,6 +65,13 @@ def startup() -> None:
     except Exception:
         if os.environ.get("ERP_BOOTSTRAP_STRICT", "0") == "1":
             raise
+    # Ensure the MinIO bucket exists; a missing/unreachable MinIO must never
+    # block the API from starting (image upload will simply fail per-request).
+    try:
+        from .storage import ensure_bucket
+        ensure_bucket()
+    except Exception:
+        pass
 
 
 def _normalize_query(value: str) -> str:
@@ -214,30 +224,97 @@ def change_password(payload: ChangePasswordIn, request: Request, user: dict[str,
     return {"status": "ok"}
 
 
+_PRODUCT_SORT = {
+    "display_name": "p.display_name",
+    "product_id": "p.product_id",
+    "manufacturer": "coalesce(p.manufacturer, '')",
+    "specification": "coalesce(p.specification, '')",
+    "created_at": "p.created_at",
+    "updated_at": "p.updated_at",
+}
+
+_PRODUCT_FILTERS = {
+    "display_name": ("p.display_name", ("contains", "eq")),
+    "manufacturer": ("coalesce(p.manufacturer, '')", ("contains", "eq")),
+    "specification": ("coalesce(p.specification, '')", ("contains", "eq")),
+    "category_id": ("p.category_id", ("eq", "in")),
+    "status_id": ("p.status_id", ("eq", "in")),
+}
+
+_PRODUCT_COLUMNS = [
+    ("货品ID", lambda r: r["product_id"]),
+    ("业务编号", lambda r: r["identifier"] or ""),
+    ("货品名称", lambda r: r["display_name"]),
+    ("厂家", lambda r: r["manufacturer"] or ""),
+    ("规格型号", lambda r: r["specification"] or ""),
+    ("默认单位", lambda r: r["uom_code"] or ""),
+    ("更新时间", lambda r: r["updated_at"]),
+]
+
+
+def _product_where(q: str, filters: list[str]) -> tuple[str, list]:
+    """货品列表/导出的共享 WHERE 构造器。q 走名称/编号/别名 EXISTS 子查询避免行膨胀。"""
+    clauses: list[str] = []
+    params: list = []
+    if q.strip():
+        needle = "%" + q.strip() + "%"
+        clauses.append(
+            "(p.display_name ILIKE %s OR coalesce(p.manufacturer,'') ILIKE %s OR coalesce(p.specification,'') ILIKE %s"
+            " OR EXISTS (SELECT 1 FROM product_identifier pi WHERE pi.product_id=p.product_id AND pi.value_raw ILIKE %s)"
+            " OR EXISTS (SELECT 1 FROM product_name_alias pa WHERE pa.product_id=p.product_id AND pa.alias_raw ILIKE %s))"
+        )
+        params.extend([needle] * 5)
+    filter_parts, filter_params = parse_filters(filters, _PRODUCT_FILTERS)
+    clauses.extend(filter_parts)
+    params.extend(filter_params)
+    return " AND ".join(clauses), params
+
+
+def _products_query(where: str, order_by: str) -> str:
+    return f"""SELECT p.product_id, p.display_name, p.manufacturer, p.specification, p.status_id, p.category_id,
+                      u.uom_id, u.code AS uom_code, p.source_uom_raw,
+                      ident.value_raw AS identifier, ident.value_normalized AS identifier_normalized
+                 FROM product p
+                 LEFT JOIN uom u ON u.uom_id = p.default_uom_id
+                 LEFT JOIN LATERAL (SELECT value_raw, value_normalized FROM product_identifier p0
+                                     WHERE p0.product_id = p.product_id AND p0.is_primary
+                                     ORDER BY p0.product_identifier_id LIMIT 1) ident ON TRUE
+                WHERE {where} ORDER BY {order_by}"""
+
+
 @app.get("/api/products")
-def products(q: str = "", page: int = 1, page_size: int = 30, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
-    page = max(1, page)
-    page_size = min(100, max(1, page_size))
+def products(q: str = "", page: int = 1, page_size: int = 30, sort: str = "", order: str = "asc",
+             f: list[str] = Query(default=[]), user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+    page = clamp_page(page)
+    page_size = clamp_page_size(page_size, cap=500)
     q = _normalize_query(q)
-    needle = "%" + q.strip() + "%"
+    where, params = _product_where(q, f)
+    order_by = parse_sort(sort, order, _PRODUCT_SORT, "display_name")
+    where = where or "TRUE"
     with connection() as conn:
-        rows = fetch_all(conn, """SELECT DISTINCT p.product_id,p.display_name,p.manufacturer,p.specification,
-                    u.uom_id,u.code AS uom_code, p.source_uom_raw, ident.value_raw AS identifier,
-                    ident.value_normalized AS identifier_normalized
-                    FROM product p LEFT JOIN uom u ON u.uom_id=p.default_uom_id
-                    LEFT JOIN product_identifier pi ON pi.product_id=p.product_id
-                    LEFT JOIN product_name_alias pa ON pa.product_id=p.product_id
-                    LEFT JOIN LATERAL (SELECT value_raw,value_normalized FROM product_identifier p0 WHERE p0.product_id=p.product_id AND p0.is_primary ORDER BY p0.product_identifier_id LIMIT 1) ident ON TRUE
-                    WHERE (%s='' OR p.display_name ILIKE %s OR coalesce(p.manufacturer,'') ILIKE %s
-                      OR coalesce(p.specification,'') ILIKE %s OR coalesce(pi.value_raw,'') ILIKE %s
-                      OR coalesce(pa.alias_raw,'') ILIKE %s)
-                    ORDER BY p.display_name LIMIT %s OFFSET %s""", (q.strip(), needle, needle, needle, needle, needle, page_size, (page - 1) * page_size))
-        total = fetch_one(conn, """SELECT count(DISTINCT p.product_id) AS n FROM product p
-                    LEFT JOIN product_identifier pi ON pi.product_id=p.product_id
-                    LEFT JOIN product_name_alias pa ON pa.product_id=p.product_id
-                    WHERE (%s='' OR p.display_name ILIKE %s OR coalesce(p.manufacturer,'') ILIKE %s
-                      OR coalesce(p.specification,'') ILIKE %s OR coalesce(pi.value_raw,'') ILIKE %s OR coalesce(pa.alias_raw,'') ILIKE %s)""", (q.strip(), needle, needle, needle, needle, needle))
-    return {"items": rows, "page": page, "page_size": page_size, "total": total["n"]}
+        rows = fetch_all(conn, _products_query(where, order_by) + " LIMIT %s OFFSET %s", tuple(params + [page_size, (page - 1) * page_size]))
+        total = fetch_one(conn, f"SELECT count(*) AS n FROM product p WHERE {where}", tuple(params))
+    return {"items": rows, "page": page, "page_size": page_size, "total": int(total["n"])}
+
+
+@app.get("/api/products/export")
+def products_export(q: str = "", sort: str = "", order: str = "asc", f: list[str] = Query(default=[]),
+                    ids: str = "", fmt: str = "xlsx", user: dict[str, Any] = Depends(require_user)) -> Response:
+    q = _normalize_query(q)
+    where, params = _product_where(q, f)
+    if ids:
+        try:
+            id_list = parse_ids(ids)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        id_params = ", ".join(["%s"] * len(id_list))
+        where = (where + f" AND p.product_id IN ({id_params})") if where else f"p.product_id IN ({id_params})"
+        params.extend(id_list)
+    order_by = parse_sort(sort, order, _PRODUCT_SORT, "display_name")
+    where = where or "TRUE"
+    with connection() as conn:
+        rows = fetch_all(conn, _products_query(where, order_by), tuple(params))
+    return export_response(rows, _PRODUCT_COLUMNS, "货品", fmt)
 
 
 @app.get("/api/products/{product_id}")
@@ -306,10 +383,84 @@ def update_product(product_id: int, payload: ProductUpdateIn, request: Request, 
     return result
 
 
+_INVENTORY_EXPORT_QUERY = """SELECT b.product_id, b.product_name, b.location_id, b.location_name,
+                                    b.condition_id, b.condition_code, b.uom_id, b.uom_code, b.on_hand_quantity,
+                                    p.manufacturer, p.specification,
+                                    ident.value_raw AS identifier
+                               FROM v_inventory_balance b
+                               JOIN product p ON p.product_id = b.product_id
+                               LEFT JOIN LATERAL (SELECT value_raw FROM product_identifier p0
+                                                   WHERE p0.product_id = b.product_id AND p0.is_primary
+                                                   ORDER BY p0.product_identifier_id LIMIT 1) ident ON TRUE
+                              WHERE {where} ORDER BY {order_by}"""
+
+_INVENTORY_SORT = {
+    "product_name": "b.product_name",
+    "location_name": "b.location_name",
+    "condition_code": "b.condition_code",
+    "uom_code": "b.uom_code",
+    "on_hand_quantity": "b.on_hand_quantity",
+    "identifier": "ident.value_raw",
+    "manufacturer": "p.manufacturer",
+    "specification": "p.specification",
+}
+
+_INVENTORY_FILTERS = {
+    "identifier": ("coalesce(ident.value_raw, '')", ("contains", "eq")),
+    "product_name": ("b.product_name", ("contains", "eq")),
+    "manufacturer": ("coalesce(p.manufacturer, '')", ("contains", "eq")),
+    "specification": ("coalesce(p.specification, '')", ("contains", "eq")),
+    "location_name": ("b.location_name", ("contains", "eq")),
+    "condition_code": ("b.condition_code", ("eq",)),
+    "uom_code": ("b.uom_code", ("eq",)),
+}
+
+_INVENTORY_COLUMNS = [
+    ("业务编号", lambda r: r["identifier"] or ""),
+    ("货品名称", lambda r: r["product_name"]),
+    ("厂家", lambda r: r["manufacturer"] or ""),
+    ("规格型号", lambda r: r["specification"] or ""),
+    ("库位", lambda r: r["location_name"] or ""),
+    ("成色", lambda r: r["condition_code"] or ""),
+    ("现库存", lambda r: r["on_hand_quantity"]),
+    ("单位", lambda r: r["uom_code"] or ""),
+]
+
+
 @app.get("/api/inventory/balance")
 def inventory_balance(user: dict[str, Any] = Depends(require_user)) -> list[dict[str, Any]]:
     with connection() as conn:
         return fetch_all(conn, "SELECT * FROM v_inventory_balance ORDER BY product_name,location_name")
+
+
+@app.get("/api/inventory/balance/export")
+def inventory_balance_export(q: str = "", sort: str = "", order: str = "asc", f: list[str] = Query(default=[]),
+                             ids: str = "", fmt: str = "xlsx", user: dict[str, Any] = Depends(require_user)) -> Response:
+    q = _normalize_query(q)
+    clauses: list[str] = []
+    params: list = []
+    if q.strip():
+        needle = "%" + q.strip() + "%"
+        clauses.append("(b.product_name ILIKE %s OR coalesce(p.manufacturer,'') ILIKE %s OR coalesce(p.specification,'') ILIKE %s"
+                       " OR coalesce(ident.value_raw,'') ILIKE %s OR b.location_name ILIKE %s OR b.condition_code ILIKE %s OR b.uom_code ILIKE %s)")
+        params.extend([needle] * 7)
+    filter_parts, filter_params = parse_filters(f, _INVENTORY_FILTERS)
+    clauses.extend(filter_parts)
+    params.extend(filter_params)
+    if ids:
+        try:
+            id_list = parse_composite_ids(ids, parts=4)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        sub_clauses = ["(b.product_id=%s AND b.location_id=%s AND b.condition_id=%s AND b.uom_id=%s)"] * len(id_list)
+        flat = [x for tup in id_list for x in tup]
+        clauses.append(f"({' OR '.join(sub_clauses)})")
+        params.extend(flat)
+    where = " AND ".join(clauses) if clauses else "TRUE"
+    order_by = parse_sort(sort, order, _INVENTORY_SORT, "product_name")
+    with connection() as conn:
+        rows = fetch_all(conn, _INVENTORY_EXPORT_QUERY.format(where=where, order_by=order_by), tuple(params))
+    return export_response(rows, _INVENTORY_COLUMNS, "库存余额", fmt)
 
 
 @app.get("/api/inventory/balance/{product_id}/{location_id}/{condition_id}/{uom_id}")
@@ -431,6 +582,24 @@ def locations(user: dict[str, Any] = Depends(require_user)) -> list[dict[str, An
         return fetch_all(conn, "SELECT location_id,code,name,location_type,is_company_inventory,is_active FROM location WHERE is_active ORDER BY name")
 
 
+_LOCATION_COLUMNS = [
+    ("库位ID", lambda r: r["location_id"]),
+    ("编码", lambda r: r["code"]),
+    ("名称", lambda r: r["name"]),
+    ("类型", lambda r: r["location_type"]),
+    ("公司库存", lambda r: "是" if r["is_company_inventory"] else "否"),
+    ("启用", lambda r: "是" if r["is_active"] else "否"),
+]
+
+
+@app.get("/api/locations/export")
+def locations_export(ids: str = "", fmt: str = "xlsx", user: dict[str, Any] = Depends(require_user)) -> Response:
+    with connection() as conn:
+        return export_rows_by_ids(conn, ids, "location_id",
+            "SELECT location_id,code,name,location_type,is_company_inventory,is_active FROM location WHERE is_active AND {where} ORDER BY {order_by}",
+            "name", _LOCATION_COLUMNS, "库位", fmt)
+
+
 @app.get("/api/locations/{location_id}")
 def location_detail(location_id: int, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
     with connection() as conn:
@@ -487,6 +656,24 @@ def update_location(location_id: int, payload: LocationUpdateIn, request: Reques
 def users(user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> list[dict[str, Any]]:
     with connection() as conn:
         return fetch_all(conn, "SELECT user_id,username,display_name,role,is_active,created_at FROM app_user ORDER BY username")
+
+
+_USER_COLUMNS = [
+    ("用户ID", lambda r: r["user_id"]),
+    ("用户名", lambda r: r["username"]),
+    ("显示名", lambda r: r["display_name"] or ""),
+    ("角色", lambda r: r["role"]),
+    ("启用", lambda r: "是" if r["is_active"] else "否"),
+    ("创建时间", lambda r: r["created_at"]),
+]
+
+
+@app.get("/api/admin/users/export")
+def users_export(ids: str = "", fmt: str = "xlsx", user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> Response:
+    with connection() as conn:
+        return export_rows_by_ids(conn, ids, "user_id",
+            "SELECT user_id,username,display_name,role,is_active,created_at FROM app_user WHERE {where} ORDER BY {order_by}",
+            "username", _USER_COLUMNS, "用户", fmt)
 
 
 @app.get("/api/admin/users/{user_id}")
@@ -567,6 +754,44 @@ def stock_requests(user: dict[str, Any] = Depends(require_user)) -> list[dict[st
             row["line_count"] = int(count["n"])
             row["total_quantity"] = None
         return rows
+
+
+_STOCK_REQUEST_COLUMNS = [
+    ("申请ID", lambda r: r["stock_request_id"]),
+    ("单号", lambda r: r["request_no"]),
+    ("类型", lambda r: r["request_type"]),
+    ("申请人", lambda r: r["requester_display_name"] or r["requester_username"] or ""),
+    ("状态", lambda r: r["status"]),
+    ("明细数", lambda r: r["line_count"]),
+    ("原因", lambda r: r["reason"] or ""),
+    ("创建时间", lambda r: r["created_at"]),
+]
+
+
+@app.get("/api/stock-requests/export")
+def stock_requests_export(ids: str = "", fmt: str = "xlsx", user: dict[str, Any] = Depends(require_user)) -> Response:
+    is_warehouse = user["role"] in {"WAREHOUSE", "ADMIN"}
+    clauses: list[str] = []
+    params: list = []
+    if ids:
+        try:
+            id_list = parse_ids(ids)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        clauses.append(f"sr.stock_request_id IN ({', '.join(['%s'] * len(id_list))})")
+        params.extend(id_list)
+    if not is_warehouse:
+        clauses.append("sr.requester_user_id=%s")
+        params.append(user["user_id"])
+    where = " AND ".join(clauses) if clauses else "TRUE"
+    with connection() as conn:
+        rows = fetch_all(conn, f"""SELECT sr.*,u.username AS requester_username,u.display_name AS requester_display_name
+                                     FROM stock_request sr JOIN app_user u ON u.user_id=sr.requester_user_id
+                                    WHERE {where} ORDER BY sr.created_at DESC""", tuple(params))
+        for row in rows:
+            count = fetch_one(conn, "SELECT count(*) AS n FROM stock_request_line WHERE stock_request_id=%s", (row["stock_request_id"],))
+            row["line_count"] = int(count["n"])
+    return export_response(rows, _STOCK_REQUEST_COLUMNS, "库存申请", fmt)
 
 
 @app.get("/api/stock-requests/{request_id}")
@@ -812,34 +1037,62 @@ def _resolve_case(conn: Any, user: dict[str, Any], meta: dict[str, Any], row: di
                         (terminal, observation["product_observation_id"]))
 
 
+_CONFLICT_QUERY = """SELECT rc.resolution_case_id,rc.case_type,rc.source_record_id,
+                            rc.product_observation_id,rc.movement_candidate_id,
+                            rc.opened_at,rc.assigned_to,rc.resolution_notes,
+                            rs.code AS status_code,
+                            COALESCE(po.source_name_raw, NULLIF(sr.display_values->>'品名','')) AS source_name,
+                            po.source_identifier_raw AS source_identifier,
+                            mc.movement_type_code,mc.quantity_raw,mc.movement_date_raw
+                       FROM resolution_case rc
+                       JOIN record_status rs ON rs.status_id=rc.status_id
+                       LEFT JOIN source_record sr ON sr.source_record_id=rc.source_record_id
+                       LEFT JOIN LATERAL (SELECT p.source_name_raw,p.source_identifier_raw
+                                            FROM product_observation p
+                                           WHERE p.product_observation_id=rc.product_observation_id
+                                              OR (rc.product_observation_id IS NULL AND p.source_record_id=rc.source_record_id)
+                                           ORDER BY (p.product_observation_id=rc.product_observation_id) DESC,p.observation_ordinal
+                                           LIMIT 1) po ON TRUE
+                       LEFT JOIN LATERAL (SELECT mt.code AS movement_type_code,m2.quantity_raw,m2.movement_date_raw
+                                            FROM movement_candidate m2
+                                            LEFT JOIN movement_type mt ON mt.movement_type_id=m2.movement_type_id
+                                           WHERE m2.movement_candidate_id=rc.movement_candidate_id
+                                              OR (rc.movement_candidate_id IS NULL AND m2.source_record_id=rc.source_record_id)
+                                           ORDER BY (m2.movement_candidate_id=rc.movement_candidate_id) DESC,m2.candidate_ordinal
+                                           LIMIT 1) mc ON TRUE
+                      WHERE {where}
+                      ORDER BY rc.opened_at DESC"""
+
+_CONFLICT_COLUMNS = [
+    ("冲突ID", lambda r: r["resolution_case_id"]),
+    ("类型", lambda r: r["case_type"]),
+    ("来源名称", lambda r: r["source_name"] or ""),
+    ("来源编号", lambda r: r["source_identifier"] or ""),
+    ("状态", lambda r: r["status_code"]),
+    ("打开时间", lambda r: r["opened_at"]),
+]
+
+
 @app.get("/api/conflicts")
 def conflicts(user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> list[dict[str, Any]]:
     with connection() as conn:
-        return fetch_all(conn, """SELECT rc.resolution_case_id,rc.case_type,rc.source_record_id,
-                                         rc.product_observation_id,rc.movement_candidate_id,
-                                         rc.opened_at,rc.assigned_to,rc.resolution_notes,
-                                         rs.code AS status_code,
-                                         COALESCE(po.source_name_raw, NULLIF(sr.display_values->>'品名','')) AS source_name,
-                                         po.source_identifier_raw AS source_identifier,
-                                         mc.movement_type_code,mc.quantity_raw,mc.movement_date_raw
-                                    FROM resolution_case rc
-                                    JOIN record_status rs ON rs.status_id=rc.status_id
-                                    LEFT JOIN source_record sr ON sr.source_record_id=rc.source_record_id
-                                    LEFT JOIN LATERAL (SELECT p.source_name_raw,p.source_identifier_raw
-                                                         FROM product_observation p
-                                                        WHERE p.product_observation_id=rc.product_observation_id
-                                                           OR (rc.product_observation_id IS NULL AND p.source_record_id=rc.source_record_id)
-                                                        ORDER BY (p.product_observation_id=rc.product_observation_id) DESC,p.observation_ordinal
-                                                        LIMIT 1) po ON TRUE
-                                    LEFT JOIN LATERAL (SELECT mt.code AS movement_type_code,m2.quantity_raw,m2.movement_date_raw
-                                                         FROM movement_candidate m2
-                                                         LEFT JOIN movement_type mt ON mt.movement_type_id=m2.movement_type_id
-                                                        WHERE m2.movement_candidate_id=rc.movement_candidate_id
-                                                           OR (rc.movement_candidate_id IS NULL AND m2.source_record_id=rc.source_record_id)
-                                                        ORDER BY (m2.movement_candidate_id=rc.movement_candidate_id) DESC,m2.candidate_ordinal
-                                                        LIMIT 1) mc ON TRUE
-                                   WHERE rs.code='pending_review'
-                                   ORDER BY rc.opened_at DESC""")
+        return fetch_all(conn, _CONFLICT_QUERY.format(where="rs.code='pending_review'"))
+
+
+@app.get("/api/conflicts/export")
+def conflicts_export(ids: str = "", fmt: str = "xlsx", user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> Response:
+    where = "rs.code='pending_review'"
+    params: list = []
+    if ids:
+        try:
+            id_list = parse_ids(ids)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        where += f" AND rc.resolution_case_id IN ({', '.join(['%s'] * len(id_list))})"
+        params.extend(id_list)
+    with connection() as conn:
+        rows = fetch_all(conn, _CONFLICT_QUERY.format(where=where), tuple(params))
+    return export_response(rows, _CONFLICT_COLUMNS, "冲突", fmt)
 
 
 @app.get("/api/conflicts/{case_id}")
@@ -986,6 +1239,37 @@ def audit_log(limit: int = 100, user: dict[str, Any] = Depends(require_roles("AD
     limit = min(500, max(1, limit))
     with connection() as conn:
         return fetch_all(conn, "SELECT audit_event_id,actor_user_id,actor_role,action,target_table,target_id,request_id,before_data,after_data,field_diff,created_at FROM audit_event ORDER BY created_at DESC LIMIT %s", (limit,))
+
+
+_AUDIT_COLUMNS = [
+    ("审计ID", lambda r: r["audit_event_id"]),
+    ("操作者", lambda r: r["actor_user_id"] or r["actor_role"] or ""),
+    ("角色", lambda r: r["actor_role"] or ""),
+    ("动作", lambda r: r["action"]),
+    ("目标表", lambda r: r["target_table"] or ""),
+    ("目标ID", lambda r: r["target_id"] if r["target_id"] is not None else ""),
+    ("时间", lambda r: r["created_at"]),
+]
+
+
+@app.get("/api/audit/export")
+def audit_export(ids: str = "", fmt: str = "xlsx", user: dict[str, Any] = Depends(require_roles("ADMIN", "FINANCE"))) -> Response:
+    if ids:
+        try:
+            id_list = parse_ids(ids)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        arr = ", ".join(str(i) for i in id_list)
+        placeholders = ", ".join(["%s"] * len(id_list))
+        with connection() as conn:
+            rows = fetch_all(conn, f"""SELECT audit_event_id,actor_user_id,actor_role,action,target_table,target_id,request_id,before_data,after_data,field_diff,created_at
+                                         FROM audit_event WHERE audit_event_id IN ({placeholders})
+                                         ORDER BY array_position(ARRAY[{arr}], audit_event_id)""", tuple(id_list))
+    else:
+        with connection() as conn:
+            rows = fetch_all(conn, """SELECT audit_event_id,actor_user_id,actor_role,action,target_table,target_id,request_id,before_data,after_data,field_diff,created_at
+                                        FROM audit_event ORDER BY created_at DESC LIMIT 500""")
+    return export_response(rows, _AUDIT_COLUMNS, "审计日志", fmt)
 
 
 @app.get("/api/audit/{audit_event_id}")

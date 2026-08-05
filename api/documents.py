@@ -12,10 +12,12 @@ from datetime import date
 from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from psycopg2 import Binary
 
 from .db import audit, connection, fetch_all, fetch_one
+from .export import export_response
+from .list_params import clamp_page, clamp_page_size, parse_filters, parse_ids, parse_sort
 from .helpers import _condition_id, _line_uom_id, _movement_id, _request_meta, _status_id
 from .permissions import DOC_TYPE_META, GROUP_META, _can_post, _csrf, require_user
 from .schemas import AttachmentIn, DocCreateIn, DocSubmitIn, DocUpdateIn
@@ -308,44 +310,120 @@ def _reverse_document(conn: Any, document_id: int, user: dict[str, Any], req_met
     return _doc_detail(conn, document_id, user)
 
 
-@router.get("")
-def documents(doc_type: str = "", group: str = "", page: int = 1, page_size: int = 30,
-              user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
-    page = max(1, page)
-    page_size = min(100, max(1, page_size))
-    allowed: list[str] | None = None
+_DOC_SORT = {
+    "created_at": "d.created_at",
+    "doc_no": "d.doc_no",
+    "doc_date": "d.doc_date",
+    "total_amount": "d.total_amount",
+    "status": "d.status",
+    "doc_type": "d.doc_type",
+}
+
+_DOC_FILTERS = {
+    "status": ("d.status", ("eq", "in", "ne")),
+    "doc_type": ("d.doc_type", ("eq", "in")),
+    "doc_no": ("d.doc_no", ("contains", "eq")),
+    "party_name": ("coalesce(c.name, s.name, '')", ("contains", "eq")),
+    "doc_date": ("d.doc_date", ("gte", "lte", "eq")),
+}
+
+_DOC_QUERY = """SELECT d.document_id, d.doc_type, d.doc_no, d.status, d.doc_date, d.deposit_amount, d.total_amount,
+                       d.posted_by, d.created_at,
+                       CASE WHEN d.party_type='CUSTOMER' THEN c.name WHEN d.party_type='SUPPLIER' THEN s.name END AS party_name,
+                       (SELECT count(*) FROM business_document_line l WHERE l.document_id=d.document_id) AS line_count
+                  FROM business_document d
+                  LEFT JOIN customer c ON d.party_type='CUSTOMER' AND c.customer_id=d.party_id
+                  LEFT JOIN supplier s ON d.party_type='SUPPLIER' AND s.supplier_id=d.party_id
+                 WHERE {where}
+                 ORDER BY {order_by}"""
+
+_DOC_COUNT = """SELECT count(*) AS n FROM business_document d
+                  LEFT JOIN customer c ON d.party_type='CUSTOMER' AND c.customer_id=d.party_id
+                  LEFT JOIN supplier s ON d.party_type='SUPPLIER' AND s.supplier_id=d.party_id
+                 WHERE {where}"""
+
+_DOC_COLUMNS = [
+    ("单据ID", lambda r: r["document_id"]),
+    ("单号", lambda r: r["doc_no"]),
+    ("类型", lambda r: r["doc_type_label"]),
+    ("日期", lambda r: r["doc_date"]),
+    ("往来方", lambda r: r["party_name"] or ""),
+    ("金额", lambda r: r["total_amount"]),
+    ("状态", lambda r: r["status"]),
+    ("过账人", lambda r: r["posted_by"] or ""),
+    ("创建时间", lambda r: r["created_at"]),
+]
+
+
+def _resolve_doc_types(doc_type: str, group: str, user: dict[str, Any]) -> list[str]:
+    """按 group/doc_type 解析当前用户可见的单据类型集合；列表与导出共用。"""
     if group:
         g = GROUP_META.get(group)
         if not g:
             raise HTTPException(status_code=422, detail="单据分组不存在")
         if user["role"] not in g["view_roles"]:
             raise HTTPException(status_code=403, detail="无权查看该分组")
-        allowed = list(g["types"])
-    elif doc_type:
+        return list(g["types"])
+    if doc_type:
         meta = DOC_TYPE_META.get(doc_type)
         if not meta:
             raise HTTPException(status_code=422, detail="单据类型不存在")
         if user["role"] not in meta["view_roles"]:
             raise HTTPException(status_code=403, detail="无权查看此单据")
-        allowed = [doc_type]
-    else:
-        allowed = [t for t, m in DOC_TYPE_META.items() if user["role"] in m["view_roles"]]
-        if not allowed:
-            return {"items": [], "page": page, "page_size": page_size, "total": 0}
+        return [doc_type]
+    return [t for t, m in DOC_TYPE_META.items() if user["role"] in m["view_roles"]]
+
+
+def _doc_where(allowed: list[str], filters: list[str]) -> tuple[str, list]:
+    clauses = ["d.doc_type = ANY(%s)"]
+    params: list = [list(allowed)]
+    filter_parts, filter_params = parse_filters(filters, _DOC_FILTERS)
+    clauses.extend(filter_parts)
+    params.extend(filter_params)
+    return " AND ".join(clauses), params
+
+
+@router.get("")
+def documents(doc_type: str = "", group: str = "", page: int = 1, page_size: int = 30,
+              sort: str = "", order: str = "asc", f: list[str] = Query(default=[]),
+              user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+    page = clamp_page(page)
+    page_size = clamp_page_size(page_size, cap=500)
+    allowed = _resolve_doc_types(doc_type, group, user)
+    if not allowed:
+        return {"items": [], "page": page, "page_size": page_size, "total": 0}
+    where, params = _doc_where(allowed, f)
+    order_by = parse_sort(sort, order, _DOC_SORT, "created_at")
     with connection() as conn:
-        rows = fetch_all(conn, """SELECT d.document_id,d.doc_type,d.doc_no,d.status,d.doc_date,d.deposit_amount,d.total_amount,d.posted_by,d.created_at,
-                                         CASE WHEN d.party_type='CUSTOMER' THEN c.name WHEN d.party_type='SUPPLIER' THEN s.name END AS party_name,
-                                         (SELECT count(*) FROM business_document_line l WHERE l.document_id=d.document_id) AS line_count
-                                    FROM business_document d
-                                    LEFT JOIN customer c ON d.party_type='CUSTOMER' AND c.customer_id=d.party_id
-                                    LEFT JOIN supplier s ON d.party_type='SUPPLIER' AND s.supplier_id=d.party_id
-                                   WHERE d.doc_type = ANY(%s)
-                                   ORDER BY d.created_at DESC LIMIT %s OFFSET %s""",
-                          (list(allowed), page_size, (page - 1) * page_size))
-        total = fetch_one(conn, "SELECT count(*) AS n FROM business_document WHERE doc_type = ANY(%s)", (list(allowed),))
+        rows = fetch_all(conn, _DOC_QUERY.format(where=where, order_by=order_by) + " LIMIT %s OFFSET %s", tuple(params + [page_size, (page - 1) * page_size]))
+        total = fetch_one(conn, _DOC_COUNT.format(where=where), tuple(params))
     for row in rows:
         row["doc_type_label"] = DOC_TYPE_META[row["doc_type"]]["label"]
     return {"items": rows, "page": page, "page_size": page_size, "total": int(total["n"])}
+
+
+@router.get("/export")
+def documents_export(doc_type: str = "", group: str = "", sort: str = "", order: str = "asc",
+                     f: list[str] = Query(default=[]), ids: str = "", fmt: str = "xlsx",
+                     user: dict[str, Any] = Depends(require_user)) -> Response:
+    allowed = _resolve_doc_types(doc_type, group, user)
+    if not allowed:
+        return export_response([], _DOC_COLUMNS, "单据", fmt)
+    where, params = _doc_where(allowed, f)
+    if ids:
+        try:
+            id_list = parse_ids(ids)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        id_params = ", ".join(["%s"] * len(id_list))
+        where = f"{where} AND d.document_id IN ({id_params})"
+        params.extend(id_list)
+    order_by = parse_sort(sort, order, _DOC_SORT, "created_at")
+    with connection() as conn:
+        rows = fetch_all(conn, _DOC_QUERY.format(where=where, order_by=order_by), tuple(params))
+    for row in rows:
+        row["doc_type_label"] = DOC_TYPE_META[row["doc_type"]]["label"]
+    return export_response(rows, _DOC_COLUMNS, "单据", fmt)
 
 
 @router.get("/{document_id}")

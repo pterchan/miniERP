@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from .db import audit, connection, fetch_all, fetch_one
+from .export import export_response, export_rows_by_ids
 from .helpers import _request_meta
 from .permissions import _csrf, require_roles, require_user
 from .schemas import CategoryIn, CustomerIn, DepartmentIn, PriceTierIn, SupplierIn
@@ -63,6 +64,19 @@ def update_category(category_id: int, payload: CategoryIn, request: Request, use
     return {"category_id": category_id, "name": payload.name, "parent_category_id": payload.parent_category_id, "sort_order": payload.sort_order, "is_active": payload.is_active}
 
 
+_CUSTOMER_COLUMNS = [
+    ("客户ID", lambda r: r["customer_id"]),
+    ("名称", lambda r: r["name"]),
+    ("联系人", lambda r: r["contact_person"] or ""),
+    ("电话", lambda r: r["phone"] or ""),
+    ("结算方式", lambda r: r["settlement_method"] or ""),
+    ("等级", lambda r: r["level"] or ""),
+    ("信用上限", lambda r: r["credit_limit"]),
+    ("应收余额", lambda r: r["receivable_balance"]),
+    ("启用", lambda r: "是" if r["is_active"] else "否"),
+]
+
+
 @router.get("/customers")
 def customers(user: dict[str, Any] = Depends(require_roles("SALES", "FINANCE", "ADMIN"))) -> list[dict[str, Any]]:
     with connection() as conn:
@@ -71,6 +85,17 @@ def customers(user: dict[str, Any] = Depends(require_roles("SALES", "FINANCE", "
                                     FROM customer c
                                     LEFT JOIN v_customer_balance v ON v.customer_id=c.customer_id
                                    ORDER BY c.name""")
+
+
+@router.get("/customers/export")
+def customers_export(ids: str = "", fmt: str = "xlsx", user: dict[str, Any] = Depends(require_roles("SALES", "FINANCE", "ADMIN"))) -> Response:
+    with connection() as conn:
+        return export_rows_by_ids(conn, ids, "c.customer_id",
+            """SELECT c.customer_id,c.name,c.contact_person,c.phone,c.address,c.settlement_method,c.level,c.credit_limit,c.is_active,
+                      COALESCE(v.receivable_balance,0) AS receivable_balance
+                 FROM customer c LEFT JOIN v_customer_balance v ON v.customer_id=c.customer_id
+                WHERE {where} ORDER BY {order_by}""",
+            "c.name", _CUSTOMER_COLUMNS, "客户", fmt)
 
 
 @router.get("/customers/{customer_id}")
@@ -123,6 +148,17 @@ def update_customer(customer_id: int, payload: CustomerIn, request: Request, use
     return customer_detail(customer_id, user)
 
 
+_SUPPLIER_COLUMNS = [
+    ("供应商ID", lambda r: r["supplier_id"]),
+    ("名称", lambda r: r["name"]),
+    ("联系人", lambda r: r["contact_person"] or ""),
+    ("电话", lambda r: r["phone"] or ""),
+    ("账期(天)", lambda r: r["settlement_days"] if r["settlement_days"] is not None else ""),
+    ("应付余额", lambda r: r["payable_balance"]),
+    ("启用", lambda r: "是" if r["is_active"] else "否"),
+]
+
+
 @router.get("/suppliers")
 def suppliers(user: dict[str, Any] = Depends(require_roles("WAREHOUSE", "FINANCE", "ADMIN"))) -> list[dict[str, Any]]:
     with connection() as conn:
@@ -130,6 +166,17 @@ def suppliers(user: dict[str, Any] = Depends(require_roles("WAREHOUSE", "FINANCE
                                          COALESCE(v.payable_balance,0) AS payable_balance
                                     FROM supplier s LEFT JOIN v_supplier_balance v ON v.supplier_id=s.supplier_id
                                    ORDER BY s.name""")
+
+
+@router.get("/suppliers/export")
+def suppliers_export(ids: str = "", fmt: str = "xlsx", user: dict[str, Any] = Depends(require_roles("WAREHOUSE", "FINANCE", "ADMIN"))) -> Response:
+    with connection() as conn:
+        return export_rows_by_ids(conn, ids, "s.supplier_id",
+            """SELECT s.supplier_id,s.name,s.contact_person,s.phone,s.address,s.settlement_days,s.is_active,
+                      COALESCE(v.payable_balance,0) AS payable_balance
+                 FROM supplier s LEFT JOIN v_supplier_balance v ON v.supplier_id=s.supplier_id
+                WHERE {where} ORDER BY {order_by}""",
+            "s.name", _SUPPLIER_COLUMNS, "供应商", fmt)
 
 
 @router.get("/suppliers/{supplier_id}")

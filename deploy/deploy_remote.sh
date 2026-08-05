@@ -114,6 +114,9 @@ BOOTSTRAP_REQUESTER_USERNAME=colleague
 BOOTSTRAP_REQUESTER_PASSWORD=$(gen_secret)
 OCR_INTERNAL_TOKEN=$(gen_secret)
 OCR_PROXY_TIMEOUT_SECONDS=25
+MINIO_ACCESS_KEY=$(openssl rand -hex 8)
+MINIO_SECRET_KEY=$(openssl rand -hex 16)
+MINIO_BUCKET=erp-product-images
 WEB_PORT=80
 API_PORT=127.0.0.1:18001
 POSTGRES_PORT=127.0.0.1:15432
@@ -135,6 +138,13 @@ if ! docker image inspect python:3.12-slim >/dev/null 2>&1; then
   CACHED_PYTHON="$(docker image ls --format '{{.ID}}' python | head -n 1)"
   [[ -n "$CACHED_PYTHON" ]] || { echo "python:3.12-slim base image is unavailable" >&2; exit 1; }
   docker tag "$CACHED_PYTHON" python:3.12-slim
+fi
+
+# The target host has no Docker Hub access; the MinIO image must come from the
+# mirror as well. Prefetch + retag so the compose service can start offline.
+if ! docker image inspect minio/minio:latest >/dev/null 2>&1; then
+  docker pull minio/minio:latest >/dev/null 2>&1 || true
+  docker tag minio/minio:latest minio/minio:latest 2>/dev/null || true
 fi
 
 docker compose --env-file .env config --quiet
