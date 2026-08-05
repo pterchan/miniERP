@@ -17,6 +17,14 @@ describe('dense business lists', () => {
     expect(within(list).getByRole('link')).toHaveAccessibleName(/业务编号 —.*成色 NEW.*现库存 8.5 EA/)
   })
 
+  it('renders integral stock without a decimal point or decimals', () => {
+    render(<BalanceList rows={[{ product_id: 1, location_id: 2, condition_id: 3, uom_id: 4, product_name: '测试货品', location_name: '主仓库', condition_code: 'NEW', on_hand_quantity: '12.000', uom_code: 'EA', identifier: 'MED-1' }]} />)
+
+    const list = screen.getByLabelText('库存余额列表')
+    expect(within(list).getByText('12')).toBeInTheDocument()
+    expect(within(list).getByRole('link')).toHaveAccessibleName(/现库存 12 EA/)
+  })
+
   it('renders product columns and keeps multiple units separate', () => {
     const inventoryByProduct = new Map([['7', [{ uom_code: 'BOX', quantity: 3 }, { uom_code: 'EA', quantity: 12 }]]])
     render(<ProductRows inventoryByProduct={inventoryByProduct} rows={[{ product_id: 7, identifier: 'MED-7', display_name: '手术器械', manufacturer: '厂家 A', specification: 'XL', uom_code: 'EA' }]} />)

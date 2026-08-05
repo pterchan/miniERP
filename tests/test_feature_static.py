@@ -8,6 +8,8 @@ SCHEMAS = (ROOT / "api/schemas.py").read_text(encoding="utf-8")
 FRONTEND = (ROOT / "web/src/main.jsx").read_text(encoding="utf-8")
 SCAN_UTILS = (ROOT / "web/src/scan-utils.js").read_text(encoding="utf-8")
 STYLES = (ROOT / "web/src/styles.css").read_text(encoding="utf-8")
+LIST_UTILS = (ROOT / "web/src/list-utils.js").read_text(encoding="utf-8")
+UI = (ROOT / "web/src/ui.jsx").read_text(encoding="utf-8")
 
 
 class FeatureContractTests(unittest.TestCase):
@@ -31,7 +33,7 @@ class FeatureContractTests(unittest.TestCase):
             "/api/audit/{audit_event_id}",
         ):
             self.assertIn(route, API)
-        self.assertIn("不能停用或降级最后一个有效仓管", API)
+        self.assertIn("不能停用或降级最后一个有效管理员", API)
 
     def test_mobile_ocr_and_history_router_contract(self):
         for token in ("capture=\"environment\"", "heic2any", "reshoot_required", "MAX_OCR_CANDIDATES", "100dvh"):
@@ -39,6 +41,28 @@ class FeatureContractTests(unittest.TestCase):
             self.assertIn(token, source)
         self.assertIn("pushState", FRONTEND)
         self.assertIn("bottom-nav", STYLES)
+
+    def test_stock_count_and_unit_creation_contract(self):
+        for route in ('@app.post("/api/inventory/adjust")', '@app.post("/api/uoms")'):
+            self.assertIn(route, API)
+        for token in ("InventoryAdjustIn", "counted_quantity", "change_default_unit", "UomIn", "decimal_scale"):
+            self.assertIn(token, SCHEMAS)
+        self.assertIn("清点库存", FRONTEND)
+        self.assertIn("useIsMobile", UI)
+        self.assertIn("matchMedia", UI)
+        self.assertIn("first === 'count'", FRONTEND)
+        self.assertIn("formatQuantity", LIST_UTILS)
+
+    def test_conflict_edit_loop_contract(self):
+        for route in ("/link-product", "/create-product", "/edit-product"):
+            self.assertIn(route, API)
+        for token in ("ConflictLinkIn", "ConflictCreateProductIn", "ConflictEditProductIn", "outcome"):
+            self.assertIn(token, SCHEMAS)
+        self.assertIn("identifier_conflicts", API)
+        self.assertIn("_resolve_case", API)
+        self.assertIn("关联现有货品", FRONTEND)
+        self.assertIn("按观测新建货品", FRONTEND)
+        self.assertIn("编辑货品主数据", FRONTEND)
 
 
 if __name__ == "__main__":

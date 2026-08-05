@@ -156,6 +156,15 @@ button {
   white-space: nowrap;
 }
 
+.nav-group {
+  margin: 14px 10px 2px;
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
 .nav-link:hover {
   color: var(--text);
   background: var(--surface-hover);

@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 DDL = (ROOT / "db/migrations/002_erp_oa.sql").read_text(encoding="utf-8")
+FULL_DDL = (ROOT / "db/migrations/003_full_erp.sql").read_text(encoding="utf-8")
 API = (ROOT / "api/main.py").read_text(encoding="utf-8")
 SEED = (ROOT / "scripts/seed_inventory.py").read_text(encoding="utf-8")
 
@@ -21,6 +22,8 @@ class BackendContractTests(unittest.TestCase):
         self.assertIn("REQUESTER", DDL)
         for state in ("DRAFT", "SUBMITTED", "APPROVED", "REJECTED", "RELEASED", "WITHDRAWN"):
             self.assertIn(state, DDL)
+        for role in ("'ADMIN'", "'WAREHOUSE'", "'SALES'", "'FINANCE'", "'COLLEAGUE'"):
+            self.assertIn(role, FULL_DDL)
 
     def test_required_routes_and_cookie_csrf(self):
         for route in ("/api/auth/login", "/api/products", "/api/inventory/balance", "/api/stock-requests", "/submit", "/approve", "/reject", "/release", "/api/conflicts", "/api/audit"):

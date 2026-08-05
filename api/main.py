@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 import os
-import ipaddress
-import unicodedata
 import uuid
-from datetime import datetime, timezone
+import unicodedata
+from decimal import Decimal
 from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
+from . import documents, master, reports
 from .db import audit, connection, ensure_bootstrap_users, fetch_all, fetch_one
+from .helpers import _condition_id, _line_uom_id, _movement_id, _request_meta, _status_id
 from .ocr_client import OCRProxyError, forward_ocr
+from .permissions import CSRF_COOKIE, SESSION_COOKIE, _csrf, require_roles, require_user
 from .schemas import (
+    ChangePasswordIn,
+    ConflictCreateProductIn,
+    ConflictEditProductIn,
+    ConflictLinkIn,
     ConflictResolveIn,
+    InventoryAdjustIn,
     LocationIn,
     LocationUpdateIn,
     LoginIn,
@@ -24,13 +31,14 @@ from .schemas import (
     RejectIn,
     StockRequestIn,
     StockRequestPatch,
+    UomIn,
     UserCreateIn,
     UserUpdateIn,
 )
 from .security import hash_password, random_token, token_hash, utc_after, verify_password
 
 
-app = FastAPI(title="Inventory ERP/OA POC", version="0.1.0")
+app = FastAPI(title="miniERP", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[x for x in os.environ.get("ERP_CORS_ORIGINS", "http://localhost:5173").split(",") if x],
@@ -39,8 +47,10 @@ app.add_middleware(
     allow_headers=["Content-Type", "X-CSRF-Token"],
 )
 
-SESSION_COOKIE = "erp_session"
-CSRF_COOKIE = "erp_csrf"
+app.include_router(documents.router)
+app.include_router(documents.attachments_router)
+app.include_router(master.router)
+app.include_router(reports.router)
 
 
 @app.on_event("startup")
@@ -52,19 +62,6 @@ def startup() -> None:
     except Exception:
         if os.environ.get("ERP_BOOTSTRAP_STRICT", "0") == "1":
             raise
-
-
-def _request_meta(request: Request) -> dict[str, str | None]:
-    raw_ip = request.client.host if request.client else None
-    try:
-        ip_address = str(ipaddress.ip_address(raw_ip)) if raw_ip else None
-    except ValueError:
-        ip_address = None
-    return {
-        "request_id": request.headers.get("X-Request-ID", str(uuid.uuid4())),
-        "ip_address": ip_address,
-        "user_agent": request.headers.get("User-Agent"),
-    }
 
 
 def _normalize_query(value: str) -> str:
@@ -140,91 +137,6 @@ def _set_primary_identifier(conn: Any, product_id: int, identifier: str | None, 
     return conflicts
 
 
-def _user_from_request(request: Request) -> dict[str, Any]:
-    raw = request.cookies.get(SESSION_COOKIE)
-    if not raw:
-        raise HTTPException(status_code=401, detail="登录已失效")
-    with connection() as conn:
-        user = fetch_one(
-            conn,
-            """SELECT u.user_id,u.username,u.display_name,u.role
-               FROM app_session s JOIN app_user u USING(user_id)
-               WHERE s.token_hash=%s AND s.revoked_at IS NULL AND s.expires_at>now() AND u.is_active""",
-            (token_hash(raw),),
-        )
-    if not user:
-        raise HTTPException(status_code=401, detail="登录已失效")
-    return user
-
-
-def require_user(request: Request) -> dict[str, Any]:
-    return _user_from_request(request)
-
-
-def require_admin(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
-    if user["role"] != "WAREHOUSE_ADMIN":
-        raise HTTPException(status_code=403, detail="仅仓管可执行此操作")
-    return user
-
-
-def _csrf(request: Request) -> None:
-    if request.method in {"GET", "HEAD", "OPTIONS"}:
-        return
-    expected = request.cookies.get(CSRF_COOKIE)
-    provided = request.headers.get("X-CSRF-Token")
-    if not expected or not provided or expected != provided:
-        raise HTTPException(status_code=403, detail="CSRF token 无效")
-    session = request.cookies.get(SESSION_COOKIE)
-    if not session:
-        raise HTTPException(status_code=403, detail="会话不存在")
-    with connection() as conn:
-        row = fetch_one(conn, "SELECT csrf_token_hash FROM app_session WHERE token_hash=%s AND revoked_at IS NULL AND expires_at>now()", (token_hash(session),))
-    if not row or row["csrf_token_hash"] != token_hash(expected):
-        raise HTTPException(status_code=403, detail="CSRF token 已失效")
-
-
-def _status_id(conn: Any, code: str) -> int:
-    row = fetch_one(conn, "SELECT status_id FROM record_status WHERE code=%s", (code,))
-    if not row:
-        raise HTTPException(status_code=500, detail=f"缺少状态字典: {code}")
-    return int(row["status_id"])
-
-
-def _movement_id(conn: Any, code: str) -> int:
-    row = fetch_one(conn, "SELECT movement_type_id FROM movement_type WHERE code=%s", (code,))
-    if not row:
-        raise HTTPException(status_code=500, detail=f"缺少流水类型: {code}")
-    return int(row["movement_type_id"])
-
-
-def _condition_id(conn: Any, value: int | None) -> int:
-    if value:
-        return value
-    row = fetch_one(conn, "SELECT condition_id FROM inventory_condition WHERE code='new'")
-    return int(row["condition_id"])
-
-
-def _line_uom_id(conn: Any, line: Any) -> int:
-    """Resolve a requested unit without converting its quantity."""
-    if not fetch_one(conn, "SELECT product_id FROM product WHERE product_id=%s", (line.product_id,)):
-        raise HTTPException(status_code=404, detail="货品不存在")
-    if line.uom_id:
-        row = fetch_one(conn, "SELECT uom_id FROM uom WHERE uom_id=%s AND is_active", (line.uom_id,))
-        if row:
-            return int(row["uom_id"])
-        raise HTTPException(status_code=422, detail="单位不存在或已停用")
-    if line.uom_code:
-        aliases = {"个": "EA", "件": "EA", "台": "EA", "盒": "BOX", "箱": "BOX", "套": "SET", "米": "M"}
-        code = aliases.get(line.uom_code.strip(), line.uom_code.strip().upper())
-        row = fetch_one(conn, "SELECT uom_id FROM uom WHERE code=%s AND is_active", (code,))
-        if row:
-            return int(row["uom_id"])
-        raise HTTPException(status_code=422, detail="单位不存在或已停用")
-    row = fetch_one(conn, "SELECT COALESCE(default_uom_id,(SELECT uom_id FROM uom WHERE code='UNKNOWN')) AS uom_id FROM product WHERE product_id=%s", (line.product_id,))
-    if not row:
-        raise HTTPException(status_code=404, detail="货品不存在")
-    return int(row["uom_id"])
-
 
 def _main_location_id(conn: Any) -> int | None:
     row = fetch_one(conn, "SELECT location_id FROM location WHERE code='MAIN' AND is_active")
@@ -286,6 +198,22 @@ def me(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
     return user
 
 
+@app.post("/api/auth/change-password")
+def change_password(payload: ChangePasswordIn, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, str]:
+    _csrf(request)
+    meta = _request_meta(request)
+    with connection() as conn:
+        row = fetch_one(conn, "SELECT password_hash FROM app_user WHERE user_id=%s FOR UPDATE", (user["user_id"],))
+        if not row or not verify_password(payload.current_password, row["password_hash"]):
+            raise HTTPException(status_code=403, detail="当前密码不正确")
+        audit(conn, user, "CHANGE_PASSWORD", "app_user", target_id=user["user_id"],
+              before={"user_id": user["user_id"]}, after={"user_id": user["user_id"]},
+              request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
+        with conn.cursor() as cur:
+            cur.execute("UPDATE app_user SET password_hash=%s,updated_at=now() WHERE user_id=%s", (hash_password(payload.new_password), user["user_id"]))
+    return {"status": "ok"}
+
+
 @app.get("/api/products")
 def products(q: str = "", page: int = 1, page_size: int = 30, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
     page = max(1, page)
@@ -330,11 +258,14 @@ def product_detail(product_id: int, user: dict[str, Any] = Depends(require_user)
                                                            FROM product_identifier pi JOIN product p ON p.product_id=pi.product_id
                                                           WHERE pi.value_normalized=%s AND pi.product_id<>%s""", (primary["value_normalized"], product_id)) if primary else []
         row["aliases"] = fetch_all(conn, "SELECT product_name_alias_id,alias_raw,alias_normalized,is_verified,is_exclusive,notes FROM product_name_alias WHERE product_id=%s ORDER BY product_name_alias_id", (product_id,))
+        row["price_tiers"] = fetch_all(conn, "SELECT price_tier_id,tier_name,min_quantity,price FROM product_price_tier WHERE product_id=%s ORDER BY min_quantity", (product_id,))
+        if user["role"] in ("SALES", "COLLEAGUE"):
+            row["purchase_cost_price"] = None
         return row
 
 
 @app.post("/api/products")
-def create_product(payload: ProductCreateIn, request: Request, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+def create_product(payload: ProductCreateIn, request: Request, user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
     _csrf(request)
     meta = _request_meta(request)
     with connection() as conn:
@@ -344,15 +275,15 @@ def create_product(payload: ProductCreateIn, request: Request, user: dict[str, A
         after = {**payload.model_dump(), "default_uom_id": uom_id}
         audit(conn, user, "CREATE", "product", after=after, request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
         with conn.cursor() as cur:
-            cur.execute("""INSERT INTO product(display_name,manufacturer,specification,default_uom_id,source_uom_raw)
-                         VALUES (%s,%s,%s,%s,%s) RETURNING product_id""", (payload.display_name.strip(), payload.manufacturer, payload.specification, uom_id, payload.source_uom_raw))
+            cur.execute("""INSERT INTO product(display_name,manufacturer,specification,default_uom_id,source_uom_raw,category_id,purchase_cost_price,sales_price)
+                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING product_id""", (payload.display_name.strip(), payload.manufacturer, payload.specification, uom_id, payload.source_uom_raw, payload.category_id, payload.purchase_cost_price or 0, payload.sales_price or 0))
             product_id = cur.fetchone()[0]
         _set_primary_identifier(conn, product_id, payload.primary_identifier, user, meta)
     return product_detail(product_id, user)
 
 
 @app.put("/api/products/{product_id}")
-def update_product(product_id: int, payload: ProductUpdateIn, request: Request, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+def update_product(product_id: int, payload: ProductUpdateIn, request: Request, user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
     _csrf(request)
     meta = _request_meta(request)
     with connection() as conn:
@@ -366,8 +297,9 @@ def update_product(product_id: int, payload: ProductUpdateIn, request: Request, 
         after = {**before, **values, "default_uom_id": uom_id}
         audit(conn, user, "EDIT", "product", target_id=product_id, before=before, after=after, field_diff={k: [before.get(k), v] for k, v in after.items() if before.get(k) != v}, request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
         with conn.cursor() as cur:
-            cur.execute("""UPDATE product SET display_name=%s,manufacturer=%s,specification=%s,default_uom_id=%s,source_uom_raw=%s,updated_at=now()
-                         WHERE product_id=%s""", (after.get("display_name", before["display_name"]).strip(), after.get("manufacturer"), after.get("specification"), uom_id, after.get("source_uom_raw"), product_id))
+            cur.execute("""UPDATE product SET display_name=%s,manufacturer=%s,specification=%s,default_uom_id=%s,source_uom_raw=%s,
+                                 category_id=%s,purchase_cost_price=%s,sales_price=%s,updated_at=now()
+                         WHERE product_id=%s""", (after.get("display_name", before["display_name"]).strip(), after.get("manufacturer"), after.get("specification"), uom_id, after.get("source_uom_raw"), after.get("category_id"), after.get("purchase_cost_price", 0), after.get("sales_price", 0), product_id))
         conflicts = _set_primary_identifier(conn, product_id, values["primary_identifier"] if values["primary_identifier"] is not None else "", user, meta) if "primary_identifier" in values else []
     result = product_detail(product_id, user)
     result["identifier_conflicts"] = conflicts
@@ -402,10 +334,95 @@ def inventory_balance_detail(product_id: int, location_id: int, condition_id: in
         return row
 
 
+@app.post("/api/inventory/adjust")
+def adjust_inventory(payload: InventoryAdjustIn, request: Request, user: dict[str, Any] = Depends(require_roles("WAREHOUSE", "ADMIN"))) -> dict[str, Any]:
+    """Override a product's on-hand at one location by posting an ADJUSTMENT.
+
+    A positive delta lands as a destination-side receipt, a negative delta as a
+    source-side issue, so the ledger CHECK (quantity > 0) always holds while the
+    balance view still nets to the counted value (negatives are allowed).
+    """
+    _csrf(request)
+    meta = _request_meta(request)
+    with connection() as conn:
+        product = fetch_one(conn, "SELECT * FROM product WHERE product_id=%s FOR UPDATE", (payload.product_id,))
+        if not product:
+            raise HTTPException(status_code=404, detail="货品不存在")
+        if not fetch_one(conn, "SELECT location_id FROM location WHERE location_id=%s AND is_active", (payload.location_id,)):
+            raise HTTPException(status_code=422, detail="库位不存在或已停用")
+        uom = fetch_one(conn, "SELECT uom_id,code FROM uom WHERE uom_id=%s AND is_active", (payload.uom_id,))
+        if not uom:
+            raise HTTPException(status_code=422, detail="单位不存在或已停用")
+        condition_id = _condition_id(conn, payload.condition_id)
+        balance = fetch_one(conn, """SELECT * FROM v_inventory_balance
+                                      WHERE product_id=%s AND location_id=%s AND condition_id=%s AND uom_id=%s""",
+                            (payload.product_id, payload.location_id, condition_id, payload.uom_id))
+        current_qty = Decimal(balance["on_hand_quantity"]) if balance else Decimal(0)
+        delta = payload.counted_quantity - current_qty
+        movement_posted = False
+        if delta != 0:
+            movement_posted = True
+            quantity = abs(delta)
+            destination_location = payload.location_id if delta > 0 else None
+            source_location = None if delta > 0 else payload.location_id
+            audit(conn, user, "ADJUST", "inventory_movement",
+                  after={"product_id": payload.product_id, "location_id": payload.location_id,
+                         "uom_id": payload.uom_id, "quantity": str(quantity), "delta": str(delta)},
+                  request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,source_uom_raw,notes,posted_at,posted_by)
+                             VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s)""",
+                            (_movement_id(conn, "ADJUSTMENT"), _status_id(conn, "posted"), payload.product_id,
+                             quantity, payload.uom_id, condition_id, source_location, destination_location,
+                             payload.source_uom_raw, payload.notes, user["username"]))
+        if payload.change_default_unit and product["default_uom_id"] != payload.uom_id:
+            audit(conn, user, "EDIT", "product", target_id=payload.product_id,
+                  before={"default_uom_id": product["default_uom_id"]}, after={"default_uom_id": payload.uom_id},
+                  field_diff={"default_uom_id": [product["default_uom_id"], payload.uom_id]},
+                  request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
+            with conn.cursor() as cur:
+                cur.execute("UPDATE product SET default_uom_id=%s,updated_at=now() WHERE product_id=%s", (payload.uom_id, payload.product_id))
+        after_balance = fetch_one(conn, """SELECT * FROM v_inventory_balance
+                                            WHERE product_id=%s AND location_id=%s AND condition_id=%s AND uom_id=%s""",
+                                  (payload.product_id, payload.location_id, condition_id, payload.uom_id))
+    on_hand = after_balance["on_hand_quantity"] if after_balance else Decimal(0)
+    return {
+        "product_id": payload.product_id,
+        "product_name": product["display_name"],
+        "location_id": payload.location_id,
+        "location_name": (after_balance or balance or {}).get("location_name") or "—",
+        "condition_id": condition_id,
+        "condition_code": (after_balance or balance or {}).get("condition_code") or "—",
+        "uom_id": payload.uom_id,
+        "uom_code": (after_balance or balance or {}).get("uom_code") or uom["code"],
+        "on_hand_quantity": on_hand,
+        "delta": delta,
+        "movement_posted": movement_posted,
+    }
+
+
 @app.get("/api/uoms")
 def uoms(user: dict[str, Any] = Depends(require_user)) -> list[dict[str, Any]]:
     with connection() as conn:
         return fetch_all(conn, "SELECT uom_id,code,display_name,decimal_scale FROM uom WHERE is_active ORDER BY code")
+
+
+@app.post("/api/uoms")
+def create_uom(payload: UomIn, request: Request, user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
+    _csrf(request)
+    code = payload.code.strip().upper()
+    meta = _request_meta(request)
+    with connection() as conn:
+        if fetch_one(conn, "SELECT uom_id FROM uom WHERE code=%s", (code,)):
+            raise HTTPException(status_code=409, detail="单位编码已存在")
+        audit(conn, user, "CREATE", "uom",
+              after={"code": code, "display_name": payload.display_name.strip(), "decimal_scale": payload.decimal_scale, "is_active": payload.is_active},
+              request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO uom(code,display_name,decimal_scale,is_active)
+                         VALUES (%s,%s,%s,%s) RETURNING uom_id,code,display_name,decimal_scale,is_active""",
+                        (code, payload.display_name.strip(), payload.decimal_scale, payload.is_active))
+            return dict(zip([d.name for d in cur.description], cur.fetchone()))
 
 
 @app.get("/api/locations")
@@ -427,7 +444,7 @@ def location_detail(location_id: int, user: dict[str, Any] = Depends(require_use
 
 
 @app.post("/api/locations")
-def create_location(payload: LocationIn, request: Request, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+def create_location(payload: LocationIn, request: Request, user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
     _csrf(request)
     if payload.location_type not in {"warehouse", "hospital", "department", "customer", "external", "transit", "other"}:
         raise HTTPException(status_code=422, detail="库位类型无效")
@@ -448,7 +465,7 @@ def create_location(payload: LocationIn, request: Request, user: dict[str, Any] 
 
 
 @app.put("/api/locations/{location_id}")
-def update_location(location_id: int, payload: LocationUpdateIn, request: Request, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+def update_location(location_id: int, payload: LocationUpdateIn, request: Request, user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
     _csrf(request)
     values = payload.model_dump(exclude_unset=True)
     if "location_type" in values and not _valid_location_type(values["location_type"]):
@@ -467,13 +484,13 @@ def update_location(location_id: int, payload: LocationUpdateIn, request: Reques
 
 
 @app.get("/api/admin/users")
-def users(user: dict[str, Any] = Depends(require_admin)) -> list[dict[str, Any]]:
+def users(user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> list[dict[str, Any]]:
     with connection() as conn:
         return fetch_all(conn, "SELECT user_id,username,display_name,role,is_active,created_at FROM app_user ORDER BY username")
 
 
 @app.get("/api/admin/users/{user_id}")
-def user_detail(user_id: int, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+def user_detail(user_id: int, user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
     with connection() as conn:
         row = fetch_one(conn, "SELECT user_id,username,display_name,role,is_active,created_at,updated_at FROM app_user WHERE user_id=%s", (user_id,))
         if not row:
@@ -482,9 +499,9 @@ def user_detail(user_id: int, user: dict[str, Any] = Depends(require_admin)) -> 
 
 
 @app.post("/api/admin/users")
-def create_user(payload: UserCreateIn, request: Request, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+def create_user(payload: UserCreateIn, request: Request, user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
     _csrf(request)
-    if payload.role not in {"WAREHOUSE_ADMIN", "REQUESTER"}:
+    if payload.role not in {"ADMIN", "WAREHOUSE", "SALES", "FINANCE", "COLLEAGUE"}:
         raise HTTPException(status_code=422, detail="角色无效")
     with connection() as conn:
         if fetch_one(conn, "SELECT user_id FROM app_user WHERE username=%s", (payload.username.strip(),)):
@@ -497,10 +514,10 @@ def create_user(payload: UserCreateIn, request: Request, user: dict[str, Any] = 
 
 
 @app.put("/api/admin/users/{user_id}")
-def update_user(user_id: int, payload: UserUpdateIn, request: Request, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+def update_user(user_id: int, payload: UserUpdateIn, request: Request, user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
     _csrf(request)
     values = payload.model_dump(exclude_unset=True)
-    if "role" in values and values["role"] not in {"WAREHOUSE_ADMIN", "REQUESTER"}:
+    if "role" in values and values["role"] not in {"ADMIN", "WAREHOUSE", "SALES", "FINANCE", "COLLEAGUE"}:
         raise HTTPException(status_code=422, detail="角色无效")
     meta = _request_meta(request)
     with connection() as conn:
@@ -508,10 +525,10 @@ def update_user(user_id: int, payload: UserUpdateIn, request: Request, user: dic
         if not before:
             raise HTTPException(status_code=404, detail="用户不存在")
         after = {**before, **{k: v for k, v in values.items() if k != "password"}}
-        if (after["role"] != "WAREHOUSE_ADMIN" or not after["is_active"]) and before["role"] == "WAREHOUSE_ADMIN" and before["is_active"]:
-            remaining = fetch_one(conn, "SELECT count(*) AS n FROM app_user WHERE role='WAREHOUSE_ADMIN' AND is_active AND user_id<>%s", (user_id,))
+        if (after["role"] != "ADMIN" or not after["is_active"]) and before["role"] == "ADMIN" and before["is_active"]:
+            remaining = fetch_one(conn, "SELECT count(*) AS n FROM app_user WHERE role='ADMIN' AND is_active AND user_id<>%s", (user_id,))
             if not remaining or int(remaining["n"]) < 1:
-                raise HTTPException(status_code=409, detail="不能停用或降级最后一个有效仓管")
+                raise HTTPException(status_code=409, detail="不能停用或降级最后一个有效管理员")
         audit(conn, user, "EDIT", "app_user", target_id=user_id, before={k: before.get(k) for k in after if k != "password_hash"}, after=after, field_diff={k: [before.get(k), after.get(k)] for k in values if before.get(k) != after.get(k)}, request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
         with conn.cursor() as cur:
             if "password" in values:
@@ -522,7 +539,7 @@ def update_user(user_id: int, payload: UserUpdateIn, request: Request, user: dic
 
 
 @app.post("/api/admin/users/{user_id}/password")
-def reset_user_password(user_id: int, payload: UserUpdateIn, request: Request, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+def reset_user_password(user_id: int, payload: UserUpdateIn, request: Request, user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
     """Explicit password-reset route; only the password field is honored."""
     if not payload.password:
         raise HTTPException(status_code=422, detail="密码不能为空")
@@ -541,7 +558,7 @@ def reset_user_password(user_id: int, payload: UserUpdateIn, request: Request, u
 @app.get("/api/stock-requests")
 def stock_requests(user: dict[str, Any] = Depends(require_user)) -> list[dict[str, Any]]:
     with connection() as conn:
-        if user["role"] == "WAREHOUSE_ADMIN":
+        if user["role"] in {"WAREHOUSE", "ADMIN"}:
             rows = fetch_all(conn, "SELECT sr.*,u.username AS requester_username,u.display_name AS requester_display_name FROM stock_request sr JOIN app_user u ON u.user_id=sr.requester_user_id ORDER BY sr.created_at DESC")
         else:
             rows = fetch_all(conn, "SELECT * FROM stock_request WHERE requester_user_id=%s ORDER BY created_at DESC", (user["user_id"],))
@@ -556,7 +573,7 @@ def stock_requests(user: dict[str, Any] = Depends(require_user)) -> list[dict[st
 def stock_request_detail(request_id: int, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
     with connection() as conn:
         row = fetch_one(conn, "SELECT * FROM stock_request WHERE stock_request_id=%s", (request_id,))
-        if not row or (user["role"] != "WAREHOUSE_ADMIN" and row["requester_user_id"] != user["user_id"]):
+        if not row or (user["role"] not in {"WAREHOUSE", "ADMIN"} and row["requester_user_id"] != user["user_id"]):
             raise HTTPException(status_code=404, detail="申请单不存在")
         row["lines"] = fetch_all(conn, """SELECT l.*,p.display_name AS product_name,p.manufacturer,p.specification,
                                                     u.code AS uom_code,u.display_name AS uom_display_name,
@@ -615,11 +632,11 @@ def edit_stock_request(request_id: int, payload: StockRequestPatch, request: Req
         raise HTTPException(status_code=422, detail="来源和目的库位不能相同")
     with connection() as conn:
         row = fetch_one(conn, "SELECT * FROM stock_request WHERE stock_request_id=%s FOR UPDATE", (request_id,))
-        if not row or (user["role"] != "WAREHOUSE_ADMIN" and row["requester_user_id"] != user["user_id"]):
+        if not row or (user["role"] not in {"WAREHOUSE", "ADMIN"} and row["requester_user_id"] != user["user_id"]):
             raise HTTPException(status_code=404, detail="申请单不存在")
         if row["version"] != payload.version:
             raise HTTPException(status_code=409, detail="申请单已被其他人修改，请刷新后重试")
-        if row["status"] not in {"DRAFT", "SUBMITTED"} or (user["role"] != "WAREHOUSE_ADMIN" and row["status"] != "DRAFT"):
+        if row["status"] not in {"DRAFT", "SUBMITTED"} or (user["role"] not in {"WAREHOUSE", "ADMIN"} and row["status"] != "DRAFT"):
             raise HTTPException(status_code=409, detail="当前状态不可编辑")
         values = payload.model_dump(exclude_unset=True)
         before = {"source_location_id": row["source_location_id"], "destination_location_id": row["destination_location_id"], "reason": row["reason"], "version": row["version"]}
@@ -666,7 +683,7 @@ def _transition(request_id: int, target: str, request: Request, user: dict[str, 
     meta = _request_meta(request)
     with connection() as conn:
         row = fetch_one(conn, "SELECT * FROM stock_request WHERE stock_request_id=%s FOR UPDATE", (request_id,))
-        if not row or (user["role"] != "WAREHOUSE_ADMIN" and row["requester_user_id"] != user["user_id"]):
+        if not row or (user["role"] not in {"WAREHOUSE", "ADMIN"} and row["requester_user_id"] != user["user_id"]):
             raise HTTPException(status_code=404, detail="申请单不存在")
         current = row["status"]
         rules = {"SUBMITTED": {"DRAFT"}, "WITHDRAWN": {"SUBMITTED"}, "APPROVED": {"SUBMITTED"}, "REJECTED": {"SUBMITTED"}, "RELEASED": {"APPROVED"}}
@@ -674,7 +691,7 @@ def _transition(request_id: int, target: str, request: Request, user: dict[str, 
             raise HTTPException(status_code=409, detail=f"不允许从 {current} 转为 {target}")
         if target in {"SUBMITTED", "WITHDRAWN"} and row["requester_user_id"] != user["user_id"]:
             raise HTTPException(status_code=403, detail="仅申请单本人可提交或撤回申请")
-        if target in {"APPROVED", "REJECTED", "RELEASED"} and user["role"] != "WAREHOUSE_ADMIN":
+        if target in {"APPROVED", "REJECTED", "RELEASED"} and user["role"] not in {"WAREHOUSE", "ADMIN"}:
             raise HTTPException(status_code=403, detail="仅仓管可审批或放行")
         if target == "SUBMITTED":
             _validate_submission(conn, row)
@@ -738,12 +755,12 @@ def withdraw(request_id: int, request: Request, user: dict[str, Any] = Depends(r
 
 
 @app.post("/api/stock-requests/{request_id}/approve")
-def approve(request_id: int, request: Request, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+def approve(request_id: int, request: Request, user: dict[str, Any] = Depends(require_roles("WAREHOUSE", "ADMIN"))) -> dict[str, Any]:
     _csrf(request); return _transition(request_id, "APPROVED", request, user)
 
 
 @app.post("/api/stock-requests/{request_id}/reject")
-def reject(request_id: int, payload: RejectIn, request: Request, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+def reject(request_id: int, payload: RejectIn, request: Request, user: dict[str, Any] = Depends(require_roles("WAREHOUSE", "ADMIN"))) -> dict[str, Any]:
     _csrf(request)
     if not payload.reason.strip():
         raise HTTPException(status_code=422, detail="驳回原因不能为空")
@@ -751,56 +768,228 @@ def reject(request_id: int, payload: RejectIn, request: Request, user: dict[str,
 
 
 @app.post("/api/stock-requests/{request_id}/release")
-def release(request_id: int, request: Request, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+def release(request_id: int, request: Request, user: dict[str, Any] = Depends(require_roles("WAREHOUSE", "ADMIN"))) -> dict[str, Any]:
     _csrf(request); return _transition(request_id, "RELEASED", request, user)
 
 
+def _case_observation(conn: Any, row: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve the product_observation for a case.
+
+    The seeder historically fills only resolution_case.source_record_id, so fall
+    back to the first observation keyed by that source row when no direct FK is
+    populated.
+    """
+    if row.get("product_observation_id"):
+        return fetch_one(conn, "SELECT * FROM product_observation WHERE product_observation_id=%s", (row["product_observation_id"],))
+    if row.get("source_record_id"):
+        return fetch_one(conn, "SELECT * FROM product_observation WHERE source_record_id=%s ORDER BY observation_ordinal LIMIT 1", (row["source_record_id"],))
+    return None
+
+
+def _lock_case(conn: Any, case_id: int) -> dict[str, Any]:
+    row = fetch_one(conn, """SELECT rc.*,rs.code AS status_code FROM resolution_case rc
+                              JOIN record_status rs ON rs.status_id=rc.status_id
+                             WHERE rc.resolution_case_id=%s FOR UPDATE""", (case_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="冲突不存在")
+    if row["status_code"] != "pending_review":
+        raise HTTPException(status_code=409, detail="该冲突已处理，只读")
+    return row
+
+
+def _resolve_case(conn: Any, user: dict[str, Any], meta: dict[str, Any], row: dict[str, Any], outcome: str, notes: str) -> None:
+    terminal = _status_id(conn, outcome)
+    audit(conn, user, "RESOLVE", "resolution_case", target_id=row["resolution_case_id"],
+          before={"status": row["status_code"]}, after={"status": outcome, "notes": notes},
+          request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
+    with conn.cursor() as cur:
+        cur.execute("UPDATE resolution_case SET status_id=%s,resolved_at=now(),assigned_to=%s,resolution_notes=%s WHERE resolution_case_id=%s",
+                    (terminal, user["username"], notes, row["resolution_case_id"]))
+    observation = _case_observation(conn, row)
+    if observation:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE product_observation SET resolution_status_id=%s WHERE product_observation_id=%s",
+                        (terminal, observation["product_observation_id"]))
+
+
 @app.get("/api/conflicts")
-def conflicts(user: dict[str, Any] = Depends(require_admin)) -> list[dict[str, Any]]:
+def conflicts(user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> list[dict[str, Any]]:
     with connection() as conn:
-        return fetch_all(conn, """SELECT rc.*,dr.code AS status_code FROM resolution_case rc JOIN record_status dr ON dr.status_id=rc.status_id
-                                  WHERE dr.code='pending_review' ORDER BY rc.opened_at DESC""")
+        return fetch_all(conn, """SELECT rc.resolution_case_id,rc.case_type,rc.source_record_id,
+                                         rc.product_observation_id,rc.movement_candidate_id,
+                                         rc.opened_at,rc.assigned_to,rc.resolution_notes,
+                                         rs.code AS status_code,
+                                         COALESCE(po.source_name_raw, NULLIF(sr.display_values->>'品名','')) AS source_name,
+                                         po.source_identifier_raw AS source_identifier,
+                                         mc.movement_type_code,mc.quantity_raw,mc.movement_date_raw
+                                    FROM resolution_case rc
+                                    JOIN record_status rs ON rs.status_id=rc.status_id
+                                    LEFT JOIN source_record sr ON sr.source_record_id=rc.source_record_id
+                                    LEFT JOIN LATERAL (SELECT p.source_name_raw,p.source_identifier_raw
+                                                         FROM product_observation p
+                                                        WHERE p.product_observation_id=rc.product_observation_id
+                                                           OR (rc.product_observation_id IS NULL AND p.source_record_id=rc.source_record_id)
+                                                        ORDER BY (p.product_observation_id=rc.product_observation_id) DESC,p.observation_ordinal
+                                                        LIMIT 1) po ON TRUE
+                                    LEFT JOIN LATERAL (SELECT mt.code AS movement_type_code,m2.quantity_raw,m2.movement_date_raw
+                                                         FROM movement_candidate m2
+                                                         LEFT JOIN movement_type mt ON mt.movement_type_id=m2.movement_type_id
+                                                        WHERE m2.movement_candidate_id=rc.movement_candidate_id
+                                                           OR (rc.movement_candidate_id IS NULL AND m2.source_record_id=rc.source_record_id)
+                                                        ORDER BY (m2.movement_candidate_id=rc.movement_candidate_id) DESC,m2.candidate_ordinal
+                                                        LIMIT 1) mc ON TRUE
+                                   WHERE rs.code='pending_review'
+                                   ORDER BY rc.opened_at DESC""")
 
 
 @app.get("/api/conflicts/{case_id}")
-def conflict_detail(case_id: int, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+def conflict_detail(case_id: int, user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
     with connection() as conn:
         row = fetch_one(conn, """SELECT rc.*,rs.code AS status_code,rs.display_name AS status_name
                                   FROM resolution_case rc JOIN record_status rs ON rs.status_id=rc.status_id
                                  WHERE rc.resolution_case_id=%s""", (case_id,))
         if not row:
             raise HTTPException(status_code=404, detail="冲突不存在")
+        row["source_record"] = fetch_one(conn, "SELECT * FROM source_record WHERE source_record_id=%s", (row["source_record_id"],)) if row["source_record_id"] else None
+        observation = _case_observation(conn, row)
+        row["product_observation"] = observation
+        row["product"] = None
+        if observation and observation.get("resolved_product_id"):
+            row["product"] = fetch_one(conn, """SELECT p.product_id,p.display_name,p.manufacturer,p.specification,p.default_uom_id,
+                                                       u.code AS uom_code,u.display_name AS uom_display_name,
+                                                       (SELECT pi.value_raw FROM product_identifier pi
+                                                         WHERE pi.product_id=p.product_id AND pi.is_primary
+                                                         ORDER BY pi.product_identifier_id LIMIT 1) AS primary_identifier_value
+                                                  FROM product p LEFT JOIN uom u ON u.uom_id=p.default_uom_id
+                                                 WHERE p.product_id=%s""", (observation["resolved_product_id"],))
+        row["movement_candidate"] = None
+        if row["movement_candidate_id"]:
+            row["movement_candidate"] = fetch_one(conn, """SELECT m.*,mt.code AS movement_type_code
+                                                             FROM movement_candidate m
+                                                             LEFT JOIN movement_type mt ON mt.movement_type_id=m.movement_type_id
+                                                            WHERE m.movement_candidate_id=%s""", (row["movement_candidate_id"],))
+        elif row["source_record_id"]:
+            row["movement_candidate"] = fetch_one(conn, """SELECT m.*,mt.code AS movement_type_code
+                                                             FROM movement_candidate m
+                                                             LEFT JOIN movement_type mt ON mt.movement_type_id=m.movement_type_id
+                                                            WHERE m.source_record_id=%s ORDER BY m.candidate_ordinal LIMIT 1""", (row["source_record_id"],))
         return row
 
 
-@app.post("/api/conflicts/{case_id}/resolve")
-def resolve_conflict(case_id: int, payload: ConflictResolveIn, request: Request, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+@app.post("/api/conflicts/{case_id}/link-product")
+def link_conflict_product(case_id: int, payload: ConflictLinkIn, request: Request, user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
     _csrf(request)
     if not payload.resolution_notes.strip():
         raise HTTPException(status_code=422, detail="处理备注不能为空")
     meta = _request_meta(request)
     with connection() as conn:
-        row = fetch_one(conn, "SELECT rc.*,rs.code AS status_code FROM resolution_case rc JOIN record_status rs ON rs.status_id=rc.status_id WHERE resolution_case_id=%s FOR UPDATE", (case_id,))
-        if not row:
-            raise HTTPException(status_code=404, detail="冲突不存在")
-        if row["status_code"] != "pending_review":
-            raise HTTPException(status_code=409, detail="该冲突已处理，只读")
-        resolved_id = _status_id(conn, "resolved")
-        audit(conn, user, "RESOLVE", "resolution_case", target_id=case_id, before={"status": row["status_code"]}, after={"status": "resolved", "notes": payload.resolution_notes}, request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
+        row = _lock_case(conn, case_id)
+        if not fetch_one(conn, "SELECT product_id FROM product WHERE product_id=%s", (payload.product_id,)):
+            raise HTTPException(status_code=404, detail="货品不存在")
+        observation = _case_observation(conn, row)
+        conflicts: list[dict[str, Any]] = []
+        if observation and observation.get("source_identifier_raw"):
+            conflicts = _set_primary_identifier(conn, payload.product_id, observation["source_identifier_raw"], user, meta)
+        if observation:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE product_observation SET resolved_product_id=%s,match_method='manual_link' WHERE product_observation_id=%s",
+                            (payload.product_id, observation["product_observation_id"]))
+        _resolve_case(conn, user, meta, row, "resolved", payload.resolution_notes.strip())
+    result = conflict_detail(case_id, user)
+    result["identifier_conflicts"] = conflicts
+    return result
+
+
+@app.post("/api/conflicts/{case_id}/create-product")
+def create_conflict_product(case_id: int, payload: ConflictCreateProductIn, request: Request, user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
+    _csrf(request)
+    if not payload.resolution_notes.strip():
+        raise HTTPException(status_code=422, detail="处理备注不能为空")
+    meta = _request_meta(request)
+    with connection() as conn:
+        row = _lock_case(conn, case_id)
+        uom_id = payload.default_uom_id
+        if uom_id is not None and not fetch_one(conn, "SELECT uom_id FROM uom WHERE uom_id=%s AND is_active", (uom_id,)):
+            raise HTTPException(status_code=422, detail="默认单位不存在或已停用")
+        if uom_id is None:
+            uom_id = int(fetch_one(conn, "SELECT uom_id FROM uom WHERE code='EA'")["uom_id"])
+        audit(conn, user, "CREATE", "product",
+              after={"display_name": payload.display_name, "default_uom_id": uom_id},
+              request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
         with conn.cursor() as cur:
-            cur.execute("UPDATE resolution_case SET status_id=%s,resolved_at=now(),assigned_to=%s,resolution_notes=%s WHERE resolution_case_id=%s", (resolved_id, user["username"], payload.resolution_notes, case_id))
+            cur.execute("""INSERT INTO product(display_name,manufacturer,specification,default_uom_id,source_uom_raw)
+                         VALUES (%s,%s,%s,%s,%s) RETURNING product_id""",
+                        (payload.display_name.strip(), payload.manufacturer, payload.specification, uom_id, payload.source_uom_raw))
+            product_id = cur.fetchone()[0]
+        conflicts = _set_primary_identifier(conn, product_id, payload.primary_identifier, user, meta) if payload.primary_identifier else []
+        observation = _case_observation(conn, row)
+        if observation:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE product_observation SET resolved_product_id=%s,match_method='manual_create' WHERE product_observation_id=%s",
+                            (product_id, observation["product_observation_id"]))
+        _resolve_case(conn, user, meta, row, "resolved", payload.resolution_notes.strip())
+    result = conflict_detail(case_id, user)
+    result["identifier_conflicts"] = conflicts
+    return result
+
+
+@app.post("/api/conflicts/{case_id}/edit-product")
+def edit_conflict_product(case_id: int, payload: ConflictEditProductIn, request: Request, user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
+    _csrf(request)
+    if not payload.resolution_notes.strip():
+        raise HTTPException(status_code=422, detail="处理备注不能为空")
+    meta = _request_meta(request)
+    with connection() as conn:
+        row = _lock_case(conn, case_id)
+        observation = _case_observation(conn, row)
+        if not observation or not observation.get("resolved_product_id"):
+            raise HTTPException(status_code=409, detail="该冲突未关联货品，无法编辑")
+        product_id = int(observation["resolved_product_id"])
+        before = fetch_one(conn, "SELECT * FROM product WHERE product_id=%s FOR UPDATE", (product_id,))
+        if not before:
+            raise HTTPException(status_code=404, detail="货品不存在")
+        values = payload.model_dump(exclude_unset=True, exclude={"resolution_notes"})
+        uom_id = values.get("default_uom_id", before.get("default_uom_id"))
+        if uom_id is not None and not fetch_one(conn, "SELECT uom_id FROM uom WHERE uom_id=%s AND is_active", (uom_id,)):
+            raise HTTPException(status_code=422, detail="默认单位不存在或已停用")
+        after = {**before, **values, "default_uom_id": uom_id}
+        audit(conn, user, "EDIT", "product", target_id=product_id, before=before, after=after,
+              field_diff={k: [before.get(k), v] for k, v in after.items() if before.get(k) != v},
+              request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE product SET display_name=%s,manufacturer=%s,specification=%s,default_uom_id=%s,source_uom_raw=%s,
+                                 category_id=%s,purchase_cost_price=%s,sales_price=%s,updated_at=now()
+                         WHERE product_id=%s""",
+                        (after["display_name"].strip(), after.get("manufacturer"), after.get("specification"), uom_id, after.get("source_uom_raw"),
+                         after.get("category_id"), after.get("purchase_cost_price", 0), after.get("sales_price", 0), product_id))
+        conflicts = _set_primary_identifier(conn, product_id, values["primary_identifier"] if values.get("primary_identifier") is not None else "", user, meta) if "primary_identifier" in values else []
+        _resolve_case(conn, user, meta, row, "resolved", payload.resolution_notes.strip())
+    result = conflict_detail(case_id, user)
+    result["identifier_conflicts"] = conflicts
+    return result
+
+
+@app.post("/api/conflicts/{case_id}/resolve")
+def resolve_conflict(case_id: int, payload: ConflictResolveIn, request: Request, user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
+    _csrf(request)
+    if not payload.resolution_notes.strip():
+        raise HTTPException(status_code=422, detail="处理备注不能为空")
+    meta = _request_meta(request)
+    with connection() as conn:
+        row = _lock_case(conn, case_id)
+        _resolve_case(conn, user, meta, row, payload.outcome, payload.resolution_notes.strip())
     return conflict_detail(case_id, user)
 
 
 @app.get("/api/audit")
-def audit_log(limit: int = 100, user: dict[str, Any] = Depends(require_admin)) -> list[dict[str, Any]]:
+def audit_log(limit: int = 100, user: dict[str, Any] = Depends(require_roles("ADMIN", "FINANCE"))) -> list[dict[str, Any]]:
     limit = min(500, max(1, limit))
     with connection() as conn:
         return fetch_all(conn, "SELECT audit_event_id,actor_user_id,actor_role,action,target_table,target_id,request_id,before_data,after_data,field_diff,created_at FROM audit_event ORDER BY created_at DESC LIMIT %s", (limit,))
 
 
 @app.get("/api/audit/{audit_event_id}")
-def audit_detail(audit_event_id: int, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+def audit_detail(audit_event_id: int, user: dict[str, Any] = Depends(require_roles("ADMIN", "FINANCE"))) -> dict[str, Any]:
     with connection() as conn:
         row = fetch_one(conn, "SELECT audit_event_id,actor_user_id,actor_role,action,target_table,target_id,request_id,ip_address,user_agent,before_data,after_data,field_diff,created_at FROM audit_event WHERE audit_event_id=%s", (audit_event_id,))
         if not row:

@@ -108,9 +108,9 @@ POSTGRES_DB=inventory
 POSTGRES_USER=inventory
 POSTGRES_PASSWORD=$(gen_secret)
 SESSION_SECRET=$(gen_secret)
-BOOTSTRAP_WAREHOUSE_USERNAME=warehouse
-BOOTSTRAP_WAREHOUSE_PASSWORD=$(gen_secret)
-BOOTSTRAP_REQUESTER_USERNAME=requester
+BOOTSTRAP_ADMIN_USERNAME=admin
+BOOTSTRAP_ADMIN_PASSWORD=$(gen_secret)
+BOOTSTRAP_REQUESTER_USERNAME=colleague
 BOOTSTRAP_REQUESTER_PASSWORD=$(gen_secret)
 OCR_INTERNAL_TOKEN=$(gen_secret)
 OCR_PROXY_TIMEOUT_SECONDS=25
@@ -124,7 +124,7 @@ chmod 600 .env
 if ! grep -q '^WEB_DOCKERFILE=' .env; then
   printf '\nWEB_DOCKERFILE=Dockerfile.remote\n' >> .env
 fi
-if grep -Eq '^(POSTGRES_PASSWORD|SESSION_SECRET|BOOTSTRAP_WAREHOUSE_PASSWORD|BOOTSTRAP_REQUESTER_PASSWORD|OCR_INTERNAL_TOKEN)=(change-me|replace-with)' .env; then
+if grep -Eq '^(POSTGRES_PASSWORD|SESSION_SECRET|BOOTSTRAP_ADMIN_PASSWORD|BOOTSTRAP_REQUESTER_PASSWORD|OCR_INTERNAL_TOKEN)=(change-me|replace-with)' .env; then
   echo "dotenv contains placeholder secrets; provide --env-file with real values" >&2
   exit 1
 fi

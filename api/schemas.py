@@ -1,7 +1,35 @@
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
+
 from pydantic import BaseModel, Field, field_validator
+
+ROLE_VALUES = ("ADMIN", "WAREHOUSE", "SALES", "FINANCE", "COLLEAGUE")
+
+
+def _validate_role(value: str) -> str:
+    if value not in ROLE_VALUES:
+        raise ValueError("角色无效")
+    return value
+
+
+def _qty_scale(value: Decimal) -> Decimal:
+    if abs(value) >= Decimal("10") ** 15:
+        raise ValueError("数量过大")
+    if value.quantize(Decimal("0.001")) != value:
+        raise ValueError("数量最多支持 3 位小数")
+    return value
+
+
+def _money_scale(value: Decimal) -> Decimal:
+    if value < 0:
+        raise ValueError("金额不能为负")
+    if abs(value) >= Decimal("10") ** 15:
+        raise ValueError("金额过大")
+    if value.quantize(Decimal("0.01")) != value:
+        raise ValueError("金额最多支持 2 位小数")
+    return value
 
 
 class LoginIn(BaseModel):
@@ -38,6 +66,16 @@ class ProductIn(BaseModel):
     source_uom_raw: str | None = "个"
     default_uom_id: int | None = None
     primary_identifier: str | None = None
+    category_id: int | None = None
+    purchase_cost_price: Decimal | None = None
+    sales_price: Decimal | None = None
+
+    @field_validator("purchase_cost_price", "sales_price")
+    @classmethod
+    def _product_price(cls, value: Decimal | None) -> Decimal | None:
+        if value is None:
+            return None
+        return _money_scale(value)
 
 
 class ProductCreateIn(ProductIn):
@@ -53,6 +91,16 @@ class ProductUpdateIn(BaseModel):
     source_uom_raw: str | None = None
     default_uom_id: int | None = None
     primary_identifier: str | None = None
+    category_id: int | None = None
+    purchase_cost_price: Decimal | None = None
+    sales_price: Decimal | None = None
+
+    @field_validator("purchase_cost_price", "sales_price")
+    @classmethod
+    def _product_price(cls, value: Decimal | None) -> Decimal | None:
+        if value is None:
+            return None
+        return _money_scale(value)
 
 
 class UserCreateIn(BaseModel):
@@ -61,12 +109,24 @@ class UserCreateIn(BaseModel):
     role: str
     password: str = Field(min_length=8, max_length=200)
 
+    @field_validator("role")
+    @classmethod
+    def _role(cls, value: str) -> str:
+        return _validate_role(value)
+
 
 class UserUpdateIn(BaseModel):
     display_name: str | None = Field(default=None, min_length=1, max_length=200)
     role: str | None = None
     is_active: bool | None = None
     password: str | None = Field(default=None, min_length=8, max_length=200)
+
+    @field_validator("role")
+    @classmethod
+    def _role(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _validate_role(value)
 
 
 class LocationIn(BaseModel):
@@ -97,6 +157,68 @@ class RejectIn(BaseModel):
 
 class ConflictResolveIn(BaseModel):
     resolution_notes: str = Field(min_length=1, max_length=2000)
+    outcome: str = "resolved"
+
+    @field_validator("outcome")
+    @classmethod
+    def validate_outcome(cls, value: str) -> str:
+        if value not in {"resolved", "duplicate", "ignored"}:
+            raise ValueError("outcome 必须是 resolved/duplicate/ignored")
+        return value
+
+
+class ConflictLinkIn(BaseModel):
+    product_id: int
+    resolution_notes: str = Field(min_length=1, max_length=2000)
+
+
+class ConflictCreateProductIn(BaseModel):
+    display_name: str = Field(min_length=1, max_length=500)
+    manufacturer: str | None = None
+    specification: str | None = None
+    source_uom_raw: str | None = None
+    default_uom_id: int | None = None
+    primary_identifier: str | None = None
+    resolution_notes: str = Field(min_length=1, max_length=2000)
+
+
+class ConflictEditProductIn(BaseModel):
+    """Optional product master-data fields; resolution_notes resolves the case."""
+    display_name: str | None = Field(default=None, min_length=1, max_length=500)
+    manufacturer: str | None = None
+    specification: str | None = None
+    source_uom_raw: str | None = None
+    default_uom_id: int | None = None
+    primary_identifier: str | None = None
+    resolution_notes: str = Field(min_length=1, max_length=2000)
+
+
+class InventoryAdjustIn(BaseModel):
+    """Override a product's on-hand balance at one location with an ADJUSTMENT."""
+    product_id: int
+    location_id: int
+    condition_id: int | None = None
+    uom_id: int
+    counted_quantity: Decimal = Field(description="may be negative")
+    change_default_unit: bool = False
+    source_uom_raw: str | None = None
+    notes: str | None = None
+
+    @field_validator("counted_quantity")
+    @classmethod
+    def _limit_scale(cls, value: Decimal) -> Decimal:
+        if abs(value) >= Decimal("10") ** 15:
+            raise ValueError("数量过大")
+        if value.quantize(Decimal("0.001")) != value:
+            raise ValueError("数量最多支持 3 位小数")
+        return value
+
+
+class UomIn(BaseModel):
+    code: str = Field(min_length=1, max_length=40)
+    display_name: str = Field(min_length=1, max_length=200)
+    decimal_scale: int = Field(default=0, ge=0, le=6)
+    is_active: bool = True
 
 
 class OCRExtractIn(BaseModel):
@@ -110,3 +232,133 @@ class OCRExtractIn(BaseModel):
         if value.startswith("data:") or any(char.isspace() for char in value):
             raise ValueError("image_base64 必须是无空白的原始 Base64")
         return value
+
+
+class DocLineIn(BaseModel):
+    product_id: int
+    quantity: Decimal = Field(gt=0)
+    uom_id: int | None = None
+    uom_code: str | None = None
+    condition_id: int | None = None
+    source_location_id: int | None = None
+    destination_location_id: int | None = None
+    price: Decimal | None = Field(default=None, ge=0)
+    counted_quantity: Decimal | None = None  # STOCK_COUNT only
+    notes: str | None = None
+
+    _q = field_validator("quantity")(_qty_scale)
+    _cq = field_validator("counted_quantity")(_qty_scale)
+    _p = field_validator("price")(_money_scale)
+
+
+class DocCreateIn(BaseModel):
+    doc_type: str
+    party_id: int | None = None
+    doc_date: date | None = None
+    source_location_id: int | None = None
+    destination_location_id: int | None = None
+    deposit_amount: Decimal | None = Field(default=None, ge=0)
+    notes: str | None = None
+    lines: list[DocLineIn] = Field(default_factory=list)
+
+    _d = field_validator("deposit_amount")(_money_scale)
+
+
+class DocUpdateIn(BaseModel):
+    """All fields optional + optimistic-lock version, like StockRequestPatch."""
+    version: int = Field(gt=0)
+    party_id: int | None = None
+    doc_date: date | None = None
+    source_location_id: int | None = None
+    destination_location_id: int | None = None
+    deposit_amount: Decimal | None = None
+    notes: str | None = None
+    lines: list[DocLineIn] | None = None
+
+    _d = field_validator("deposit_amount")(_money_scale)
+
+
+class DocSubmitIn(BaseModel):
+    override_review: bool = False
+
+
+class AttachmentIn(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    content_type: str = Field(min_length=1, max_length=200)
+    size: int = Field(gt=0, le=10 * 1024 * 1024)
+    data_base64: str = Field(min_length=16)
+
+    @field_validator("data_base64")
+    @classmethod
+    def validate_raw_base64(cls, value: str) -> str:
+        if value.startswith("data:") or any(char.isspace() for char in value):
+            raise ValueError("data_base64 必须是无空白的原始 Base64")
+        return value
+
+
+class ChangePasswordIn(BaseModel):
+    current_password: str = Field(min_length=1, max_length=200)
+    new_password: str = Field(min_length=8, max_length=200)
+
+
+class CategoryIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    parent_category_id: int | None = None
+    sort_order: int = 0
+    is_active: bool = True
+
+
+class CustomerIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    contact_person: str | None = None
+    phone: str | None = None
+    address: str | None = None
+    settlement_method: str = "现结"
+    level: str | None = None
+    credit_limit: Decimal = Decimal(0)
+    notes: str | None = None
+    is_active: bool = True
+
+    @field_validator("settlement_method")
+    @classmethod
+    def _settlement(cls, value: str) -> str:
+        if value not in {"现结", "月结"}:
+            raise ValueError("结算方式必须是 现结/月结")
+        return value
+
+    @field_validator("credit_limit")
+    @classmethod
+    def _credit(cls, value: Decimal) -> Decimal:
+        return _money_scale(value)
+
+
+class SupplierIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    contact_person: str | None = None
+    phone: str | None = None
+    address: str | None = None
+    settlement_days: int = Field(default=0, ge=0)
+    notes: str | None = None
+    is_active: bool = True
+
+
+class PriceTierIn(BaseModel):
+    tier_name: str = Field(min_length=1, max_length=100)
+    min_quantity: Decimal = Decimal(0)
+    price: Decimal
+
+    @field_validator("min_quantity")
+    @classmethod
+    def _min_qty(cls, value: Decimal) -> Decimal:
+        return _qty_scale(value)
+
+    @field_validator("price")
+    @classmethod
+    def _price(cls, value: Decimal) -> Decimal:
+        return _money_scale(value)
+
+
+class DepartmentIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    sort_order: int = 0
+    is_active: bool = True

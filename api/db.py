@@ -98,10 +98,14 @@ def audit(
 def ensure_bootstrap_users() -> None:
     # Accept both the explicit ERP_* names and the compose-friendly
     # BOOTSTRAP_* names so deployment files can rotate credentials without
-    # changing application code.
-    admin_password = os.environ.get("ERP_ADMIN_PASSWORD") or os.environ.get("BOOTSTRAP_WAREHOUSE_PASSWORD")
-    requester_password = os.environ.get("ERP_REQUESTER_PASSWORD") or os.environ.get("BOOTSTRAP_REQUESTER_PASSWORD")
-    if not admin_password or not requester_password:
+    # changing application code. Creates an ADMIN (管理员) and a COLLEAGUE (同事).
+    admin_password = (
+        os.environ.get("BOOTSTRAP_ADMIN_PASSWORD")
+        or os.environ.get("ERP_ADMIN_PASSWORD")
+        or os.environ.get("BOOTSTRAP_WAREHOUSE_PASSWORD")
+    )
+    colleague_password = os.environ.get("BOOTSTRAP_REQUESTER_PASSWORD") or os.environ.get("ERP_REQUESTER_PASSWORD")
+    if not admin_password or not colleague_password:
         return
     from .security import hash_password
 
@@ -110,9 +114,9 @@ def ensure_bootstrap_users() -> None:
             cur.execute("SELECT count(*) FROM app_user")
             if cur.fetchone()[0]:
                 return
-        admin_name = os.environ.get("ERP_ADMIN_USERNAME") or os.environ.get("BOOTSTRAP_WAREHOUSE_USERNAME", "warehouse")
-        requester_name = os.environ.get("ERP_REQUESTER_USERNAME") or os.environ.get("BOOTSTRAP_REQUESTER_USERNAME", "requester")
-        audit(conn, None, "BOOTSTRAP_CREATE", "app_user", after={"usernames": [admin_name, requester_name]})
+        admin_name = os.environ.get("BOOTSTRAP_ADMIN_USERNAME") or os.environ.get("ERP_ADMIN_USERNAME") or os.environ.get("BOOTSTRAP_WAREHOUSE_USERNAME", "admin")
+        colleague_name = os.environ.get("BOOTSTRAP_REQUESTER_USERNAME") or os.environ.get("ERP_REQUESTER_USERNAME", "colleague")
+        audit(conn, None, "BOOTSTRAP_CREATE", "app_user", after={"usernames": [admin_name, colleague_name]})
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO app_user(username,display_name,role,password_hash) VALUES (%s,%s,'WAREHOUSE_ADMIN',%s),(%s,%s,'REQUESTER',%s)",
-                        (admin_name, "仓管管理员", hash_password(admin_password), requester_name, "申请人", hash_password(requester_password)))
+            cur.execute("INSERT INTO app_user(username,display_name,role,password_hash) VALUES (%s,%s,'ADMIN',%s),(%s,%s,'COLLEAGUE',%s)",
+                        (admin_name, "系统管理员", hash_password(admin_password), colleague_name, "同事", hash_password(colleague_password)))

@@ -1,5 +1,5 @@
 import React from 'react'
-import { formatInventorySummary } from './list-utils'
+import { formatInventorySummary, formatQuantity } from './list-utils'
 
 function RowLink({ LinkComponent, to, children, ...props }) {
   if (LinkComponent) return <LinkComponent to={to} {...props}>{children}</LinkComponent>
@@ -15,7 +15,7 @@ export function BalanceList({ rows, LinkComponent }) {
       const productName = row.product_name || '未命名货品'
       const location = row.location_name || '—'
       const condition = row.condition_code || '—'
-      const quantity = row.on_hand_quantity ?? '—'
+      const quantity = formatQuantity(row.on_hand_quantity)
       const unit = row.uom_code || '—'
       const accessibleName = `业务编号 ${identifier}，货品名称 ${productName}，库位 ${location}，成色 ${condition}，现库存 ${quantity} ${unit}`
       return <RowLink LinkComponent={LinkComponent} key={`${row.product_id}-${row.location_id}-${row.condition_id}-${row.uom_id}-${index}`} className="data-row" to={`/inventory/${row.product_id}/${row.location_id}/${row.condition_id}/${row.uom_id}`} aria-label={accessibleName}><span className="data-cell code-cell" data-label="业务编号">{identifier}</span><span className="data-cell name-cell" data-label="货品名称"><strong>{productName}</strong>{secondary.length > 0 && <small>{secondary.join(' · ')}</small>}</span><span className="data-cell" data-label="库位">{location}<small className="medium-condition-meta">成色 {condition}</small></span><span className="data-cell" data-label="成色">{condition}</span><span className="data-cell quantity-cell" data-label="现库存">{quantity}<span className="mobile-unit"> {unit}</span></span><span className="data-cell unit-cell" data-label="单位">{unit}</span></RowLink>
