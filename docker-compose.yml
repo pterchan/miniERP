@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-inventory}
+      POSTGRES_USER: ${POSTGRES_USER:-inventory}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-inventory}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-inventory}
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET}
+      ERP_ADMIN_USERNAME: ${BOOTSTRAP_WAREHOUSE_USERNAME:-warehouse}
+      ERP_ADMIN_PASSWORD: ${BOOTSTRAP_WAREHOUSE_PASSWORD:?set BOOTSTRAP_WAREHOUSE_PASSWORD}
+      ERP_REQUESTER_USERNAME: ${BOOTSTRAP_REQUESTER_USERNAME:-requester}
+      ERP_REQUESTER_PASSWORD: ${BOOTSTRAP_REQUESTER_PASSWORD:?set BOOTSTRAP_REQUESTER_PASSWORD}
+      ERP_BOOTSTRAP_STRICT: "1"
+      ERP_CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
+      OCR_SERVICE_URL: http://ocr:8010
+      OCR_INTERNAL_TOKEN: ${OCR_INTERNAL_TOKEN:?set OCR_INTERNAL_TOKEN}
+      OCR_PROXY_TIMEOUT_SECONDS: ${OCR_PROXY_TIMEOUT_SECONDS:-15}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ocr:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8000}:8000"
+
+  ocr:
+    build:
+      context: .
+      dockerfile: ocr_service/Dockerfile
+    environment:
+      OCR_INTERNAL_TOKEN: ${OCR_INTERNAL_TOKEN:?set OCR_INTERNAL_TOKEN}
+      OMP_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+    expose:
+      - "8010"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: 1g
+
+  web:
+    build:
+      context: ./web
+      dockerfile: ${WEB_DOCKERFILE:-Dockerfile}
+    depends_on:
+      - api
+    ports:
+      - "${WEB_PORT:-80}:80"
+
+volumes:
+  postgres_data:

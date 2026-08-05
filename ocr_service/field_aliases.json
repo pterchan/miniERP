@@ -1,0 +1,16 @@
+{
+  "product_name": ["产品名称", "商品名称", "品名", "product name", "product description", "device name"],
+  "brand": ["品牌", "brand"],
+  "manufacturer": ["制造商", "生产商", "生产企业", "厂家", "manufacturer", "manufactured by"],
+  "reference_number": ["ref no", "reference no", "reference number", "catalog no", "catalog number", "catalogue no", "part no", "part number", "item no", "item number", "p/n", "ref", "货号", "货品编号", "参考号", "产品编号"],
+  "model": ["规格型号", "型号规格", "型号", "model no", "model number", "model", "型号/规格"],
+  "specification": ["规格", "specification", "size"],
+  "revision": ["revision", "rev", "版本", "修订"],
+  "lot_number": ["lot no", "lot number", "lot", "batch no", "batch number", "batch", "批号", "批次"],
+  "serial_number": ["serial no", "serial number", "serial", "s/n", "sn", "序列号"],
+  "manufacture_date": ["生产日期", "制造日期", "manufacture date", "manufactured date", "date of mfg", "mfg date", "mfd", "mfg", "dom"],
+  "expiry_date": ["有效期至", "失效日期", "expiry date", "expiration date", "expiry", "exp", "use by"],
+  "shelf_life": ["使用期限", "保质期", "shelf life"],
+  "registration_number": ["注册证编号", "注册证号", "registration number", "registration no", "certificate number", "certificate no"],
+  "udi": ["udi", "unique device identifier"]
+}

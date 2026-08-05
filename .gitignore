@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+web/node_modules/
+web/dist/
+*.log
+inventory-dry-run/
+deploy/*.env

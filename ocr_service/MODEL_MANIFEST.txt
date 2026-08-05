@@ -1,0 +1,25 @@
+Offline OCR POC model/runtime manifest
+======================================
+
+Python wheels
+-------------
+rapidocr==3.9.2 (Apache-2.0)
+onnxruntime==1.28.0 (MIT)
+
+Bundled PP-OCRv6 small models (provided by rapidocr 3.9.2)
+-----------------------------------------------------------
+PP-OCRv6_det_small.onnx
+  sha256 090f04abcd9d9a7498bc4ebf677e4cb9bdce1fe4197ddb7e529f1ef44e1ff94f
+ch_ppocr_mobile_v2.0_cls_mobile.onnx
+  sha256 e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c
+PP-OCRv6_rec_small.onnx
+  sha256 6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153cf8cbe210b3c14884
+
+Sources and licenses
+--------------------
+- RapidOCR: https://github.com/RapidAI/RapidOCR (Apache-2.0)
+- PP-OCR models: https://github.com/PaddlePaddle/PaddleOCR (Apache-2.0)
+- ONNX Runtime: https://github.com/microsoft/onnxruntime (MIT)
+
+The Docker build validates that the bundled models load. Runtime startup
+refuses to start if any model is absent; no network download is permitted.
