@@ -75,8 +75,13 @@ def export_response(
         ext = "csv"
     else:
         raise HTTPException(status_code=422, detail="fmt 仅支持 csv 或 xlsx")
-    filename_enc = quote(f"{filename}.{ext}")
-    disposition = f'attachment; filename="{filename}.{ext}"; filename*=UTF-8\'\'{filename_enc}'
+    file_name = f"{filename}.{ext}"
+    filename_enc = quote(file_name, safe="")
+    # 普通 filename= 必须 ASCII（响应头按 latin-1 编码）；中文经 filename*=UTF-8'' 传递
+    ascii_name = file_name.encode("ascii", "replace").decode("ascii").replace("?", "_")
+    if not ascii_name:
+        ascii_name = f"export.{ext}"
+    disposition = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{filename_enc}'
     return Response(content=content, media_type=media_type, headers={"Content-Disposition": disposition})
 
 

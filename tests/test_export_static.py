@@ -19,6 +19,12 @@ class ExportContractTests(unittest.TestCase):
         self.assertIn("utf-8-sig", EXPORT)
         self.assertIn("openpyxl", EXPORT)
 
+    def test_disposition_header_is_ascii_safe(self):
+        # 响应头按 latin-1 编码，中文必须走 filename*=UTF-8''，普通 filename= 只能含 ASCII
+        self.assertIn("filename*=UTF-8''", EXPORT)
+        self.assertIn('.encode("ascii", "replace")', EXPORT)
+        self.assertIn('quote(file_name, safe="")', EXPORT)
+
     def test_list_params_injection_safety(self):
         self.assertIn("def parse_sort", LIST_PARAMS)
         self.assertIn("def parse_filters", LIST_PARAMS)

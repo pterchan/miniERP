@@ -272,6 +272,7 @@ def _product_where(q: str, filters: list[str]) -> tuple[str, list]:
 
 def _products_query(where: str, order_by: str) -> str:
     return f"""SELECT p.product_id, p.display_name, p.manufacturer, p.specification, p.status_id, p.category_id,
+                      p.created_at, p.updated_at,
                       u.uom_id, u.code AS uom_code, p.source_uom_raw,
                       ident.value_raw AS identifier, ident.value_normalized AS identifier_normalized
                  FROM product p
