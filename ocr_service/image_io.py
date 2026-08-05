@@ -11,6 +11,7 @@ MAX_DECODED_BYTES = 10 * 1024 * 1024
 MAX_PIXELS = 20_000_000
 MAX_SIDE = 8192
 MIN_SIDE = 64
+MAX_BASE64_CHARS = ((MAX_DECODED_BYTES + 2) // 3) * 4 + 4
 
 
 class ImageInputError(ValueError):
@@ -46,6 +47,8 @@ def _magic_matches(data: bytes, media_type: str) -> bool:
 def decode_image(image_base64: str, media_type: str) -> DecodedImage:
     if media_type not in SUPPORTED_MEDIA_TYPES:
         raise UnsupportedMediaType("仅支持 JPEG、PNG 和 WebP")
+    if len(image_base64) > MAX_BASE64_CHARS:
+        raise ImageTooLarge("图片 Base64 编码超过 10 MiB 限制")
     try:
         data = base64.b64decode(image_base64, validate=True)
     except (binascii.Error, ValueError) as exc:

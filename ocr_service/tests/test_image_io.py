@@ -44,6 +44,10 @@ class ImageInputTests(unittest.TestCase):
         with self.assertRaises(ImageTooLarge):
             decode_image(encoded_image(size=(9000, 64)), "image/jpeg")
 
+    def test_encoded_size_limit_is_checked_before_decode(self) -> None:
+        with self.assertRaises(ImageTooLarge):
+            decode_image("A" * (14 * 1024 * 1024), "image/jpeg")
+
 
 if __name__ == "__main__":
     unittest.main()
