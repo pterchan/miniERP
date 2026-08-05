@@ -60,6 +60,10 @@ class FieldExtractionTests(unittest.TestCase):
         )
         self.assertEqual(result.fields["product_name"][0].value_normalized, "XactTrace Belt Medium")
 
+    def test_same_language_product_conflict_is_ambiguous(self) -> None:
+        result = extract_fields([ocr_line("1", "产品名称：甲产品", 0), ocr_line("2", "产品名称：乙产品", 30)])
+        self.assertEqual({item.status for item in result.fields["product_name"]}, {"ambiguous"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -31,7 +31,7 @@ services:
       ERP_CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
       OCR_SERVICE_URL: http://ocr:8010
       OCR_INTERNAL_TOKEN: ${OCR_INTERNAL_TOKEN:?set OCR_INTERNAL_TOKEN}
-      OCR_PROXY_TIMEOUT_SECONDS: ${OCR_PROXY_TIMEOUT_SECONDS:-15}
+      OCR_PROXY_TIMEOUT_SECONDS: ${OCR_PROXY_TIMEOUT_SECONDS:-25}
     depends_on:
       postgres:
         condition: service_healthy

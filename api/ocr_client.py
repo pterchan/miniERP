@@ -7,15 +7,16 @@ import httpx
 
 
 class OCRProxyError(Exception):
-    def __init__(self, status_code: int, detail: str) -> None:
+    def __init__(self, status_code: int, detail: str, retry_after: str | None = None) -> None:
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+        self.retry_after = retry_after
 
 
 def forward_ocr(payload: dict[str, Any], request_id: str) -> dict[str, Any]:
     service_url = os.environ.get("OCR_SERVICE_URL", "http://ocr:8010").rstrip("/")
-    timeout = float(os.environ.get("OCR_PROXY_TIMEOUT_SECONDS", "15"))
+    timeout = float(os.environ.get("OCR_PROXY_TIMEOUT_SECONDS", "25"))
     headers = {"X-Request-ID": request_id}
     token = os.environ.get("OCR_INTERNAL_TOKEN")
     if token:
@@ -36,7 +37,9 @@ def forward_ocr(payload: dict[str, Any], request_id: str) -> dict[str, Any]:
         detail = body.get("detail", "OCR 服务返回错误") if isinstance(body, dict) else "OCR 服务返回错误"
         # Do not expose an internal authentication failure as a client error.
         mapped_status = 503 if response.status_code == 401 else response.status_code
-        raise OCRProxyError(mapped_status, str(detail))
+        if mapped_status not in {401, 403, 413, 415, 422, 429, 502, 503, 504}:
+            mapped_status = 502
+        raise OCRProxyError(mapped_status, str(detail), response.headers.get("Retry-After"))
     if not isinstance(body, dict):
         raise OCRProxyError(502, "OCR 服务响应格式无效")
     return body

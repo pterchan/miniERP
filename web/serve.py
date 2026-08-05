@@ -11,6 +11,7 @@ from pathlib import Path
 
 API_ORIGIN = os.getenv("WEB_API_ORIGIN", "http://api:8000")
 DIST = Path(os.getenv("WEB_DIST", "/app/dist")).resolve()
+MAX_PROXY_BODY = 14 * 1024 * 1024
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",
@@ -30,6 +31,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         body = None
         length = self.headers.get("Content-Length")
         if length:
+            if int(length) > MAX_PROXY_BODY:
+                self.send_error(413, "request body too large")
+                return
             body = self.rfile.read(int(length))
         headers = {
             key: value
@@ -41,7 +45,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             f"{API_ORIGIN}{upstream_path}", data=body, headers=headers, method=self.command
         )
         try:
-            response = urllib.request.urlopen(request, timeout=30)
+            response = urllib.request.urlopen(request, timeout=35)
             status, response_headers, payload = response.status, response.headers, response.read()
         except urllib.error.HTTPError as exc:
             status, response_headers, payload = exc.code, exc.headers, exc.read()

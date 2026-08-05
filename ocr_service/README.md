@@ -13,8 +13,8 @@ Endpoints:
 
 - `GET /healthz`: process liveness.
 - `GET /readyz`: model readiness.
-- `POST /v1/extract`: OCR extraction. Set `OCR_INTERNAL_TOKEN` to require the
-  `X-Internal-Token` header.
+- `POST /v1/extract`: OCR extraction. `OCR_INTERNAL_TOKEN` is required and the
+  caller must send the matching `X-Internal-Token` header.
 
 The service never writes source images or OCR text to disk. See
 `ocr_service/contracts.py` for the versioned response contract.
@@ -38,5 +38,8 @@ Design notes
 
 The initial engine is intentionally CPU-only RapidOCR.  Full PaddleOCR with
 UVDoc is a possible later replacement, but is not a runtime dependency of this
-POC.  The ERP endpoint is only an authenticated/CSRF-protected thin proxy and
-does not perform product matching or write scan history.
+POC.  Tesseract's page layout handling was not sufficient for the photographed
+labels, while EasyOCR, docTR, and MMOCR would add a heavier training/runtime
+stack without a demonstrated POC gain.  The ERP endpoint is only an
+authenticated/CSRF-protected thin proxy and does not perform product matching
+or write scan history.

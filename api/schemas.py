@@ -26,7 +26,9 @@ class StockRequestIn(BaseModel):
     source_location_id: int | None = None
     destination_location_id: int | None = None
     reason: str | None = None
-    lines: list[RequestLineIn] = Field(min_length=1)
+    # Drafts may be created before the requester has selected a product.
+    # Submission performs the at-least-one-valid-line check server-side.
+    lines: list[RequestLineIn] = Field(default_factory=list)
 
 
 class ProductIn(BaseModel):
@@ -35,6 +37,22 @@ class ProductIn(BaseModel):
     specification: str | None = None
     source_uom_raw: str | None = "个"
     default_uom_id: int | None = None
+    primary_identifier: str | None = None
+
+
+class ProductCreateIn(ProductIn):
+    """Payload for creating a product and (optionally) its primary identifier."""
+
+
+class ProductUpdateIn(BaseModel):
+    """All fields are optional so omitted values never silently reset units."""
+
+    display_name: str | None = Field(default=None, min_length=1, max_length=500)
+    manufacturer: str | None = None
+    specification: str | None = None
+    source_uom_raw: str | None = None
+    default_uom_id: int | None = None
+    primary_identifier: str | None = None
 
 
 class UserCreateIn(BaseModel):
@@ -44,6 +62,13 @@ class UserCreateIn(BaseModel):
     password: str = Field(min_length=8, max_length=200)
 
 
+class UserUpdateIn(BaseModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=200)
+    role: str | None = None
+    is_active: bool | None = None
+    password: str | None = Field(default=None, min_length=8, max_length=200)
+
+
 class LocationIn(BaseModel):
     code: str = Field(min_length=1, max_length=80)
     name: str = Field(min_length=1, max_length=200)
@@ -51,7 +76,15 @@ class LocationIn(BaseModel):
     is_company_inventory: bool = True
 
 
+class LocationUpdateIn(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    location_type: str | None = None
+    is_company_inventory: bool | None = None
+    is_active: bool | None = None
+
+
 class StockRequestPatch(BaseModel):
+    version: int = Field(gt=0)
     source_location_id: int | None = None
     destination_location_id: int | None = None
     reason: str | None = None

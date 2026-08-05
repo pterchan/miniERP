@@ -7,6 +7,7 @@
 - `db/migrations/001_inventory.sql`：PostgreSQL DDL、暂存审计层、货品/库位、库存流水、序列资产及四个查询视图。
 - `db/migrations/002_erp_oa.sql`：用户/会话、仓管审批、申请单、不可变审计和单位字典扩展；不做隐式单位换算。
 - `api/`：FastAPI API；HttpOnly 会话 Cookie + CSRF、仓管/申请人角色、产品搜索、申请审批/放行、冲突和审计接口。
+- `ocr_service/`：独立离线 RapidOCR 产品标签识别服务；不访问商品库、不写数据库，ERP 只通过 `/api/ocr/extract` 薄代理调用。
 - `web/`：Vite/React 响应式桌面/手机界面。
 - `scripts/import_inventory.py`：只读解密、列白名单抽取、规范化、日期/数量质量检查、调货语义候选和安全干运行器。
 - `scripts/seed_inventory.py`：幂等导入到暂存、冲突、快照及可安全重放的历史流水；默认只 dry-run，`--apply` 才写库。

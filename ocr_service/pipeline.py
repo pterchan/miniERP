@@ -8,7 +8,6 @@ from .contracts import Diagnostics, ExtractResponse, ImageInfo, LabelResult, Lin
 from .field_extractor import extract_fields, normalize_text
 from .geometry import (
     cluster_lines,
-    denormalize_polygon,
     group_angle,
     median_line_height,
     normalize_polygon,
@@ -70,7 +69,7 @@ def _assign_labels(lines: list[dict[str, Any]], width: int, height: int) -> list
 
 
 def _replace_low_confidence_regions(lines: list[dict[str, Any]], groups: list[list[Any]], image: object, width: int, height: int, backend: object) -> None:
-    """Try at most two local deskew candidates; raw OCR remains the default."""
+    """Try at most two local correction candidates; raw OCR remains default."""
 
     if _mean_confidence(lines) >= 0.75:
         return

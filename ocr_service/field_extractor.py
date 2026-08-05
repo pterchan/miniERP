@@ -216,8 +216,13 @@ def _merge_candidates(fields: dict[str, list[FieldCandidate]]) -> None:
                     elif len(language_values) > 1:
                         # Keep the strongest reading usable for search while
                         # retaining weaker/conflicting readings as evidence.
-                        for value in language_values[1:]:
-                            value.status = "ambiguous"  # type: ignore[assignment]
+                        confidence_gap = language_values[0].confidence - language_values[1].confidence
+                        if confidence_gap < 0.15:
+                            for value in language_values:
+                                value.status = "ambiguous"  # type: ignore[assignment]
+                        else:
+                            for value in language_values[1:]:
+                                value.status = "ambiguous"  # type: ignore[assignment]
             else:
                 for value in values:
                     value.status = "ambiguous"  # type: ignore[assignment]
