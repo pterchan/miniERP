@@ -1,11 +1,34 @@
 import { describe, expect, it } from 'vitest'
-import { isNavigationItemActive, normalizePath } from './navigation-utils'
+import { isInventoryDocumentPath, isNavigationItemActive, normalizePath } from './navigation-utils'
+
+const INVENTORY_DOC_SLUGS = ['stock_transfer', 'stock_count', 'stock_loss', 'other_in', 'other_out']
 
 describe('normalizePath', () => {
   it('normalizes list routes before page dispatch', () => {
     expect(normalizePath('/products/')).toBe('/products')
     expect(normalizePath('/requests/?status=pending')).toBe('/requests')
     expect(normalizePath('/admin///')).toBe('/admin')
+  })
+})
+
+describe('isInventoryDocumentPath', () => {
+  it('keeps the group hub and document routes on the document router', () => {
+    expect(isInventoryDocumentPath('/inventory', INVENTORY_DOC_SLUGS)).toBe(true)
+    expect(isInventoryDocumentPath('/inventory/', INVENTORY_DOC_SLUGS)).toBe(true)
+    expect(isInventoryDocumentPath('/inventory/stock_transfer', INVENTORY_DOC_SLUGS)).toBe(true)
+    expect(isInventoryDocumentPath('/inventory/STOCK_COUNT', INVENTORY_DOC_SLUGS)).toBe(true)
+    expect(isInventoryDocumentPath('/inventory/stock_count/5', INVENTORY_DOC_SLUGS)).toBe(true)
+    expect(isInventoryDocumentPath('/inventory/other_in/5/edit', INVENTORY_DOC_SLUGS)).toBe(true)
+  })
+
+  it('routes inventory-balance detail paths to the detail page, not the document router', () => {
+    expect(isInventoryDocumentPath('/inventory/1/2/3/4', INVENTORY_DOC_SLUGS)).toBe(false)
+    expect(isInventoryDocumentPath('/inventory/10/20/30/40', INVENTORY_DOC_SLUGS)).toBe(false)
+  })
+
+  it('is not concerned with other top-level routes', () => {
+    expect(isInventoryDocumentPath('/products', INVENTORY_DOC_SLUGS)).toBe(false)
+    expect(isInventoryDocumentPath('/purchase/purchase_order', INVENTORY_DOC_SLUGS)).toBe(false)
   })
 })
 

@@ -25,6 +25,26 @@ export function Field({ label, children, className = '' }) { return <label class
 export function Button({ children, className = '', ...props }) { return <button className={className} {...props}>{children}</button> }
 export function Forbidden() { return <section><PageHeading eyebrow="403" title="无权访问" description="当前账号没有执行此操作的权限。" /><Link className="primary button-link" to="/">返回总览</Link></section> }
 
+/** 兜底错误边界：任一页面渲染抛错时显示可恢复的提示，而不是整棵应用白屏。 */
+export class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props)
+    this.state = { error: null }
+  }
+  static getDerivedStateFromError(error) {
+    return { error }
+  }
+  componentDidCatch(error, info) {
+    console.error('页面渲染错误', error, info)
+  }
+  render() {
+    if (this.state.error) {
+      return <section><PageHeading eyebrow="出错" title="页面渲染出错" description="遇到一个意外错误。你的数据不会被影响，可以返回总览或重试。" /><div className="actions"><Link className="primary button-link" to="/">返回总览</Link><button type="button" className="secondary" onClick={() => this.setState({ error: null })}>重试</button></div></section>
+    }
+    return this.props.children
+  }
+}
+
 export function useDirtyLeaveGuard(dirty) {
   useEffect(() => {
     if (!dirty) return undefined

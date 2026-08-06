@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import './styles.css'
 import api from './api'
@@ -7,14 +7,14 @@ import { ScanStateHeading } from './scan-ui'
 import DataTable, { toServerFilters } from './data-table'
 import ProductGallery from './product-gallery'
 import { buildInventoryByProduct, enrichInventoryRows, fetchAllProductPages, formatInventorySummary, formatMoney, formatQuantity } from './list-utils'
-import { isNavigationItemActive, normalizePath } from './navigation-utils'
+import { isInventoryDocumentPath, isNavigationItemActive, normalizePath } from './navigation-utils'
 import { ROLE_LABELS, can, canView } from './roles'
-import { documentRoute } from './documents'
+import { DOC_GROUP_TYPES, documentRoute } from './documents'
 import { masterRoute } from './master-data'
 import { reportRoute } from './reports'
 
 import {
-  Back, Badge, Button, Empty, ErrorBox, Field, Link, Loading, NavLink, PageHeading,
+  Back, Badge, Button, Empty, ErrorBoundary, ErrorBox, Field, Link, Loading, NavLink, PageHeading,
   RouterContext, useDirtyLeaveGuard, useIsMobile, useRouter,
 } from './ui'
 
@@ -54,7 +54,7 @@ function Layout({ user, children, onLogout }) {
     <main className="content">
       <header className="mobile-header"><Link to="/" className="brand"><span className="brand-dot" />miniERP</Link><button className="icon-button" onClick={() => setMore(!more)} aria-label="打开菜单" aria-expanded={more}>☰</button></header>
       {more && <div className="mobile-menu" role="dialog" aria-label="更多导航">{[...flatItems, ...moreItems].map(item => <NavLink className="nav-link" key={item.to} to={item.to} onClick={() => setMore(false)}>{navContents(item)}</NavLink>)}<button className="mobile-logout" onClick={logout}>退出登录</button></div>}
-      {children}
+      <ErrorBoundary key={currentPath}>{children}</ErrorBoundary>
     </main>
     <nav className="bottom-nav" aria-label="移动导航">{flatItems.slice(0, 3).map(item => <NavLink key={item.to} to={item.to}><span className="nav-icon" aria-hidden="true">{item.icon}</span><small>{item.label}</small></NavLink>)}<button onClick={() => setMore(!more)} aria-expanded={more} aria-current={moreActive ? 'page' : undefined}><span aria-hidden="true">•••</span><small>更多</small></button></nav>
   </div>
@@ -377,16 +377,21 @@ function CountPage() {
 
 function NotFound() { return <section><PageHeading eyebrow="404" title="页面不存在" description="请从导航返回业务列表。" /><Link className="primary button-link" to="/">返回总览</Link></section> }
 
-function routeView(path, user, query) {
+export function routeView(path, user, query) {
   const parts = path.split('/').filter(Boolean); const first = parts[0]; const id = parts[1]; const sub = parts[2]
   if (path === '/') return <Dashboard />
   if (first === 'products') { if (path === '/products') return <ProductList user={user} />; if (id === 'new') return user.role === 'ADMIN' ? <ProductForm /> : <Forbidden />; if (sub === 'edit') return user.role === 'ADMIN' ? <ProductForm id={id} /> : <Forbidden />; return <ProductDetail id={id} user={user} /> }
   if (first === 'requests') { if (path === '/requests') return <RequestList user={user} />; if (id === 'new') return <RequestForm prefillProductId={query?.get('product_id')} />; if (sub === 'edit') return <RequestDetailLoader id={id} user={user} edit />; return <RequestDetail id={id} user={user} /> }
   if (first === 'count') return canView(user, 'count') ? <CountPage /> : <Forbidden />
-  if (first === 'purchase' || first === 'sales' || first === 'inventory') return documentRoute(first, parts, user)
+  if (first === 'purchase' || first === 'sales') return documentRoute(first, parts, user)
+  if (first === 'inventory') {
+    const isDocument = isInventoryDocumentPath(path, DOC_GROUP_TYPES.inventory)
+    return isDocument
+      ? documentRoute(first, parts, user)
+      : <InventoryDetail ids={{ product_id: parts[1], location_id: parts[2], condition_id: parts[3], uom_id: parts[4] }} />
+  }
   if (first === 'master') return masterRoute(first, parts, query, user)
   if (first === 'reports') return reportRoute(first, parts, query, user)
-  if (first === 'inventory') return <InventoryDetail ids={{ product_id: id, location_id: parts[2], condition_id: parts[3], uom_id: parts[4] }} />
   if (first === 'admin') { if (path === '/admin') return canView(user, 'system') ? <AdminPage /> : <Forbidden />; if (parts[1] === 'users') return canView(user, 'system') ? (parts[2] === 'new' ? <UserForm /> : parts[3] === 'edit' ? <UserForm id={parts[2]} /> : <UserDetail id={parts[2]} />) : <Forbidden />; if (parts[1] === 'locations') return canView(user, 'system') ? (parts[2] === 'new' ? <LocationForm /> : parts[3] === 'edit' ? <LocationForm id={parts[2]} /> : <LocationDetail id={parts[2]} />) : <Forbidden /> }
   if (first === 'conflicts') return canView(user, 'conflicts') ? (path === '/conflicts' ? <Conflicts /> : <ConflictDetail id={id} />) : <Forbidden />
   if (first === 'audit') return canView(user, 'audit') ? (path === '/audit' ? <Audit /> : <AuditDetail id={id} />) : <Forbidden />
@@ -412,6 +417,7 @@ function AppRouter({ user, onLogout }) {
   return <RouterContext.Provider value={{ navigate, currentPath: clean }}><Layout user={user} onLogout={onLogout}>{routeView(clean, user, new URLSearchParams(path.split('?')[1] || ''))}</Layout></RouterContext.Provider>
 }
 
-function App() { const [user, setUser] = useState(null); const [loading, setLoading] = useState(true); useEffect(() => { api.me().then(setUser).catch(() => {}).finally(() => setLoading(false)) }, []); if (loading) return <Loading />; return user ? <AppRouter user={user} onLogout={() => setUser(null)} /> : <Login onLogin={setUser} /> }
+export function App() { const [user, setUser] = useState(null); const [loading, setLoading] = useState(true); useEffect(() => { api.me().then(setUser).catch(() => {}).finally(() => setLoading(false)) }, []); if (loading) return <Loading />; return user ? <AppRouter user={user} onLogout={() => setUser(null)} /> : <Login onLogin={setUser} /> }
 
-createRoot(document.getElementById('root')).render(<App />)
+const mountEl = document.getElementById('root')
+if (mountEl) createRoot(mountEl).render(<App />)
