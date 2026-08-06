@@ -32,7 +32,8 @@ ALTER TABLE asset_identifier ADD CONSTRAINT asset_identifier_identifier_type_che
 -- 4) 单据明细草稿期捕获 SN（软约束：NULL/空即不登记）
 ALTER TABLE business_document_line ADD COLUMN IF NOT EXISTS serial_numbers TEXT[];
 
--- 5) 扩展 v_asset_current_state：加 product_id / product_name（保留原列语义）
+-- 5) 扩展 v_asset_current_state：追加 product_id / product_name 列。
+--    CREATE OR REPLACE VIEW 不允许改变既有列的顺序/名称，新列必须追加到末尾。
 CREATE OR REPLACE VIEW v_asset_current_state AS
 WITH latest_event AS (
     SELECT DISTINCT ON (ae.asset_id)
@@ -73,8 +74,6 @@ WITH latest_event AS (
 )
 SELECT
     s.asset_id,
-    s.product_id,
-    p.display_name AS product_name,
     s.asset_type,
     s.manufacturer,
     s.model,
@@ -89,7 +88,9 @@ SELECT
     s.latest_event_type,
     s.latest_event_date,
     s.latest_inventory_movement_id,
-    s.latest_event_notes
+    s.latest_event_notes,
+    s.product_id,
+    p.display_name AS product_name
 FROM state s
 LEFT JOIN product p ON p.product_id = s.product_id
 LEFT JOIN record_status rs ON rs.status_id = s.status_id
