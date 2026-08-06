@@ -174,7 +174,7 @@ def _insert_movement(conn: Any, user: dict[str, Any], req_meta: dict[str, Any], 
           request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
     with conn.cursor() as cur:
         cur.execute("""INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,document_id,reversal_of_movement_id,notes,posted_at,posted_by)
-                     VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s) RETURNING inventory_movement_id""",
+                     VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s) RETURNING inventory_movement_id""",
                     (_movement_id(conn, movement_code), _status_id(conn, "posted"), line["product_id"], quantity,
                      line["uom_id"], _condition_id(conn, line["condition_id"]), source, dest,
                      document_id or doc["document_id"], reversal_of, doc["notes"], user["username"]))

@@ -649,13 +649,13 @@ def adjust_inventory(payload: InventoryAdjustIn, request: Request, user: dict[st
             movement_id = None
             with conn.cursor() as cur:
                 cur.execute("""INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,source_uom_raw,notes,posted_at,posted_by)
-                             VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s) RETURNING inventory_movement_id""",
+                             VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s) RETURNING inventory_movement_id""",
                             (_movement_id(conn, "ADJUSTMENT"), _status_id(conn, "posted"), payload.product_id,
                              quantity, payload.uom_id, condition_id, source_location, destination_location,
                              payload.source_uom_raw, payload.notes, user["username"]))
                 movement_id = cur.fetchone()[0]
             if payload.serial_numbers:
-                apply_adjustment_serials(conn, user, req_meta, movement_id, product,
+                apply_adjustment_serials(conn, user, meta, movement_id, product,
                                          payload.serial_numbers, delta, condition_id, payload.location_id)
         if payload.change_default_unit and product["default_uom_id"] != payload.uom_id:
             audit(conn, user, "EDIT", "product", target_id=payload.product_id,

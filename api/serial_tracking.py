@@ -172,12 +172,14 @@ def apply_line_serials(conn: Any, user: dict[str, Any] | None, req_meta: dict[st
         elif stock_effect == "OUT":
             if not asset:
                 raise HTTPException(status_code=422, detail=f"SN {sn} 未在库中登记，无法出库")
-            _write_event(conn, user, req_meta, asset["asset_id"], movement_id, "issued", "retired",
+            asset_id = asset["asset_id"]
+            _write_event(conn, user, req_meta, asset_id, movement_id, "issued", "retired",
                          cond_id, source, None)
         elif stock_effect == "TRANSFER":
             if not asset:
                 raise HTTPException(status_code=422, detail=f"SN {sn} 未在库中登记，无法调拨")
-            _write_event(conn, user, req_meta, asset["asset_id"], movement_id, "transferred", "active",
+            asset_id = asset["asset_id"]
+            _write_event(conn, user, req_meta, asset_id, movement_id, "transferred", "active",
                          cond_id, source, dest)
         else:
             continue
@@ -229,7 +231,8 @@ def apply_adjustment_serials(conn: Any, user: dict[str, Any] | None, req_meta: d
         else:
             if not asset:
                 raise HTTPException(status_code=422, detail=f"SN {sn} 未在库中登记，无法出库")
-            _write_event(conn, user, req_meta, asset["asset_id"], movement_id, "issued", "retired", cond_id, location_id, None)
+            asset_id = asset["asset_id"]
+            _write_event(conn, user, req_meta, asset_id, movement_id, "issued", "retired", cond_id, location_id, None)
         _link(conn, user, req_meta, movement_id, asset_id)
 
 
