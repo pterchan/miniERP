@@ -45,7 +45,8 @@ function CustomerForm({ id, user }) {
   const { navigate } = useRouter()
   const [form, setForm] = useState({ name: '', contact_person: '', phone: '', address: '', settlement_method: '现结', level: '', credit_limit: '', notes: '', is_active: true })
   const baseline = useRef(JSON.stringify(form))
-  useDirtyLeaveGuard(JSON.stringify(form) !== baseline.current)
+  const dirty = useMemo(() => JSON.stringify(form) !== baseline.current, [form])
+  useDirtyLeaveGuard(dirty)
   const [error, setError] = useState(null)
   useEffect(() => { if (id) api.customer(id).then(x => { const next = { name: x.name, contact_person: x.contact_person || '', phone: x.phone || '', address: x.address || '', settlement_method: x.settlement_method, level: x.level || '', credit_limit: x.credit_limit != null ? String(x.credit_limit) : '', notes: x.notes || '', is_active: x.is_active }; baseline.current = JSON.stringify(next); setForm(next) }).catch(setError) }, [id])
   function patch(k, v) { setForm(x => ({ ...x, [k]: v })) }
@@ -82,7 +83,8 @@ function SupplierForm({ id, user }) {
   const { navigate } = useRouter()
   const [form, setForm] = useState({ name: '', contact_person: '', phone: '', address: '', settlement_days: '', notes: '', is_active: true })
   const baseline = useRef(JSON.stringify(form))
-  useDirtyLeaveGuard(JSON.stringify(form) !== baseline.current)
+  const dirty = useMemo(() => JSON.stringify(form) !== baseline.current, [form])
+  useDirtyLeaveGuard(dirty)
   const [error, setError] = useState(null)
   useEffect(() => { if (id) api.supplier(id).then(x => { const next = { name: x.name, contact_person: x.contact_person || '', phone: x.phone || '', address: x.address || '', settlement_days: x.settlement_days != null ? String(x.settlement_days) : '', notes: x.notes || '', is_active: x.is_active }; baseline.current = JSON.stringify(next); setForm(next) }).catch(setError) }, [id])
   function patch(k, v) { setForm(x => ({ ...x, [k]: v })) }

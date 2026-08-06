@@ -29,7 +29,7 @@ def purchase_reconciliation(supplier_id: int | None = None, start_date: str = ""
     if end_date:
         sql += " AND d.doc_date<=%s"
         params.append(end_date)
-    sql += " ORDER BY d.doc_date DESC, d.document_id DESC"
+    sql += " ORDER BY d.doc_date DESC, d.document_id DESC LIMIT 20000"
     with connection() as conn:
         rows = fetch_all(conn, sql, tuple(params))
     return {"rows": rows}
@@ -53,7 +53,7 @@ def receivables(party_id: int | None = None, user: dict[str, Any] = Depends(requ
                                     JOIN business_document d ON d.document_id=e.document_id
                                     LEFT JOIN customer c ON e.party_type='CUSTOMER' AND c.customer_id=e.party_id
                                    WHERE e.party_type='CUSTOMER' AND (%s IS NULL OR e.party_id=%s)
-                                   ORDER BY e.created_at DESC""", (party_id, party_id))
+                                   ORDER BY e.created_at DESC LIMIT 20000""", (party_id, party_id))
 
 
 @router.get("/payables")
@@ -65,7 +65,7 @@ def payables(party_id: int | None = None, user: dict[str, Any] = Depends(require
                                     JOIN business_document d ON d.document_id=e.document_id
                                     LEFT JOIN supplier s ON e.party_type='SUPPLIER' AND s.supplier_id=e.party_id
                                    WHERE e.party_type='SUPPLIER' AND (%s IS NULL OR e.party_id=%s)
-                                   ORDER BY e.created_at DESC""", (party_id, party_id))
+                                   ORDER BY e.created_at DESC LIMIT 20000""", (party_id, party_id))
 
 
 @router.get("/inventory-cost")

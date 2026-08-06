@@ -4,6 +4,8 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 MAIN = (ROOT / "api/main.py").read_text(encoding="utf-8")
 IMAGES = (ROOT / "api/images.py").read_text(encoding="utf-8")
+IMAGE_UTILS = (ROOT / "api/image_utils.py").read_text(encoding="utf-8")
+DOCS = (ROOT / "api/documents.py").read_text(encoding="utf-8")
 STORAGE = (ROOT / "api/storage.py").read_text(encoding="utf-8")
 SCHEMAS = (ROOT / "api/schemas.py").read_text(encoding="utf-8")
 REQS = (ROOT / "api/requirements.txt").read_text(encoding="utf-8")
@@ -40,10 +42,22 @@ class ImageFeatureContractTests(unittest.TestCase):
         self.assertIn("_csrf(request)", IMAGES)
 
     def test_magic_byte_sniffing_rejects_non_images(self):
+        # 嗅探逻辑迁移到共享模块 image_utils.py，images.py 仍保留 import
         self.assertIn("_sniff_image_type", IMAGES)
+        self.assertIn("_sniff_image_type", IMAGE_UTILS)
         # JPEG 魔数（FF D8 FF）；SVG 等文本型不被放行
-        self.assertIn("\\xff\\xd8\\xff", IMAGES)
-        self.assertIn("一律拒绝", IMAGES)
+        self.assertIn("\\xff\\xd8\\xff", IMAGE_UTILS)
+        self.assertIn("一律拒绝", IMAGE_UTILS)
+
+    def test_server_reencode_cap_and_attachment_wiring(self):
+        # 服务端兜底：超限（>1600px 或 >700KB）重编码为 JPEG
+        self.assertIn("_reencode_to_cap", IMAGE_UTILS)
+        self.assertIn("_reencode_to_cap", IMAGES)
+        self.assertIn("SERVER_MAX_EDGE = 1600", IMAGE_UTILS)
+        self.assertIn("SERVER_MAX_BYTES = 700 * 1024", IMAGE_UTILS)
+        self.assertIn("ImageOps.exif_transpose", IMAGE_UTILS)
+        # 附件（documents.py）与货品附图（images.py）共用同一套媒体工具
+        self.assertIn("from .image_utils import _reencode_to_cap, _sniff_image_type", DOCS)
 
     def test_object_key_never_serialized(self):
         # 客户端响应不得含 object_key/bucket

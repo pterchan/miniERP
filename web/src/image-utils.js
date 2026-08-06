@@ -1,4 +1,27 @@
-// 图片上传预处理：HEIC/HEIF → JPEG，超限时 canvas 压缩，返回 File（multipart 用）。
+// 图片上传预处理：HEIC/HEIF → JPEG，超限时 canvas 重编码到目标体积/分辨率。
+// 端侧是 2Mbps 小水管下的第一道限流：>maxBytes 的图在上传前压到 ≤maxBytes。
+
+export const UPLOAD_IMAGE_MAX_EDGE = 1280
+export const UPLOAD_IMAGE_MAX_PIXELS = 3_000_000
+export const UPLOAD_IMAGE_MAX_BYTES = 400 * 1024
+export const OCR_IMAGE_MAX_EDGE = 2048
+export const OCR_IMAGE_MAX_PIXELS = 4_000_000
+export const OCR_IMAGE_MAX_BYTES = 1_500_000
+
+const _QUALITY_START = 0.85
+const _QUALITY_MIN = 0.55
+const _DOWNSCALE_FLOOR = 640
+
+// WebP 编码能力检测（带测试注入缝隙；jsdom / 旧浏览器下不抛错、回退 false）。
+let _webpOverride = null
+export function canEncodeWebP() {
+  if (_webpOverride !== null) return _webpOverride
+  try {
+    if (typeof HTMLCanvasElement === 'undefined') return false
+    return document.createElement('canvas').toDataURL('image/webp').startsWith('data:image/webp')
+  } catch { return false }
+}
+export function setWebPOverrideForTest(value) { _webpOverride = value }
 
 function loadImage(url) {
   return new Promise((resolve, reject) => {
@@ -9,12 +32,21 @@ function loadImage(url) {
   })
 }
 
-function canvasToBlob(canvas, quality) {
-  return new Promise((resolve, reject) => canvas.toBlob(x => x ? resolve(x) : reject(new Error('图片压缩失败')), 'image/jpeg', quality))
+function canvasToBlob(canvas, mime, quality) {
+  return new Promise((resolve, reject) => canvas.toBlob(x => x ? resolve(x) : reject(new Error('图片压缩失败')), mime, quality))
 }
 
 function blobToFile(blob, name, type) {
   return new File([blob], name, { type: type || blob.type || 'image/jpeg' })
+}
+
+export function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result).split(',')[1])
+    reader.onerror = reject
+    reader.readAsDataURL(blob)
+  })
 }
 
 function replaceExt(name, ext) {
@@ -22,33 +54,40 @@ function replaceExt(name, ext) {
   return i > 0 ? name.slice(0, i) + '.' + ext : name + '.' + ext
 }
 
-// 超限图片：解码后按最大边 4096 / 像素上限逐级压缩到 maxBytes 以内。
-async function ensureWithin(blob, maxBytes, name, type) {
-  if (blob.size <= maxBytes) return blob instanceof File ? blob : blobToFile(blob, name, type)
+// 重编码：按 maxEdge/maxPixels 缩放 + 质量阶梯 + 下采样阶梯，保证 ≤maxBytes。
+// 调用方只在确实需要重编码时调用（透传决策在 prepareUploadFile / prepareImage 内）。
+export async function compressImage(blob, { maxEdge, maxPixels, maxBytes, mime, name }) {
+  if (typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') {
+    throw new Error('canvas 不可用')
+  }
   const url = URL.createObjectURL(blob)
   try {
     const image = await loadImage(url)
-    const maxEdge = 4096
-    const maxPixels = 32_000_000
+    const format = mime === 'image/webp' && canEncodeWebP() ? 'image/webp' : 'image/jpeg'
     let scale = Math.min(1, maxEdge / image.width, maxEdge / image.height, Math.sqrt(maxPixels / (image.width * image.height)))
     if (!isFinite(scale)) scale = 1
+    let cw = Math.max(64, Math.round(image.width * scale))
+    let ch = Math.max(64, Math.round(image.height * scale))
     const canvas = document.createElement('canvas')
-    canvas.width = Math.max(64, Math.round(image.width * scale))
-    canvas.height = Math.max(64, Math.round(image.height * scale))
+    canvas.width = cw; canvas.height = ch
     const ctx = canvas.getContext('2d')
-    ctx.fillStyle = '#fff'
-    ctx.fillRect(0, 0, canvas.width, canvas.height)
-    ctx.drawImage(image, 0, 0, canvas.width, canvas.height)
-    let quality = 0.86
-    let out = await canvasToBlob(canvas, quality)
-    while (out.size > maxBytes && quality > 0.55) { quality -= 0.08; out = await canvasToBlob(canvas, quality) }
-    while (out.size > maxBytes && canvas.width > 1200) {
-      canvas.width = Math.round(canvas.width * 0.8)
-      canvas.height = Math.round(canvas.height * 0.8)
+    const draw = () => {
+      ctx.fillStyle = '#fff'
+      ctx.fillRect(0, 0, canvas.width, canvas.height)
       ctx.drawImage(image, 0, 0, canvas.width, canvas.height)
-      out = await canvasToBlob(canvas, quality)
     }
-    return blobToFile(out, replaceExt(name, 'jpg'), 'image/jpeg')
+    draw()
+    let quality = _QUALITY_START
+    let out = await canvasToBlob(canvas, format, quality)
+    while (out.size > maxBytes && quality > _QUALITY_MIN) { quality -= 0.08; out = await canvasToBlob(canvas, format, quality) }
+    while (out.size > maxBytes && cw > _DOWNSCALE_FLOOR) {
+      cw = Math.round(cw * 0.8); ch = Math.round(ch * 0.8)
+      canvas.width = cw; canvas.height = ch
+      draw()
+      out = await canvasToBlob(canvas, format, quality)
+    }
+    const ext = format === 'image/webp' ? 'webp' : 'jpg'
+    return blobToFile(out, replaceExt(name, ext), format)
   } finally {
     URL.revokeObjectURL(url)
   }
@@ -57,10 +96,11 @@ async function ensureWithin(blob, maxBytes, name, type) {
 /**
  * 把待上传文件预处理为适合 multipart 上传的 File：
  * - HEIC/HEIF 先转 JPEG（heic2any）；
- * - jpeg/png/webp 且未超限则原样返回；
- * - 其余/超限走 canvas 重压缩到 maxBytes（默认 20MB）以内。
+ * - ≤maxBytes 的图片原样返回（不解码、无质量损失）；
+ * - 超限走 compressImage 重编码到 ≤maxBytes（WebP，不支持则 JPEG）。
+ * 解码失败一律回退原文件，交由服务端 _reencode_to_cap 兜底。
  */
-export async function prepareUploadFile(file, { maxBytes = 20 * 1024 * 1024 } = {}) {
+export async function prepareUploadFile(file, { maxBytes = UPLOAD_IMAGE_MAX_BYTES, maxEdge = UPLOAD_IMAGE_MAX_EDGE, maxPixels = UPLOAD_IMAGE_MAX_PIXELS } = {}) {
   let source = file
   let name = file.name
   let type = file.type
@@ -72,8 +112,19 @@ export async function prepareUploadFile(file, { maxBytes = 20 * 1024 * 1024 } = 
     name = replaceExt(file.name, 'jpg')
     type = 'image/jpeg'
   }
-  if (source.type && /^image\/(jpeg|png|webp)$/i.test(source.type) && source.size <= maxBytes) {
+  if (!(source.type && /^image\/(jpeg|png|webp|gif)$/i.test(source.type))) {
     return source instanceof File ? source : blobToFile(source, name, type)
   }
-  return ensureWithin(source, maxBytes, name, type)
+  if (source.size <= maxBytes) {
+    return source instanceof File ? source : blobToFile(source, name, type)
+  }
+  try {
+    return await compressImage(source, {
+      maxEdge, maxPixels, maxBytes,
+      mime: canEncodeWebP() ? 'image/webp' : 'image/jpeg',
+      name,
+    })
+  } catch {
+    return source instanceof File ? source : blobToFile(source, name, type)
+  }
 }

@@ -13,6 +13,7 @@ export default function ProductGallery({ productId, canEdit }) {
   const [images, setImages] = useState([])
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(null)
   const [preview, setPreview] = useState(null)
   const fileRef = useRef(null)
 
@@ -26,13 +27,16 @@ export default function ProductGallery({ productId, canEdit }) {
     const files = Array.from(e.target.files || [])
     e.target.value = ''
     if (!files.length) return
-    setBusy(true); setError(null)
+    setBusy(true); setError(null); setUploadProgress(null)
     try {
       const prepared = []
       for (const file of files) prepared.push(await prepareUploadFile(file))
-      await api.uploadProductImages(productId, prepared)
+      // 慢水管（2Mbps）下 XHR 进度：一个 FormData 带整批，e.total 即整批字节。
+      await api.uploadProductImages(productId, prepared, {
+        onProgress: (loaded, total) => setUploadProgress(total ? Math.round((loaded / total) * 100) : 0),
+      })
       await load()
-    } catch (err) { setError(err) } finally { setBusy(false) }
+    } catch (err) { setError(err) } finally { setBusy(false); setUploadProgress(null) }
   }
 
   async function remove(image) {
@@ -61,11 +65,12 @@ export default function ProductGallery({ productId, canEdit }) {
     <ErrorBox error={error} />
     <div className="gallery-toolbar">
       <input ref={fileRef} hidden type="file" multiple accept="image/*,.heic,.heif" onChange={onFilesSelected} />
-      {canEdit && <Button type="button" className="secondary" onClick={() => fileRef.current?.click()} disabled={busy}>{busy ? '上传中…' : '＋ 上传图片'}</Button>}
+      {canEdit && <Button type="button" className="secondary" onClick={() => fileRef.current?.click()} disabled={busy}>{busy && uploadProgress === null ? '压缩中…' : uploadProgress !== null ? `上传中 ${uploadProgress}%` : '＋ 上传图片'}</Button>}
+      {uploadProgress !== null && <progress value={uploadProgress} max="100" aria-label="上传进度" />}
       <span className="muted">{images.length} 张</span>
     </div>
     {sorted.length ? <div className="gallery-grid">{sorted.map(image => <figure className="gallery-tile" key={image.image_id}>
-      <img src={api.productImageContent(image.image_id)} alt={image.filename || `图片 ${image.image_id}`} loading="lazy" onClick={() => setPreview(image)} />
+      <img src={api.productImageContent(image.image_id, 'thumb')} alt={image.filename || `图片 ${image.image_id}`} loading="lazy" onClick={() => setPreview(image)} />
       <figcaption><span title={image.filename}>{image.filename || `图片 ${image.image_id}`}</span><small>{fmtSize(image.size)}</small></figcaption>
       {canEdit && <div className="gallery-actions">
         <button type="button" onClick={() => move(image, -1)} disabled={sorted[0].image_id === image.image_id} aria-label="前移">↑</button>

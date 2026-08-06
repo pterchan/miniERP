@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 
 import psycopg2
+from psycopg2 import pool as _pg_pool
 from psycopg2.extras import RealDictCursor, Json
 
 
@@ -27,9 +28,21 @@ def database_url() -> str:
     return os.environ.get("DATABASE_URL", "postgresql://inventory:<password>@postgres:5432/inventory")
 
 
+_pool: Any = None
+
+
+def _get_pool() -> Any:
+    """惰性创建连接池：minconn=0 避免启动即连库，maxconn 耗尽时 getconn() 排队阻塞。"""
+    global _pool
+    if _pool is None:
+        _pool = _pg_pool.ThreadedConnectionPool(0, 30, database_url())
+    return _pool
+
+
 @contextmanager
 def connection() -> Iterator[Any]:
-    conn = psycopg2.connect(database_url())
+    pool = _get_pool()
+    conn = pool.getconn()
     conn.autocommit = False
     try:
         yield conn
@@ -38,7 +51,7 @@ def connection() -> Iterator[Any]:
         conn.rollback()
         raise
     finally:
-        conn.close()
+        pool.putconn(conn)
 
 
 def fetch_one(conn: Any, sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:

@@ -19,43 +19,15 @@ from fastapi.responses import StreamingResponse
 
 from .db import audit, connection, fetch_all, fetch_one
 from .helpers import _request_meta
+from .image_utils import _ext_for_type, _make_thumbnail, _reencode_to_cap, _sniff_image_type
 from .permissions import _csrf, require_roles, require_user
 from .schemas import ImageUpdateIn
 from .storage import bucket_name, get_client
 
 router = APIRouter(prefix="/api", tags=["images"])
 
-_MAX_IMAGE = 20 * 1024 * 1024   # 单图 ≤20MB（反代 body 上限已调至 ~25m）
+_MAX_IMAGE = 20 * 1024 * 1024   # 单图 ≤20MB（反代 body 上限已调至 ~25m；超限入参由 _reencode_to_cap 拉回）
 _MAX_FILES = 10                 # 单次请求最多 10 张（总数量不限制，可分批上传）
-
-_EXT_BY_TYPE = {
-    "image/jpeg": "jpg",
-    "image/png": "png",
-    "image/gif": "gif",
-    "image/webp": "webp",
-    "image/heic": "heic",
-}
-
-
-def _sniff_image_type(data: bytes) -> str | None:
-    """Magic-byte 嗅探，只放行位图/HEIC；SVG 等文本型（可注入脚本）一律拒绝。"""
-    if data[:3] == b"\xff\xd8\xff":
-        return "image/jpeg"
-    if data[:8] == b"\x89PNG\r\n\x1a\n":
-        return "image/png"
-    if data[:6] in (b"GIF87a", b"GIF89a"):
-        return "image/gif"
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
-    if len(data) >= 12 and data[4:8] == b"ftyp":
-        brand = data[8:12]
-        if brand in (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"):
-            return "image/heic"
-    return None
-
-
-def _ext_for_type(content_type: str) -> str:
-    return _EXT_BY_TYPE.get(content_type, "bin")
 
 
 def _safe_filename(name: str) -> str:
@@ -131,14 +103,25 @@ def upload_product_images(
         content_type = _sniff_image_type(data)
         if not content_type:
             raise HTTPException(status_code=422, detail=f"不支持的文件类型: {up.filename or '未知'}")
+        # 服务端兜底：绕过端侧或极端尺寸时，把存储/下载体积拉回 ≤1600px/≤700KB。
+        re = _reencode_to_cap(data, content_type)
+        if re:
+            data, content_type, _ = re
         object_key = f"products/{product_id}/{uuid.uuid4().hex}.{_ext_for_type(content_type)}"
         prepared.append((up, data, content_type, object_key))
 
     uploaded_keys: list[tuple[str, str]] = []
+    thumbnails: list[tuple[str, int] | None] = []
     try:
         for _up, data, content_type, object_key in prepared:
             get_client().put_object(bucket_name(), object_key, io.BytesIO(data), len(data), content_type=content_type)
             uploaded_keys.append((bucket_name(), object_key))
+            thumb = _make_thumbnail(data) if content_type != "image/heic" else None
+            if thumb:
+                thumb_key = object_key + ".thumb.jpg"
+                get_client().put_object(bucket_name(), thumb_key, io.BytesIO(thumb[0]), thumb[1], content_type="image/jpeg")
+                uploaded_keys.append((bucket_name(), thumb_key))
+            thumbnails.append((thumb_key, thumb[1]) if thumb else None)
         with connection() as conn:
             if not fetch_one(conn, "SELECT product_id FROM product WHERE product_id=%s", (product_id,)):
                 raise HTTPException(status_code=404, detail="货品不存在")
@@ -153,12 +136,14 @@ def upload_product_images(
                 }
                 audit(conn, user, "UPLOAD", "product_image", after=after,
                       request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
+                thumb = thumbnails[i]
                 with conn.cursor() as cur:
                     cur.execute(
-                        """INSERT INTO product_image(product_id, object_key, bucket, filename, content_type, size, sort_order, uploaded_by)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                        """INSERT INTO product_image(product_id, object_key, bucket, filename, content_type, size, sort_order, uploaded_by, thumb_object_key, thumb_size)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                            RETURNING image_id, product_id, filename, content_type, size, sort_order, uploaded_by, created_at""",
-                        (product_id, object_key, bucket_name(), after["filename"], after["content_type"], after["size"], after["sort_order"], user["user_id"]),
+                        (product_id, object_key, bucket_name(), after["filename"], after["content_type"], after["size"], after["sort_order"], user["user_id"],
+                         thumb[0] if thumb else None, thumb[1] if thumb else None),
                     )
                     rows.append(dict(zip([d.name for d in cur.description], cur.fetchone())))
             return rows
@@ -171,21 +156,26 @@ def upload_product_images(
 
 
 @router.get("/product-images/{image_id}/content")
-def product_image_content(image_id: int, user: dict[str, Any] = Depends(require_user)) -> Response:
+def product_image_content(image_id: int, size: str = "", user: dict[str, Any] = Depends(require_user)) -> Response:
     with connection() as conn:
         row = fetch_one(conn, "SELECT * FROM product_image WHERE image_id=%s", (image_id,))
     if not row:
         raise HTTPException(status_code=404, detail="图片不存在")
+    is_thumb = size == "thumb" and bool(row.get("thumb_object_key"))
+    object_key = row["thumb_object_key"] if is_thumb else row["object_key"]
+    media_type = "image/jpeg" if is_thumb else row["content_type"]
+    content_length = row.get("thumb_size") if is_thumb else row["size"]
     filename = _safe_filename(row["filename"])
     headers = {
         "Content-Disposition": f"inline; filename*=UTF-8''{_quote_filename(filename)}",
         "X-Content-Type-Options": "nosniff",
-        "Content-Length": str(row["size"]),
-        "Cache-Control": "private, max-age=3600",
+        "Cache-Control": "public, max-age=31536000, immutable",
     }
+    if content_length:
+        headers["Content-Length"] = str(content_length)
     return StreamingResponse(
-        _stream_object(row["bucket"], row["object_key"]),
-        media_type=row["content_type"],
+        _stream_object(row["bucket"], object_key),
+        media_type=media_type,
         headers=headers,
     )
 

@@ -7,25 +7,27 @@ posts the inverse movements/entries so the ledger nets to zero.
 
 from __future__ import annotations
 
-import base64
 from datetime import date
 from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile
 from psycopg2 import Binary
 
 from .db import audit, connection, fetch_all, fetch_one
 from .export import export_response
+from .image_utils import _reencode_to_cap, _sniff_image_type
 from .list_params import clamp_page, clamp_page_size, parse_filters, parse_ids, parse_sort
 from .helpers import _condition_id, _line_uom_id, _movement_id, _request_meta, _status_id
 from .permissions import DOC_TYPE_META, GROUP_META, _can_post, _csrf, require_user
-from .schemas import AttachmentIn, DocCreateIn, DocSubmitIn, DocUpdateIn
+from .schemas import DocCreateIn, DocSubmitIn, DocUpdateIn
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 attachments_router = APIRouter(prefix="/api/attachments", tags=["documents"])
 
 # 价格来源：销售单用销售价（可命中批发档）、采购单用采购成本价
+_MAX_ATTACHMENT = 10 * 1024 * 1024  # 附件 ≤10MB（与前端校验一致）
+
 PRICE_SOURCE = {
     "PURCHASE_ORDER": "cost", "PURCHASE_RECEIPT": "cost", "PURCHASE_RETURN": "cost",
     "SALES_ORDER": "sales", "SALES_DELIVERY": "sales", "SALES_RETURN": "sales",
@@ -587,22 +589,33 @@ def reverse_document(document_id: int, request: Request, user: dict[str, Any] = 
 
 
 @router.post("/{document_id}/attachments")
-def add_attachment(document_id: int, payload: AttachmentIn, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+def add_attachment(document_id: int, file: UploadFile = File(...), request: Request = None,
+                   user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
     _csrf(request)
     req_meta = _request_meta(request)
-    data = base64.b64decode(payload.data_base64)
-    if len(data) != payload.size:
-        raise HTTPException(status_code=422, detail="附件大小与内容不符")
+    data = file.file.read(_MAX_ATTACHMENT + 1)
+    if len(data) > _MAX_ATTACHMENT:
+        raise HTTPException(status_code=413, detail=f"附件不能超过 {_MAX_ATTACHMENT // (1024 * 1024)}MB")
+    filename = (file.filename or "attachment")[:255]
+    content_type = file.content_type or "application/octet-stream"
+    # 图片附件服务端兜底：超限重编码为 ≤1600px/≤700KB 的 JPEG（下载也走 2Mbps 小水管）；
+    # PDF 等非图片原样透传、10MB 上限不变。
+    sniffed = _sniff_image_type(data)
+    if sniffed:
+        content_type = sniffed
+        re = _reencode_to_cap(data, sniffed)
+        if re:
+            data, content_type, _ = re
     with connection() as conn:
         if not fetch_one(conn, "SELECT document_id FROM business_document WHERE document_id=%s", (document_id,)):
             raise HTTPException(status_code=404, detail="单据不存在")
         audit(conn, user, "UPLOAD", "document_attachment",
-              after={"document_id": document_id, "filename": payload.filename, "size": payload.size},
+              after={"document_id": document_id, "filename": filename, "size": len(data)},
               request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO document_attachment(document_id,filename,content_type,size,data,uploaded_by)
                          VALUES (%s,%s,%s,%s,%s,%s) RETURNING attachment_id,filename,content_type,size,created_at,uploaded_by""",
-                        (document_id, payload.filename, payload.content_type, payload.size, Binary(data), user["user_id"]))
+                        (document_id, filename, content_type, len(data), Binary(data), user["user_id"]))
             return dict(zip([d.name for d in cur.description], cur.fetchone()))
 
 

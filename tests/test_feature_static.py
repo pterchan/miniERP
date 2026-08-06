@@ -68,7 +68,7 @@ class FeatureContractTests(unittest.TestCase):
     def test_fuzzy_search_contract(self):
         for token in ("normalize_search", "fuzzy_search", "SequenceMatcher"):
             self.assertIn(token, SEARCH)
-        self.assertIn("strpos(", API)
+        self.assertIn("LIKE %s ESCAPE", API)
         self.assertIn("_FUZZY_POOL_QUERY", API)
         self.assertIn("match_type", SEARCH)
         self.assertIn("match_score", SEARCH)

@@ -161,6 +161,15 @@ else
   docker compose --env-file .env exec -T api python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/healthz", timeout=5).read()'
 fi
 
+# 全新库由 docker-entrypoint-initdb.d 自动执行 005；已有库在此幂等执行一次。
+DB_USER="$(grep -E '^POSTGRES_USER=' .env | cut -d= -f2-)"
+DB_NAME="$(grep -E '^POSTGRES_DB=' .env | cut -d= -f2-)"
+if [[ -n "$DB_USER" && -n "$DB_NAME" ]]; then
+  echo "Applying idempotent migration 005 to existing database..."
+  docker compose --env-file .env exec -T postgres psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" \
+    -f /docker-entrypoint-initdb.d/005_search_indexes.sql || { echo "migration 005 failed" >&2; exit 1; }
+fi
+
 if [[ "$DO_SEED" == "1" ]]; then
   [[ -s .workbook.xlsx && -s .import-password ]] || { echo "seed inputs are missing" >&2; exit 1; }
   chmod 600 .workbook.xlsx .import-password

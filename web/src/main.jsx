@@ -6,12 +6,13 @@ import { findProductMatches } from './scan-utils'
 import { ScanStateHeading } from './scan-ui'
 import DataTable, { toServerFilters } from './data-table'
 import ProductGallery from './product-gallery'
-import { buildInventoryByProduct, enrichInventoryRows, fetchAllProductPages, formatInventorySummary, formatMoney, formatQuantity } from './list-utils'
+import { formatInventorySummary, formatMoney, formatQuantity } from './list-utils'
 import { isInventoryDocumentPath, isNavigationItemActive, normalizePath } from './navigation-utils'
 import { ROLE_LABELS, can, canView } from './roles'
 import { DOC_GROUP_TYPES, documentRoute } from './documents'
 import { masterRoute } from './master-data'
 import { reportRoute } from './reports'
+import { blobToBase64, compressImage, OCR_IMAGE_MAX_BYTES, OCR_IMAGE_MAX_EDGE, OCR_IMAGE_MAX_PIXELS } from './image-utils'
 
 import {
   Back, Badge, Button, Empty, ErrorBoundary, ErrorBox, Field, Link, Loading, NavLink, PageHeading,
@@ -66,15 +67,13 @@ function Layout({ user, children, onLogout }) {
 }
 
 function Dashboard() {
-  const [rows, setRows] = useState([]); const [catalog, setCatalog] = useState([]); const [error, setError] = useState(null); const [catalogError, setCatalogError] = useState(false)
+  const [rows, setRows] = useState([]); const [error, setError] = useState(null)
   useEffect(() => {
     api.inventory().then(setRows).catch(setError)
-    api.productCatalog().then(setCatalog).catch(() => setCatalogError(true))
   }, [])
-  const enrichedRows = useMemo(() => enrichInventoryRows(rows, catalog), [rows, catalog])
-  const productCount = new Set(rows.map(row => row.product_id)).size
-  const locationCount = new Set(rows.map(row => row.location_id)).size
-  const conditionOptions = useMemo(() => [...new Set(enrichedRows.map(r => r.condition_code).filter(Boolean))].map(c => ({ value: c, label: c })), [enrichedRows])
+  const productCount = useMemo(() => new Set(rows.map(row => row.product_id)).size, [rows])
+  const locationCount = useMemo(() => new Set(rows.map(row => row.location_id)).size, [rows])
+  const conditionOptions = useMemo(() => [...new Set(rows.map(r => r.condition_code).filter(Boolean))].map(c => ({ value: c, label: c })), [rows])
   const columns = useMemo(() => [
     { key: 'identifier', label: '业务编号', value: r => r.identifier || '—' },
     { key: 'product_name', label: '货品名称', filterType: 'search', searchKeys: ['identifier', 'product_name', 'manufacturer', 'specification', 'location_name', 'condition_code', 'uom_code'] },
@@ -84,10 +83,10 @@ function Dashboard() {
     { key: 'uom_code', label: '单位', value: r => r.uom_code || '—' },
   ], [conditionOptions])
   const inventoryKey = r => `${r.product_id}:${r.location_id}:${r.condition_id}:${r.uom_id}`
-  return <section><PageHeading eyebrow="总览" title="库存工作台" description="按编号、货品、库位、成色和单位查看已过账余额。" /><div className="stats"><div className="stat"><span>库存维度</span><strong>{rows.length}</strong></div><div className="stat teal"><span>货品数</span><strong>{productCount}</strong></div><div className="stat"><span>库位数</span><strong>{locationCount}</strong></div></div><div className="panel"><div className="panel-head"><div><h2>库存余额</h2><p className="muted">余额来自已过账流水；不同单位分别展示。</p></div></div><ErrorBox error={error} />{catalogError && <div className="alert warning compact">货品编号暂未加载，库存余额仍可正常查看。</div>}<DataTable
+  return <section><PageHeading eyebrow="总览" title="库存工作台" description="按编号、货品、库位、成色和单位查看已过账余额。" /><div className="stats"><div className="stat"><span>库存维度</span><strong>{rows.length}</strong></div><div className="stat teal"><span>货品数</span><strong>{productCount}</strong></div><div className="stat"><span>库位数</span><strong>{locationCount}</strong></div></div><div className="panel"><div className="panel-head"><div><h2>库存余额</h2><p className="muted">余额来自已过账流水；不同单位分别展示。</p></div></div><ErrorBox error={error} /><DataTable
     mode="client"
     columns={columns}
-    rows={enrichedRows}
+    rows={rows}
     rowKey={inventoryKey}
     rowHref={r => `/inventory/${r.product_id}/${r.location_id}/${r.condition_id}/${r.uom_id}`}
     exportConfig={{
@@ -100,24 +99,17 @@ function Dashboard() {
 }
 
 function ProductList({ user }) {
-  const { navigate } = useRouter(); const [inventoryRows, setInventoryRows] = useState([]); const [inventoryStatus, setInventoryStatus] = useState('loading'); const [error, setError] = useState(null)
-  useEffect(() => {
-    let active = true
-    api.inventory().then(result => { if (active) { setInventoryRows(result); setInventoryStatus('ready') } }).catch(() => { if (active) setInventoryStatus('error') })
-    return () => { active = false }
-  }, [])
-  const inventoryByProduct = useMemo(() => buildInventoryByProduct(inventoryRows), [inventoryRows])
-  const inventoryAvailable = inventoryStatus === 'ready'
-  const fetchProducts = useCallback(p => api.products(p), [])
+  const { navigate } = useRouter(); const [error, setError] = useState(null)
+  const fetchProducts = useCallback((p, signal) => api.products({ ...p, signal }), [])
   const columns = useMemo(() => [
     { key: 'identifier', label: '业务编号', value: r => r.identifier || '—' },
     { key: 'display_name', label: '货品名称', filterType: 'search' },
     { key: 'manufacturer', label: '厂家', filterType: 'text', value: r => r.manufacturer || '—' },
     { key: 'specification', label: '规格 / 型号', filterType: 'text', value: r => r.specification || '—' },
-    { key: 'stock', label: '现库存', align: 'end', sortable: false, value: r => { const summary = inventoryAvailable ? formatInventorySummary(inventoryByProduct.get(String(r.product_id))) : '—'; return summary === '无库存' ? `无库存 · ${r.uom_code || '—'}` : summary } },
+    { key: 'stock', label: '现库存', align: 'end', sortable: false, value: r => { const summary = formatInventorySummary(r.stock_summary); return summary === '无库存' ? `无库存 · ${r.uom_code || '—'}` : summary } },
     { key: 'uom_code', label: '默认单位', value: r => r.uom_code || '—' },
-  ], [inventoryByProduct, inventoryAvailable])
-  return <section><PageHeading eyebrow="主数据" title="货品" description="搜索并维护编号、名称、厂家、规格、库存和单位。">{user.role === 'ADMIN' && <Button className="primary" onClick={() => navigate('/products/new')}>＋ 新增货品</Button>}</PageHeading><div className="panel">{inventoryStatus === 'error' && <div className="alert warning compact">库存汇总暂未加载，货品主数据仍可正常查看。</div>}<ErrorBox error={error} /><DataTable
+  ], [])
+  return <section><PageHeading eyebrow="主数据" title="货品" description="搜索并维护编号、名称、厂家、规格、库存和单位。">{user.role === 'ADMIN' && <Button className="primary" onClick={() => navigate('/products/new')}>＋ 新增货品</Button>}</PageHeading><div className="panel"><ErrorBox error={error} /><DataTable
     mode="server"
     columns={columns}
     fetchData={fetchProducts}
@@ -135,7 +127,8 @@ function ProductList({ user }) {
 
 function ProductForm({ id }) {
   const { navigate } = useRouter(); const [form, setForm] = useState({ display_name: '', manufacturer: '', specification: '', source_uom_raw: '个', default_uom_id: '', primary_identifier: '', category_id: '', purchase_cost_price: '', sales_price: '' }); const baseline = useRef(JSON.stringify(form)); const [uoms, setUoms] = useState([]); const [categories, setCategories] = useState([]); const [error, setError] = useState(null); const [message, setMessage] = useState(''); const [busy, setBusy] = useState(false)
-  useDirtyLeaveGuard(JSON.stringify(form) !== baseline.current)
+  const dirty = useMemo(() => JSON.stringify(form) !== baseline.current, [form])
+  useDirtyLeaveGuard(dirty)
   useEffect(() => { api.uoms().then(setUoms).catch(setError); api.categories().then(setCategories).catch(() => {}); if (id) api.product(id).then(p => { const next = { display_name: p.display_name || '', manufacturer: p.manufacturer || '', specification: p.specification || '', source_uom_raw: p.source_uom_raw || '', default_uom_id: p.default_uom_id || '', primary_identifier: p.primary_identifier?.value_raw || '', category_id: p.category_id || '', purchase_cost_price: p.purchase_cost_price != null ? String(p.purchase_cost_price) : '', sales_price: p.sales_price != null ? String(p.sales_price) : '' }; baseline.current = JSON.stringify(next); setForm(next) }).catch(setError) }, [id])
   function set(k, v) { setForm(x => ({ ...x, [k]: v })) }
   async function save(e) { e.preventDefault(); setError(null); setMessage(''); setBusy(true); try { const payload = { ...form, default_uom_id: form.default_uom_id ? Number(form.default_uom_id) : null, primary_identifier: form.primary_identifier || null, category_id: form.category_id ? Number(form.category_id) : null, purchase_cost_price: form.purchase_cost_price !== '' ? Number(form.purchase_cost_price) : 0, sales_price: form.sales_price !== '' ? Number(form.sales_price) : 0 }; const result = id ? await api.updateProduct(id, payload) : await api.createProduct(payload); setMessage(result.identifier_conflicts?.length ? '已保存；编号与其他货品冲突，请复核。' : '已保存'); setTimeout(() => navigate(`/products/${result.product_id || id}`), 350) } catch (err) { setError(err) } finally { setBusy(false) } }
@@ -151,11 +144,11 @@ function ProductDetail({ id, user }) {
 }
 
 function ScanPicker({ onAdd }) {
-  const [menu, setMenu] = useState(false); const [state, setState] = useState('idle'); const [error, setError] = useState(null); const [warning, setWarning] = useState(''); const [terms, setTerms] = useState([]); const [matches, setMatches] = useState([]); const cameraRef = useRef(null); const galleryRef = useRef(null); const abortRef = useRef(null)
+  const [menu, setMenu] = useState(false); const [state, setState] = useState('idle'); const [error, setError] = useState(null); const [warning, setWarning] = useState(''); const [terms, setTerms] = useState([]); const [matches, setMatches] = useState([]); const cameraRef = useRef(null); const galleryRef = useRef(null); const abortRef = useRef(null); const searchToken = useRef(0)
   async function findMatches(searchTerms) {
-    const found = await findProductMatches(searchTerms, async value => (await api.products(value)).items || [])
-    setMatches(found)
-    setState('result')
+    const token = ++searchToken.current
+    const found = await findProductMatches(searchTerms, async value => (await api.products(value, 1, 30, { signal: abortRef.current?.signal })).items || [])
+    if (token === searchToken.current) { setMatches(found); setState('result') }
   }
   async function fileSelected(e) {
     const file = e.target.files?.[0]
@@ -164,6 +157,7 @@ function ScanPicker({ onAdd }) {
     setMenu(false); setError(null); setWarning(''); setMatches([]); setState('processing')
     try {
       const image = await prepareImage(file)
+      abortRef.current?.abort()
       abortRef.current = new AbortController()
       const result = await api.ocrExtract(image, abortRef.current.signal)
       const searchTerms = result.search_terms || []
@@ -187,18 +181,24 @@ function ScanPicker({ onAdd }) {
   return <div className="scan-wrap">
     <div className="scan-control"><Button type="button" className="scan-button" onClick={() => setMenu(!menu)} disabled={state === 'processing'} aria-expanded={menu}>⌾ 扫描</Button>{menu && <div className="scan-menu"><button type="button" onClick={() => cameraRef.current?.click()}>拍照</button><button type="button" onClick={() => galleryRef.current?.click()}>从相册选择</button></div>}<input ref={cameraRef} hidden type="file" accept="image/*" capture="environment" onChange={fileSelected} /><input ref={galleryRef} hidden type="file" accept="image/*,.heic,.heif" onChange={fileSelected} /></div>
     {state === 'processing' && <div className="scan-status">图片处理中并识别…</div>}
-    {(['result', 'partial', 'reshoot', 'error'].includes(state)) && <div className="scan-result"><div className="scan-result-head"><ScanStateHeading state={state} /><button type="button" className="close-button" onClick={() => setState('idle')} aria-label="关闭扫描结果">×</button></div><ErrorBox error={error} />{warning && <div className="alert warning">{warning}</div>}{state === 'partial' && <Button type="button" className="secondary" onClick={() => findMatches(terms)}>确认并匹配</Button>}{terms.length > 0 && <div className="term-list">{terms.map(t => <button type="button" key={`${t.kind}-${t.normalized}`} onClick={async () => { const r = await api.products(t.value); setMatches(r.items || []); setState('result') }}>{t.value}</button>)}</div>}{matches.length > 0 && <div className="match-list"><p className="muted">点击货品加入申请明细</p>{matches.map(p => <button type="button" key={p.product_id} onClick={() => { onAdd(p); setState('idle'); setMatches([]) }}><strong>{p.display_name}<FuzzyTag item={p} /></strong><span>{p.identifier || '无编号'} · {p.specification || '—'}</span></button>)}</div>}{state === 'result' && matches.length === 0 && <p className="muted">没有匹配货品，请重拍或手工输入关键词。</p>}</div>}
+    {(['result', 'partial', 'reshoot', 'error'].includes(state)) && <div className="scan-result"><div className="scan-result-head"><ScanStateHeading state={state} /><button type="button" className="close-button" onClick={() => setState('idle')} aria-label="关闭扫描结果">×</button></div><ErrorBox error={error} />{warning && <div className="alert warning">{warning}</div>}{state === 'partial' && <Button type="button" className="secondary" onClick={() => findMatches(terms)}>确认并匹配</Button>}{terms.length > 0 && <div className="term-list">{terms.map(t => <button type="button" key={`${t.kind}-${t.normalized}`} onClick={async () => { const token = ++searchToken.current; const r = await api.products(t.value, 1, 30, { signal: abortRef.current?.signal }); if (token === searchToken.current) { setMatches(r.items || []); setState('result') } }}>{t.value}</button>)}</div>}{matches.length > 0 && <div className="match-list"><p className="muted">点击货品加入申请明细</p>{matches.map(p => <button type="button" key={p.product_id} onClick={() => { onAdd(p); setState('idle'); setMatches([]) }}><strong>{p.display_name}<FuzzyTag item={p} /></strong><span>{p.identifier || '无编号'} · {p.specification || '—'}</span></button>)}</div>}{state === 'result' && matches.length === 0 && <p className="muted">没有匹配货品，请重拍或手工输入关键词。</p>}</div>}
   </div>
 }
 
 async function prepareImage(file) {
   let source = file
   if (/heic|heif/i.test(file.type) || /\.(heic|heif)$/i.test(file.name)) { const mod = await import('heic2any'); const convert = mod.default || mod; source = await convert({ blob: file, toType: 'image/jpeg', quality: 0.86 }); if (Array.isArray(source)) source = source[0] }
-  const url = URL.createObjectURL(source); try { const image = await loadImage(url); const maxEdge = 4096; const maxPixels = 16_000_000; const sourceType = source.type || file.type; const canPreserve = /^image\/(jpeg|png|webp)$/i.test(sourceType) && source.size <= 8 * 1024 * 1024 && image.width <= maxEdge && image.height <= maxEdge && image.width * image.height <= maxPixels; if (canPreserve) return { media_type: sourceType, image_base64: await blobToBase64(source) }; let scale = Math.min(1, maxEdge / image.width, Math.sqrt(maxPixels / (image.width * image.height))); const canvas = document.createElement('canvas'); canvas.width = Math.max(64, Math.round(image.width * scale)); canvas.height = Math.max(64, Math.round(image.height * scale)); const ctx = canvas.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height); ctx.drawImage(image, 0, 0, canvas.width, canvas.height); let quality = 0.86; let blob = await canvasToBlob(canvas, quality); while (blob.size > 8 * 1024 * 1024 && quality > 0.55) { quality -= 0.08; blob = await canvasToBlob(canvas, quality) } while (blob.size > 8 * 1024 * 1024 && canvas.width > 1200) { canvas.width = Math.round(canvas.width * 0.8); canvas.height = Math.round(canvas.height * 0.8); ctx.drawImage(image, 0, 0, canvas.width, canvas.height); blob = await canvasToBlob(canvas, quality) } const base64 = await blobToBase64(blob); return { media_type: 'image/jpeg', image_base64: base64 } } finally { URL.revokeObjectURL(url) }
+  const sourceType = source.type || file.type
+  // 已是 JPEG 且 ≤1.5MB → 原样透传（OCR 始终 JPEG，避免无损小图被重编码引入质量损失）。
+  if (/^image\/jpeg$/i.test(sourceType) && source.size <= OCR_IMAGE_MAX_BYTES) {
+    return { media_type: 'image/jpeg', image_base64: await blobToBase64(source) }
+  }
+  const blob = await compressImage(source, {
+    maxEdge: OCR_IMAGE_MAX_EDGE, maxPixels: OCR_IMAGE_MAX_PIXELS,
+    maxBytes: OCR_IMAGE_MAX_BYTES, mime: 'image/jpeg', name: file.name,
+  })
+  return { media_type: 'image/jpeg', image_base64: await blobToBase64(blob) }
 }
-function loadImage(url) { return new Promise((resolve, reject) => { const image = new Image(); image.onload = () => resolve(image); image.onerror = reject; image.src = url }) }
-function canvasToBlob(canvas, quality) { return new Promise((resolve, reject) => canvas.toBlob(x => x ? resolve(x) : reject(new Error('图片压缩失败')), 'image/jpeg', quality)) }
-function blobToBase64(blob) { return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).split(',')[1]); reader.onerror = reject; reader.readAsDataURL(blob) }) }
 
 function RequestList({ user }) {
   const { navigate } = useRouter(); const [rows, setRows] = useState([]); const [error, setError] = useState(null)
@@ -223,9 +223,10 @@ function RequestList({ user }) {
 
 function RequestForm({ id, initial, prefillProductId }) {
   const { navigate } = useRouter(); const [form, setForm] = useState({ request_type: 'ISSUE_OTHER', source_location_id: '', destination_location_id: '', reason: '', lines: [] }); const baseline = useRef(JSON.stringify(form)); const [products, setProducts] = useState([]); const [locations, setLocations] = useState([]); const [q, setQ] = useState(''); const [error, setError] = useState(null); const [busy, setBusy] = useState(false); const [uoms, setUoms] = useState([])
-  useDirtyLeaveGuard(JSON.stringify(form) !== baseline.current)
+  const dirty = useMemo(() => JSON.stringify(form) !== baseline.current, [form])
+  useDirtyLeaveGuard(dirty)
   useEffect(() => { api.locations().then(setLocations).catch(setError); api.uoms().then(setUoms).catch(setError); if (initial) { const next = { request_type: initial.request_type, source_location_id: initial.source_location_id || '', destination_location_id: initial.destination_location_id || '', reason: initial.reason || '', lines: initial.lines.map(x => ({ product_id: x.product_id, product_name: x.product_name, quantity: x.quantity, uom_id: x.uom_id, uom_code: x.uom_code, source_uom_raw: x.source_uom_raw || '个', notes: x.notes || '', source_location_id: x.source_location_id || '', destination_location_id: x.destination_location_id || '' })) }; baseline.current = JSON.stringify(next); setForm(next) } else if (prefillProductId) api.product(prefillProductId).then(addProduct).catch(setError) }, [initial, prefillProductId])
-  useEffect(() => { if (!q) { setProducts([]); return }; const t = setTimeout(() => api.products(q).then(x => setProducts(x.items || [])).catch(setError), 180); return () => clearTimeout(t) }, [q])
+  useEffect(() => { if (!q) { setProducts([]); return }; const controller = new AbortController(); const t = setTimeout(() => api.products({ q, page: 1, page_size: 30, signal: controller.signal }).then(x => { if (!controller.signal.aborted) setProducts(x.items || []) }).catch(err => { if (err.name !== 'AbortError') setError(err) }), 180); return () => { clearTimeout(t); controller.abort() } }, [q])
   function addProduct(p) { setForm(x => ({ ...x, lines: [...x.lines, { product_id: p.product_id, product_name: p.display_name, quantity: 1, uom_id: p.uom_id || '', uom_code: p.uom_code || '', source_uom_raw: p.source_uom_raw || '个', notes: '', source_location_id: '', destination_location_id: '' }] })); setQ(''); setProducts([]) }
   function updateLine(index, key, value) { setForm(x => ({ ...x, lines: x.lines.map((line, i) => i === index ? { ...line, [key]: value } : line) })) }
   async function save(e) { e.preventDefault(); setError(null); setBusy(true); try { const payload = { request_type: form.request_type, source_location_id: form.source_location_id || null, destination_location_id: form.destination_location_id || null, reason: form.reason || null, lines: form.lines.map(x => ({ product_id: Number(x.product_id), quantity: Number(x.quantity), uom_id: x.uom_id ? Number(x.uom_id) : null, uom_code: x.uom_code || null, source_uom_raw: x.source_uom_raw || '个', source_location_id: x.source_location_id ? Number(x.source_location_id) : null, destination_location_id: x.destination_location_id ? Number(x.destination_location_id) : null, notes: x.notes || null })) }; const result = id ? await api.updateRequest(id, { ...payload, version: initial.version }) : await api.createRequest(payload); navigate(`/requests/${result.stock_request_id}`) } catch (err) { setError(err) } finally { setBusy(false) } }
@@ -264,14 +265,15 @@ function AdminPage() {
 
 function UserForm({ id }) {
   const { navigate } = useRouter(); const [form, setForm] = useState({ display_name: '', role: 'COLLEAGUE', is_active: true, password: '' }); const baseline = useRef(JSON.stringify(form)); const [error, setError] = useState(null); const [busy, setBusy] = useState(false)
-  useDirtyLeaveGuard(JSON.stringify(form) !== baseline.current)
+  const dirty = useMemo(() => JSON.stringify(form) !== baseline.current, [form])
+  useDirtyLeaveGuard(dirty)
   useEffect(() => { if (id) api.user(id).then(x => { const next = { display_name: x.display_name, role: x.role, is_active: x.is_active, password: '' }; baseline.current = JSON.stringify(next); setForm(next) }).catch(setError) }, [id]); async function save(e) { e.preventDefault(); setBusy(true); setError(null); try { const payload = { display_name: form.display_name, role: form.role, is_active: form.is_active }; if (form.password) payload.password = form.password; const result = id ? await api.updateUser(id, payload) : await api.createUser({ username: form.username, ...payload, password: form.password }); navigate(`/admin/users/${result.user_id || id}`) } catch (err) { setError(err) } finally { setBusy(false) } }
   return <section><Back to="/admin" /><PageHeading eyebrow="系统管理" title={id ? '编辑用户' : '新增用户'} /><form className="panel form-grid" onSubmit={save}>{!id && <Field label="用户名"><input required value={form.username || ''} onChange={e => setForm({ ...form, username: e.target.value })} /></Field>}<Field label="显示名"><input required value={form.display_name} onChange={e => setForm({ ...form, display_name: e.target.value })} /></Field><Field label="角色"><select value={form.role} onChange={e => setForm({ ...form, role: e.target.value })}>{Object.entries(ROLE_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></Field><Field label={id ? '新密码（可选）' : '初始密码'}><input type="password" minLength="8" required={!id} value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} /></Field>{id && <label className="check-field"><input type="checkbox" checked={form.is_active} onChange={e => setForm({ ...form, is_active: e.target.checked })} /> 启用账号</label>}<ErrorBox error={error} /><div className="span-2 actions"><Button className="primary" disabled={busy}>保存</Button><Button type="button" className="secondary" onClick={() => navigate(id ? `/admin/users/${id}` : '/admin')}>取消</Button></div></form></section>
 }
 
 function UserDetail({ id }) { const { navigate } = useRouter(); const [data, setData] = useState(null); const [error, setError] = useState(null); useEffect(() => { api.user(id).then(setData).catch(setError) }, [id]); if (!data) return error ? <section><Back to="/admin" /><ErrorBox error={error} /></section> : <Loading />; return <section><Back to="/admin" /><PageHeading eyebrow="用户详情" title={data.display_name}><Button className="primary" onClick={() => navigate(`/admin/users/${id}/edit`)}>编辑</Button></PageHeading><div className="panel"><dl className="detail-list"><dt>用户名</dt><dd>{data.username}</dd><dt>角色</dt><dd>{data.role}</dd><dt>状态</dt><dd>{data.is_active ? '启用' : '停用'}</dd><dt>创建时间</dt><dd>{new Date(data.created_at).toLocaleString()}</dd></dl></div></section> }
 
-function LocationForm({ id }) { const { navigate } = useRouter(); const [form, setForm] = useState({ code: '', name: '', location_type: 'warehouse', is_company_inventory: true, is_active: true }); const baseline = useRef(JSON.stringify(form)); const [error, setError] = useState(null); useDirtyLeaveGuard(JSON.stringify(form) !== baseline.current); useEffect(() => { if (id) api.location(id).then(x => { const next = { code: x.code || '', name: x.name, location_type: x.location_type, is_company_inventory: x.is_company_inventory, is_active: x.is_active }; baseline.current = JSON.stringify(next); setForm(next) }).catch(setError) }, [id]); async function save(e) { e.preventDefault(); setError(null); try { const result = id ? await api.updateLocation(id, { name: form.name, location_type: form.location_type, is_company_inventory: form.is_company_inventory, is_active: form.is_active }) : await api.createLocation(form); navigate(`/admin/locations/${result.location_id || id}`) } catch (err) { setError(err) } }
+function LocationForm({ id }) { const { navigate } = useRouter(); const [form, setForm] = useState({ code: '', name: '', location_type: 'warehouse', is_company_inventory: true, is_active: true }); const baseline = useRef(JSON.stringify(form)); const [error, setError] = useState(null); const dirty = useMemo(() => JSON.stringify(form) !== baseline.current, [form]); useDirtyLeaveGuard(dirty); useEffect(() => { if (id) api.location(id).then(x => { const next = { code: x.code || '', name: x.name, location_type: x.location_type, is_company_inventory: x.is_company_inventory, is_active: x.is_active }; baseline.current = JSON.stringify(next); setForm(next) }).catch(setError) }, [id]); async function save(e) { e.preventDefault(); setError(null); try { const result = id ? await api.updateLocation(id, { name: form.name, location_type: form.location_type, is_company_inventory: form.is_company_inventory, is_active: form.is_active }) : await api.createLocation(form); navigate(`/admin/locations/${result.location_id || id}`) } catch (err) { setError(err) } }
   return <section><Back to="/admin" /><PageHeading eyebrow="系统管理" title={id ? '编辑库位' : '新增库位'} /><form className="panel form-grid" onSubmit={save}><Field label="编码"><input required disabled={Boolean(id)} value={form.code} onChange={e => setForm({ ...form, code: e.target.value })} /></Field><Field label="名称"><input required value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} /></Field><Field label="类型"><select value={form.location_type} onChange={e => setForm({ ...form, location_type: e.target.value })}><option value="warehouse">仓库</option><option value="hospital">医院</option><option value="department">科室</option><option value="customer">客户</option><option value="external">外部</option><option value="transit">在途</option><option value="other">其他</option></select></Field><label className="check-field"><input type="checkbox" checked={form.is_company_inventory} onChange={e => setForm({ ...form, is_company_inventory: e.target.checked })} /> 公司库存</label>{id && <label className="check-field"><input type="checkbox" checked={form.is_active} onChange={e => setForm({ ...form, is_active: e.target.checked })} /> 启用</label>}<ErrorBox error={error} /><div className="span-2 actions"><Button className="primary">保存</Button><Button type="button" className="secondary" onClick={() => navigate(id ? `/admin/locations/${id}` : '/admin')}>取消</Button></div></form></section> }
 
 function LocationDetail({ id }) { const { navigate } = useRouter(); const [data, setData] = useState(null); const [error, setError] = useState(null); useEffect(() => { api.location(id).then(setData).catch(setError) }, [id]); if (!data) return error ? <section><Back to="/admin" /><ErrorBox error={error} /></section> : <Loading />; return <section><Back to="/admin" /><PageHeading eyebrow="库位详情" title={data.name}><Button className="primary" onClick={() => navigate(`/admin/locations/${id}/edit`)}>编辑</Button></PageHeading><div className="panel"><dl className="detail-list"><dt>编码</dt><dd>{data.code || '—'}</dd><dt>类型</dt><dd>{data.location_type}</dd><dt>公司库存</dt><dd>{data.is_company_inventory ? '是' : '否'}</dd><dt>状态</dt><dd>{data.is_active ? '启用' : '停用'}</dd></dl></div></section> }
@@ -300,7 +302,7 @@ function ConflictDetail({ id }) {
   const [uoms, setUoms] = useState([]); const [error, setError] = useState(null); const [busy, setBusy] = useState(false)
   const [action, setAction] = useState(null); const [q, setQ] = useState(''); const [results, setResults] = useState([]); const [form, setForm] = useState({})
   useEffect(() => { api.conflict(id).then(setData).catch(setError); api.uoms().then(setUoms).catch(() => {}) }, [id])
-  useEffect(() => { if (!q) { setResults([]); return }; const t = setTimeout(() => api.products(q).then(x => setResults(x.items || [])).catch(setError), 180); return () => clearTimeout(t) }, [q])
+  useEffect(() => { if (!q) { setResults([]); return }; const controller = new AbortController(); const t = setTimeout(() => api.products({ q, page: 1, page_size: 30, signal: controller.signal }).then(x => { if (!controller.signal.aborted) setResults(x.items || []) }).catch(err => { if (err.name !== 'AbortError') setError(err) }), 180); return () => { clearTimeout(t); controller.abort() } }, [q])
   if (!data) return error ? <section><Back to="/conflicts" /><ErrorBox error={error} /></section> : <Loading />
   const observation = data.product_observation || {}
   const product = data.product || null
@@ -346,8 +348,14 @@ function CountPage() {
   const [result, setResult] = useState(null)
   const [busy, setBusy] = useState(false); const [error, setError] = useState(null)
 
-  useEffect(() => { api.locations().then(setLocations).catch(setError); api.uoms().then(setUoms).catch(setError); api.inventory().then(setInventoryRows).catch(() => {}) }, [])
-  useEffect(() => { if (!q) { setResults([]); return }; const t = setTimeout(() => api.products(q).then(x => setResults(x.items || [])).catch(setError), 180); return () => clearTimeout(t) }, [q])
+  useEffect(() => { api.locations().then(setLocations).catch(setError); api.uoms().then(setUoms).catch(setError) }, [])
+  useEffect(() => {
+    if (!product) { setInventoryRows([]); return }
+    let active = true
+    api.inventoryByProduct(product.product_id).then(rows => { if (active) setInventoryRows(rows) }).catch(() => { if (active) setInventoryRows([]) })
+    return () => { active = false }
+  }, [product?.product_id])
+  useEffect(() => { if (!q) { setResults([]); return }; const controller = new AbortController(); const t = setTimeout(() => api.products({ q, page: 1, page_size: 30, signal: controller.signal }).then(x => { if (!controller.signal.aborted) setResults(x.items || []) }).catch(err => { if (err.name !== 'AbortError') setError(err) }), 180); return () => { clearTimeout(t); controller.abort() } }, [q])
   useEffect(() => { if (!locationId && locations.length) { const main = locations.find(l => l.code === 'MAIN'); setLocationId(String(main ? main.location_id : locations[0].location_id)) } }, [locations, locationId])
   useEffect(() => { if (product && !uomId && uoms.length) setUomId(product.uom_id ? String(product.uom_id) : String(uoms[0].uom_id)) }, [product, uoms, uomId])
 

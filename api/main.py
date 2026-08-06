@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import uuid
 import unicodedata
@@ -253,25 +254,32 @@ _PRODUCT_COLUMNS = [
 ]
 
 
+def _like_escape(value: str) -> str:
+    """转义 LIKE 通配符，使 '%'/_'/'\\' 作为字面量参与子串匹配。"""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _product_where(q: str, filters: list[str]) -> tuple[str, list]:
     """货品列表/导出的共享 WHERE 构造器。
 
-    q 统一转成「NFKC + 去全部空白 + 小写」后再做子串匹配（strpos > 0），
-    对 OCR 常见的全/半角、空格、大小写差异免疫；编号/别名改查 *_normalized 列
-    （写入时已 NFKC + casefold，只需再去空格）。此层不做模糊，模糊见 fuzzy_search。
+    q 统一转成「NFKC + 去全部空白 + 小写」后再做子串匹配（LIKE '%x%'，命中
+    005 迁移的 pg_trgm GIN 索引），对 OCR 常见的全/半角、空格、大小写差异免疫；
+    编号/别名改查 *_normalized 列（写入时已 NFKC + casefold，只需再去空格）。
+    此层不做模糊，模糊见 fuzzy_search。
     """
     clauses: list[str] = []
     params: list = []
     if q.strip():
-        needle = normalize_search(q)
+        # 模式 %needle% 并入绑定参数，SQL 里不再出现字面量 %（psycopg2 会把 % 当占位符）。
+        needle = "%" + _like_escape(normalize_search(q)) + "%"
         clauses.append(
-            "(strpos(lower(regexp_replace(pg_catalog.normalize(coalesce(p.display_name,''),'NFKC'), '[[:space:]]', '', 'g')), %s) > 0"
-            " OR strpos(lower(regexp_replace(pg_catalog.normalize(coalesce(p.manufacturer,''),'NFKC'), '[[:space:]]', '', 'g')), %s) > 0"
-            " OR strpos(lower(regexp_replace(pg_catalog.normalize(coalesce(p.specification,''),'NFKC'), '[[:space:]]', '', 'g')), %s) > 0"
+            "(lower(regexp_replace(pg_catalog.normalize(coalesce(p.display_name,''),'NFKC'), '[[:space:]]', '', 'g')) LIKE %s ESCAPE '\\'"
+            " OR lower(regexp_replace(pg_catalog.normalize(coalesce(p.manufacturer,''),'NFKC'), '[[:space:]]', '', 'g')) LIKE %s ESCAPE '\\'"
+            " OR lower(regexp_replace(pg_catalog.normalize(coalesce(p.specification,''),'NFKC'), '[[:space:]]', '', 'g')) LIKE %s ESCAPE '\\'"
             " OR EXISTS (SELECT 1 FROM product_identifier pi WHERE pi.product_id=p.product_id"
-            "            AND strpos(regexp_replace(pi.value_normalized, '[[:space:]]', '', 'g'), %s) > 0)"
+            "            AND regexp_replace(pi.value_normalized, '[[:space:]]', '', 'g') LIKE %s ESCAPE '\\')"
             " OR EXISTS (SELECT 1 FROM product_name_alias pa WHERE pa.product_id=p.product_id"
-            "            AND strpos(regexp_replace(pa.alias_normalized, '[[:space:]]', '', 'g'), %s) > 0))"
+            "            AND regexp_replace(pa.alias_normalized, '[[:space:]]', '', 'g') LIKE %s ESCAPE '\\'))"
         )
         params.extend([needle] * 5)
     filter_parts, filter_params = parse_filters(filters, _PRODUCT_FILTERS)
@@ -280,31 +288,78 @@ def _product_where(q: str, filters: list[str]) -> tuple[str, list]:
     return " AND ".join(clauses), params
 
 
+def _fuzzy_pool_where(needle: str) -> tuple[str, list]:
+    """模糊候选预筛：% 相似度（GIN 可加速，阈值在连接上设为 0.2）+ LIKE 子串 OR。
+
+    覆盖丢前缀/错位等非子串情形，再交由 search.fuzzy_search 的 SequenceMatcher
+    打分，保证结果语义与原先全池扫描一致，只是候选集合被索引界住。
+    """
+    esc = "%" + _like_escape(needle) + "%"
+    where = (
+        "lower(regexp_replace(pg_catalog.normalize(coalesce(p.display_name,''),'NFKC'), '[[:space:]]', '', 'g')) %% %s"
+        " OR lower(regexp_replace(pg_catalog.normalize(coalesce(p.manufacturer,''),'NFKC'), '[[:space:]]', '', 'g')) %% %s"
+        " OR lower(regexp_replace(pg_catalog.normalize(coalesce(p.specification,''),'NFKC'), '[[:space:]]', '', 'g')) %% %s"
+        " OR lower(regexp_replace(pg_catalog.normalize(coalesce(p.display_name,''),'NFKC'), '[[:space:]]', '', 'g')) LIKE %s ESCAPE '\\'"
+        " OR EXISTS (SELECT 1 FROM product_identifier pi WHERE pi.product_id=p.product_id"
+        "            AND regexp_replace(pi.value_normalized, '[[:space:]]', '', 'g') LIKE %s ESCAPE '\\')"
+        " OR EXISTS (SELECT 1 FROM product_name_alias pa WHERE pa.product_id=p.product_id"
+        "            AND regexp_replace(pa.alias_normalized, '[[:space:]]', '', 'g') LIKE %s ESCAPE '\\')"
+    )
+    return where, [needle, needle, needle, esc, esc, esc]
+
+
+_STOCK_SUMMARY_LATERAL = """LEFT JOIN LATERAL (
+                   SELECT jsonb_agg(jsonb_build_object('uom_code', bb.uom_code, 'quantity', bb.quantity)
+                                    ORDER BY bb.uom_code) AS stock_summary
+                     FROM (SELECT b.uom_code, SUM(b.on_hand_quantity)::NUMERIC(18,3) AS quantity
+                             FROM v_inventory_balance b
+                            WHERE b.product_id = p.product_id
+                            GROUP BY b.uom_code) bb
+                ) stock ON TRUE"""
+
+
 def _products_query(where: str, order_by: str) -> str:
     return f"""SELECT p.product_id, p.display_name, p.manufacturer, p.specification, p.status_id, p.category_id,
                       p.created_at, p.updated_at,
                       u.uom_id, u.code AS uom_code, p.source_uom_raw,
-                      ident.value_raw AS identifier, ident.value_normalized AS identifier_normalized
+                      ident.value_raw AS identifier, ident.value_normalized AS identifier_normalized,
+                      COALESCE(stock.stock_summary, '[]'::jsonb) AS stock_summary
                  FROM product p
                  LEFT JOIN uom u ON u.uom_id = p.default_uom_id
                  LEFT JOIN LATERAL (SELECT value_raw, value_normalized FROM product_identifier p0
                                      WHERE p0.product_id = p.product_id AND p0.is_primary
                                      ORDER BY p0.product_identifier_id LIMIT 1) ident ON TRUE
+                 {_STOCK_SUMMARY_LATERAL}
                 WHERE {where} ORDER BY {order_by}"""
 
 
-_FUZZY_POOL_QUERY = """SELECT p.product_id, p.display_name, p.manufacturer, p.specification, p.status_id, p.category_id,
+_FUZZY_POOL_QUERY = f"""SELECT p.product_id, p.display_name, p.manufacturer, p.specification, p.status_id, p.category_id,
         p.created_at, p.updated_at,
         u.uom_id, u.code AS uom_code, p.source_uom_raw,
         ident.value_raw AS identifier, ident.value_normalized AS identifier_normalized,
-        COALESCE(alias.aliases_normalized, '') AS aliases_normalized
+        COALESCE(alias.aliases_normalized, '') AS aliases_normalized,
+        COALESCE(stock.stock_summary, '[]'::jsonb) AS stock_summary
    FROM product p
    LEFT JOIN uom u ON u.uom_id = p.default_uom_id
    LEFT JOIN LATERAL (SELECT value_raw, value_normalized FROM product_identifier p0
                        WHERE p0.product_id = p.product_id AND p0.is_primary
                        ORDER BY p0.product_identifier_id LIMIT 1) ident ON TRUE
    LEFT JOIN LATERAL (SELECT string_agg(pa.alias_normalized, '') AS aliases_normalized
-                       FROM product_name_alias pa WHERE pa.product_id = p.product_id) alias ON TRUE"""
+                       FROM product_name_alias pa WHERE pa.product_id = p.product_id) alias ON TRUE
+   {_STOCK_SUMMARY_LATERAL}
+  WHERE {{where}} ORDER BY p.product_id LIMIT 2000"""
+
+
+def _hydrate_stock_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """psycopg2 返回 jsonb 为字符串，转成前端可直接消费的数组。"""
+    for row in rows:
+        s = row.get("stock_summary")
+        if isinstance(s, str):
+            try:
+                row["stock_summary"] = json.loads(s)
+            except ValueError:
+                row["stock_summary"] = []
+    return rows
 
 
 @app.get("/api/products")
@@ -321,13 +376,41 @@ def products(q: str = "", page: int = 1, page_size: int = 30, sort: str = "", or
         total = fetch_one(conn, f"SELECT count(*) AS n FROM product p WHERE {where}", tuple(params))
     total_n = int(total["n"])
     if not rows and q.strip() and not f:
-        with connection() as conn:
-            pool = fetch_all(conn, _FUZZY_POOL_QUERY, ())
-        fuzzy_items = fuzzy_search(q, pool)
-        if fuzzy_items:
-            return {"items": fuzzy_items, "page": 1, "page_size": len(fuzzy_items),
-                    "total": len(fuzzy_items), "fuzzy": True}
+        fuzzy_query = normalize_search(q)
+        if len(fuzzy_query) >= 3:
+            with connection() as conn:
+                # pg_trgm `%` 运算的相似度阈值；仅当前事务生效。
+                fetch_one(conn, "SELECT set_config('pg_trgm.similarity_threshold', '0.2', true)")
+                pool_where, pool_params = _fuzzy_pool_where(fuzzy_query)
+                pool = fetch_all(conn, _FUZZY_POOL_QUERY.format(where=pool_where), tuple(pool_params))
+            fuzzy_items = fuzzy_search(q, pool)
+            if fuzzy_items:
+                _hydrate_stock_summary(fuzzy_items)
+                return {"items": fuzzy_items, "page": 1, "page_size": len(fuzzy_items),
+                        "total": len(fuzzy_items), "fuzzy": True}
+    _hydrate_stock_summary(rows)
     return {"items": rows, "page": page, "page_size": page_size, "total": total_n}
+
+
+@app.get("/api/products/stock")
+def products_stock(ids: str = "", user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+    """批量返回指定货品的现库存（按单位分组），供单据表单按行展示。"""
+    try:
+        id_list = parse_ids(ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    if not id_list:
+        return {"items": {}}
+    placeholders = ", ".join(["%s"] * len(id_list))
+    with connection() as conn:
+        rows = fetch_all(conn, f"""SELECT b.product_id, b.uom_code, SUM(b.on_hand_quantity)::NUMERIC(18,3) AS quantity
+                                     FROM v_inventory_balance b
+                                    WHERE b.product_id IN ({placeholders})
+                                    GROUP BY b.product_id, b.uom_code""", tuple(id_list))
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        grouped.setdefault(str(r["product_id"]), []).append({"uom_code": r["uom_code"], "quantity": r["quantity"]})
+    return {"items": grouped}
 
 
 @app.get("/api/products/export")
@@ -461,9 +544,27 @@ _INVENTORY_COLUMNS = [
 
 
 @app.get("/api/inventory/balance")
-def inventory_balance(user: dict[str, Any] = Depends(require_user)) -> list[dict[str, Any]]:
+def inventory_balance(product_id: int | None = None, location_id: int | None = None,
+                       condition_id: int | None = None, uom_id: int | None = None,
+                       user: dict[str, Any] = Depends(require_user)) -> list[dict[str, Any]]:
+    """库存余额：JOIN 出 identifier/manufacturer/specification，可选按维度过滤（供单货品查询）。"""
+    clauses: list[str] = []
+    params: list = []
+    if product_id is not None:
+        clauses.append("b.product_id=%s")
+        params.append(product_id)
+    if location_id is not None:
+        clauses.append("b.location_id=%s")
+        params.append(location_id)
+    if condition_id is not None:
+        clauses.append("b.condition_id=%s")
+        params.append(condition_id)
+    if uom_id is not None:
+        clauses.append("b.uom_id=%s")
+        params.append(uom_id)
+    where = " AND ".join(clauses) if clauses else "TRUE"
     with connection() as conn:
-        return fetch_all(conn, "SELECT * FROM v_inventory_balance ORDER BY product_name,location_name")
+        return fetch_all(conn, _INVENTORY_EXPORT_QUERY.format(where=where, order_by="b.product_name,b.location_name"), tuple(params))
 
 
 @app.get("/api/inventory/balance/export")
@@ -779,12 +880,20 @@ def reset_user_password(user_id: int, payload: UserUpdateIn, request: Request, u
 def stock_requests(user: dict[str, Any] = Depends(require_user)) -> list[dict[str, Any]]:
     with connection() as conn:
         if user["role"] in {"WAREHOUSE", "ADMIN"}:
-            rows = fetch_all(conn, "SELECT sr.*,u.username AS requester_username,u.display_name AS requester_display_name FROM stock_request sr JOIN app_user u ON u.user_id=sr.requester_user_id ORDER BY sr.created_at DESC")
+            rows = fetch_all(conn, """SELECT sr.*,u.username AS requester_username,u.display_name AS requester_display_name,
+                                             COALESCE(line.line_count, 0) AS line_count
+                                        FROM stock_request sr
+                                        JOIN app_user u ON u.user_id=sr.requester_user_id
+                                        LEFT JOIN LATERAL (SELECT count(*) AS line_count FROM stock_request_line l
+                                                            WHERE l.stock_request_id = sr.stock_request_id) line ON TRUE
+                                       ORDER BY sr.created_at DESC""")
         else:
-            rows = fetch_all(conn, "SELECT * FROM stock_request WHERE requester_user_id=%s ORDER BY created_at DESC", (user["user_id"],))
+            rows = fetch_all(conn, """SELECT sr.*, COALESCE(line.line_count, 0) AS line_count
+                                        FROM stock_request sr
+                                        LEFT JOIN LATERAL (SELECT count(*) AS line_count FROM stock_request_line l
+                                                            WHERE l.stock_request_id = sr.stock_request_id) line ON TRUE
+                                       WHERE sr.requester_user_id=%s ORDER BY sr.created_at DESC""", (user["user_id"],))
         for row in rows:
-            count = fetch_one(conn, "SELECT count(*) AS n FROM stock_request_line WHERE stock_request_id=%s", (row["stock_request_id"],))
-            row["line_count"] = int(count["n"])
             row["total_quantity"] = None
         return rows
 
@@ -818,12 +927,13 @@ def stock_requests_export(ids: str = "", fmt: str = "xlsx", user: dict[str, Any]
         params.append(user["user_id"])
     where = " AND ".join(clauses) if clauses else "TRUE"
     with connection() as conn:
-        rows = fetch_all(conn, f"""SELECT sr.*,u.username AS requester_username,u.display_name AS requester_display_name
-                                     FROM stock_request sr JOIN app_user u ON u.user_id=sr.requester_user_id
+        rows = fetch_all(conn, f"""SELECT sr.*,u.username AS requester_username,u.display_name AS requester_display_name,
+                                          COALESCE(line.line_count, 0) AS line_count
+                                     FROM stock_request sr
+                                     JOIN app_user u ON u.user_id=sr.requester_user_id
+                                     LEFT JOIN LATERAL (SELECT count(*) AS line_count FROM stock_request_line l
+                                                         WHERE l.stock_request_id = sr.stock_request_id) line ON TRUE
                                     WHERE {where} ORDER BY sr.created_at DESC""", tuple(params))
-        for row in rows:
-            count = fetch_one(conn, "SELECT count(*) AS n FROM stock_request_line WHERE stock_request_id=%s", (row["stock_request_id"],))
-            row["line_count"] = int(count["n"])
     return export_response(rows, _STOCK_REQUEST_COLUMNS, "库存申请", fmt)
 
 

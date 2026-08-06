@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { Empty } from './ui'
 
 const EMPTY_EXTRA = {} // 稳定引用，避免默认对象每次渲染都改变、触发拉取 effect 重置
@@ -54,17 +54,21 @@ export default function DataTable({
   const [serverLoading, setServerLoading] = useState(false)
   const [exportError, setExportError] = useState(null)
 
-  const searchCols = columns.filter(c => c.filterType === 'search')
+  // 稳定引用：searchCols 每次渲染新建数组会击穿 searchKeys/clientRows 的 memo。
+  const searchCols = useMemo(() => columns.filter(c => c.filterType === 'search'), [columns])
   const searchKeys = useMemo(() => {
     const keys = searchCols.flatMap(c => c.searchKeys || [c.key])
     return keys.length ? keys : columns.map(c => c.key)
   }, [columns, searchCols])
 
+  // 客户端过滤用延迟值：输入即时响应，过滤在空闲时执行，避免每次按键阻塞全量过滤。
+  const deferredQ = useDeferredValue(q)
+
   const clientRows = useMemo(() => {
     if (mode === 'server') return []
     let list = [...rows]
-    if (q) {
-      const needle = q.toLowerCase()
+    if (deferredQ) {
+      const needle = deferredQ.toLowerCase()
       list = list.filter(row => searchKeys.some(key => String(cellValue(row, { key }) ?? '').toLowerCase().includes(needle)))
     }
     for (const col of columns) {
@@ -91,7 +95,7 @@ export default function DataTable({
       })
     }
     return list
-  }, [rows, columns, filters, q, sortKey, sortDir, mode, searchKeys])
+  }, [rows, columns, filters, deferredQ, sortKey, sortDir, mode, searchKeys])
 
   const total = mode === 'server' ? (serverData?.total ?? 0) : clientRows.length
   const pageCount = Math.max(1, Math.ceil(total / pageSize))
@@ -100,9 +104,12 @@ export default function DataTable({
     ? (serverData?.items ?? [])
     : clientRows.slice(currentPage * pageSize, (currentPage + 1) * pageSize)
 
+  const requestToken = useRef(0)
   useEffect(() => {
     if (mode !== 'server' || !fetchData) return
     setServerLoading(true)
+    const controller = new AbortController()
+    const token = ++requestToken.current
     const timer = setTimeout(() => {
       fetchData({
         q,
@@ -112,15 +119,14 @@ export default function DataTable({
         page: currentPage + 1,
         page_size: pageSize,
         ...pageExtra,
-      }).then(res => {
-        setServerData(res)
-        setServerLoading(false)
+      }, controller.signal).then(res => {
+        if (token === requestToken.current) { setServerData(res); setServerLoading(false) }
       }).catch(err => {
-        setServerLoading(false)
-        if (onError) onError(err)
+        if (err.name === 'AbortError') return
+        if (token === requestToken.current) { setServerLoading(false); if (onError) onError(err) }
       })
     }, 200)
-    return () => clearTimeout(timer)
+    return () => { clearTimeout(timer); controller.abort() }
   }, [mode, fetchData, q, filters, sortKey, sortDir, currentPage, pageSize, columns, pageExtra, onError])
 
   function setFilter(key, value) {

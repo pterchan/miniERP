@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import gzip
 import http.server
+import io
 import os
 import urllib.error
 import urllib.request
@@ -16,6 +18,11 @@ HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",
 }
+_GZIP_TYPES = {
+    "text/css", "text/javascript", "application/javascript", "application/json",
+    "image/svg+xml", "text/html", "text/plain",
+}
+_ASSET_CACHE = "public, max-age=31536000, immutable"
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -54,12 +61,55 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
 
         self.send_response(status)
+        ct = response_headers.get("Content-Type", "")
+        want_gzip = (
+            self.command != "HEAD"
+            and "gzip" in (self.headers.get("Accept-Encoding") or "")
+            and not response_headers.get("Content-Encoding")
+            and (ct.startswith("text/") or "json" in ct)
+            and len(payload) >= 1024
+        )
+        if want_gzip:
+            payload = gzip.compress(payload, 9)
         for key, value in response_headers.items():
-            if key.lower() not in HOP_BY_HOP:
-                self.send_header(key, value)
+            if key.lower() in HOP_BY_HOP:
+                continue
+            if key.lower() == "content-length" and want_gzip:
+                continue  # 压缩后由下方重发
+            self.send_header(key, value)
+        if want_gzip:
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(payload)
+
+    def send_head(self):
+        """静态响应：/assets/* 哈希资源打 immutable 长缓存；文本资源按
+        Accept-Encoding gzip（HEAD 同样带正确头部，body 不写出）。"""
+        clean = self.path.split("?", 1)[0]
+        path = self.translate_path(clean)
+        if not os.path.isfile(path):
+            return super().send_head()
+        ctype = self.guess_type(path)
+        with open(path, "rb") as fh:
+            data = fh.read()
+        cache = _ASSET_CACHE if clean.startswith("/assets/") else "no-cache"
+        accept_gzip = "gzip" in (self.headers.get("Accept-Encoding") or "")
+        compressible = accept_gzip and ctype in _GZIP_TYPES and len(data) >= 1024
+        if compressible:
+            data = gzip.compress(data, 9)
+        self.send_response(200)
+        self.send_header("Content-type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", cache)
+        if compressible:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
+        self.end_headers()
+        return io.BytesIO(data)
 
     def _serve_static(self) -> None:
         candidate = DIST / self.path.split("?", 1)[0].lstrip("/")

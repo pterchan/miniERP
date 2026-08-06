@@ -93,13 +93,26 @@ describe('DataTable client mode', () => {
 
 describe('DataTable server mode', () => {
   it('fetches pages through fetchData and renders them', async () => {
-    const fetchData = vi.fn(async params => ({ items: rows, total: rows.length }))
+    const fetchData = vi.fn(async (params, signal) => ({ items: rows, total: rows.length }))
     render(<DataTable mode="server" columns={columns} rows={[]} fetchData={fetchData} rowKey={r => String(r.id)} />)
     // 等待组件内部 200ms 防抖拉取
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 300)) })
     expect(fetchData).toHaveBeenCalled()
-    expect(fetchData).toHaveBeenCalledWith(expect.objectContaining({ page: 1 }))
+    expect(fetchData).toHaveBeenCalledWith(expect.objectContaining({ page: 1 }), expect.any(AbortSignal))
     expect(screen.getByText('苹果')).toBeInTheDocument()
     expect(screen.getByText('共 3 条')).toBeInTheDocument()
+  })
+
+  it('aborts an in-flight request when inputs change', async () => {
+    const fetchData = vi.fn(() => new Promise(resolve => resolve({ items: rows, total: rows.length })))
+    const { rerender } = render(<DataTable mode="server" columns={columns} rows={[]} fetchData={fetchData} rowKey={r => String(r.id)} />)
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 300)) })
+    expect(fetchData).toHaveBeenCalledTimes(1)
+    const firstSignal = fetchData.mock.calls[0][1]
+    // pageExtra 引用变化 → 触发新一轮拉取，旧请求应被 abort
+    rerender(<DataTable mode="server" columns={columns} rows={[]} fetchData={fetchData} rowKey={r => String(r.id)} pageExtra={{ v: 1 }} />)
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 300)) })
+    expect(fetchData).toHaveBeenCalledTimes(2)
+    expect(firstSignal.aborted).toBe(true)
   })
 })
