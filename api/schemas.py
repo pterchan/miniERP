@@ -69,6 +69,7 @@ class ProductIn(BaseModel):
     category_id: int | None = None
     purchase_cost_price: Decimal | None = None
     sales_price: Decimal | None = None
+    serialized: bool | None = None
 
     @field_validator("purchase_cost_price", "sales_price")
     @classmethod
@@ -94,6 +95,7 @@ class ProductUpdateIn(BaseModel):
     category_id: int | None = None
     purchase_cost_price: Decimal | None = None
     sales_price: Decimal | None = None
+    serialized: bool | None = None
 
     @field_validator("purchase_cost_price", "sales_price")
     @classmethod
@@ -203,6 +205,7 @@ class InventoryAdjustIn(BaseModel):
     change_default_unit: bool = False
     source_uom_raw: str | None = None
     notes: str | None = None
+    serial_numbers: list[str] | None = None  # 可选 SN 清单；启用 SN 的货品填了则按件校验
 
     @field_validator("counted_quantity")
     @classmethod
@@ -245,6 +248,7 @@ class DocLineIn(BaseModel):
     price: Decimal | None = Field(default=None, ge=0)
     counted_quantity: Decimal | None = None  # STOCK_COUNT only
     notes: str | None = None
+    serial_numbers: list[str] | None = None  # 可选 SN 登记；过账时按 (product, SN) 写资产事件
 
     _q = field_validator("quantity")(_qty_scale)
     _cq = field_validator("counted_quantity")(_qty_scale)
@@ -280,6 +284,12 @@ class DocUpdateIn(BaseModel):
 
 class DocSubmitIn(BaseModel):
     override_review: bool = False
+
+
+class SerialParseIn(BaseModel):
+    """解析一段 SN 文本并标注登记状态，供出库前预检。纯读取不写库。"""
+    product_id: int
+    text: str = Field(min_length=1, max_length=20000)
 
 
 class AttachmentIn(BaseModel):

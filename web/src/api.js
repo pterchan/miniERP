@@ -194,6 +194,21 @@ const api = {
   audit: () => api.request('/audit?limit=100'),
   auditEvent: (id) => api.request(`/audit/${id}`),
   ocrExtract: (payload, signal) => api.request('/ocr/extract', { method: 'POST', body: JSON.stringify(payload), signal, timeoutMs: 60000 }),
+  // 序列台账（SN 追踪）
+  serialLedger: (params = {}) => {
+    const { signal, ...query } = params
+    const sp = new URLSearchParams()
+    if (query.q) sp.set('q', query.q)
+    if (query.page) sp.set('page', query.page)
+    if (query.page_size) sp.set('page_size', query.page_size)
+    if (query.sort) sp.set('sort', query.sort)
+    if (query.order) sp.set('order', query.order)
+    ;(query.f || []).forEach(x => sp.append('f', x))
+    return api.request(`/serial-ledger?${sp.toString()}`, { signal })
+  },
+  serialAsset: (id) => api.request(`/serial-ledger/${id}`),
+  parseSerials: (payload) => api.request('/serial-ledger/parse', { method: 'POST', body: JSON.stringify(payload) }),
+  importSerialsFile: (file, options = {}) => { const form = new FormData(); form.append('file', file); return api.requestUpload('/serial-ledger/import-file', form, options) },
 }
 
 export default api

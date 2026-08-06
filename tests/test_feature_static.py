@@ -9,6 +9,7 @@ SCHEMAS = (ROOT / "api/schemas.py").read_text(encoding="utf-8")
 FRONTEND = (ROOT / "web/src/main.jsx").read_text(encoding="utf-8")
 SCAN_UTILS = (ROOT / "web/src/scan-utils.js").read_text(encoding="utf-8")
 STYLES = (ROOT / "web/src/styles.css").read_text(encoding="utf-8")
+IMAGE_UTILS = (ROOT / "web/src/image-utils.js").read_text(encoding="utf-8")
 LIST_UTILS = (ROOT / "web/src/list-utils.js").read_text(encoding="utf-8")
 UI = (ROOT / "web/src/ui.jsx").read_text(encoding="utf-8")
 
@@ -37,8 +38,10 @@ class FeatureContractTests(unittest.TestCase):
         self.assertIn("不能停用或降级最后一个有效管理员", API)
 
     def test_mobile_ocr_and_history_router_contract(self):
-        for token in ("capture=\"environment\"", "heic2any", "reshoot_required", "MAX_OCR_CANDIDATES", "100dvh"):
-            source = STYLES if token == "100dvh" else SCAN_UTILS if token == "MAX_OCR_CANDIDATES" else FRONTEND
+        # prepareImage（含 heic2any 转码）已下沉到 image-utils.js，由 ScanPicker/SerialEntry 共用。
+        for token, source in (("capture=\"environment\"", FRONTEND), ("heic2any", IMAGE_UTILS),
+                              ("reshoot_required", FRONTEND), ("MAX_OCR_CANDIDATES", SCAN_UTILS),
+                              ("100dvh", STYLES)):
             self.assertIn(token, source)
         self.assertIn("pushState", FRONTEND)
         self.assertIn("bottom-nav", STYLES)
@@ -75,6 +78,13 @@ class FeatureContractTests(unittest.TestCase):
         self.assertIn("FuzzyTag", FRONTEND)
         self.assertIn("fuzzy-badge", FRONTEND)
         self.assertIn("fuzzy-badge", STYLES)
+
+    def test_serial_tracking_contract(self):
+        self.assertIn("serialized", SCHEMAS)
+        self.assertIn("serial_numbers", SCHEMAS)
+        self.assertIn("serial_tracking.router", API)
+        self.assertIn("first === 'serials'", FRONTEND)
+        self.assertIn("序列台账", FRONTEND)
 
 
 if __name__ == "__main__":

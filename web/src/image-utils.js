@@ -128,3 +128,27 @@ export async function prepareUploadFile(file, { maxBytes = UPLOAD_IMAGE_MAX_BYTE
     return source instanceof File ? source : blobToFile(source, name, type)
   }
 }
+
+/**
+ * 把图片预处理为 OCR 抽取入参（{ media_type, image_base64 }，始终 JPEG）：
+ * HEIC/HEIF 先转 JPEG；已是 JPEG 且 ≤OCR_IMAGE_MAX_BYTES 原样透传，否则重编码。
+ */
+export async function prepareImage(file) {
+  let source = file
+  if (/heic|heif/i.test(file.type) || /\.(heic|heif)$/i.test(file.name)) {
+    const mod = await import('heic2any')
+    const convert = mod.default || mod
+    source = await convert({ blob: file, toType: 'image/jpeg', quality: 0.86 })
+    if (Array.isArray(source)) source = source[0]
+  }
+  const sourceType = source.type || file.type
+  // 已是 JPEG 且 ≤1.5MB → 原样透传（OCR 始终 JPEG，避免无损小图被重编码引入质量损失）。
+  if (/^image\/jpeg$/i.test(sourceType) && source.size <= OCR_IMAGE_MAX_BYTES) {
+    return { media_type: 'image/jpeg', image_base64: await blobToBase64(source) }
+  }
+  const blob = await compressImage(source, {
+    maxEdge: OCR_IMAGE_MAX_EDGE, maxPixels: OCR_IMAGE_MAX_PIXELS,
+    maxBytes: OCR_IMAGE_MAX_BYTES, mime: 'image/jpeg', name: file.name,
+  })
+  return { media_type: 'image/jpeg', image_base64: await blobToBase64(blob) }
+}

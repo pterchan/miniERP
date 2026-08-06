@@ -4,12 +4,22 @@ router can reuse them without a circular import (main <-> documents)."""
 from __future__ import annotations
 
 import ipaddress
+import unicodedata
 import uuid
 from typing import Any
 
 from fastapi import HTTPException, Request
 
 from .db import fetch_one
+
+
+def _normalize_query(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value or "").split())
+
+
+def _normalize_identifier(value: str) -> str:
+    """Normalize identifiers for matching while retaining value_raw verbatim."""
+    return _normalize_query(value).casefold()
 
 
 def _request_meta(request: Request) -> dict[str, str | None]:

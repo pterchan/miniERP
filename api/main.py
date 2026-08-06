@@ -3,21 +3,21 @@ from __future__ import annotations
 import json
 import os
 import uuid
-import unicodedata
 from decimal import Decimal
 from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import documents, images, master, reports
+from . import documents, images, master, reports, serial_tracking
 from .db import audit, connection, ensure_bootstrap_users, fetch_all, fetch_one
 from .export import export_response, export_rows_by_ids
 from .list_params import clamp_page, clamp_page_size, parse_composite_ids, parse_filters, parse_ids, parse_sort
-from .helpers import _condition_id, _line_uom_id, _movement_id, _request_meta, _status_id
+from .helpers import _condition_id, _line_uom_id, _movement_id, _normalize_identifier, _normalize_query, _request_meta, _status_id
 from .ocr_client import OCRProxyError, forward_ocr
 from .permissions import CSRF_COOKIE, SESSION_COOKIE, _csrf, require_roles, require_user
 from .search import fuzzy_search, normalize_search
+from .serial_tracking import apply_adjustment_serials
 from .schemas import (
     ChangePasswordIn,
     ConflictCreateProductIn,
@@ -56,6 +56,7 @@ app.include_router(documents.attachments_router)
 app.include_router(images.router)
 app.include_router(master.router)
 app.include_router(reports.router)
+app.include_router(serial_tracking.router)
 
 
 @app.on_event("startup")
@@ -74,15 +75,6 @@ def startup() -> None:
         ensure_bucket()
     except Exception:
         pass
-
-
-def _normalize_query(value: str) -> str:
-    return " ".join(unicodedata.normalize("NFKC", value or "").split())
-
-
-def _normalize_identifier(value: str) -> str:
-    """Normalize identifiers for matching while retaining value_raw verbatim."""
-    return _normalize_query(value).casefold()
 
 
 def _valid_location_type(value: str | None) -> bool:
@@ -320,7 +312,7 @@ _STOCK_SUMMARY_LATERAL = """LEFT JOIN LATERAL (
 
 def _products_query(where: str, order_by: str) -> str:
     return f"""SELECT p.product_id, p.display_name, p.manufacturer, p.specification, p.status_id, p.category_id,
-                      p.created_at, p.updated_at,
+                      p.serialized, p.created_at, p.updated_at,
                       u.uom_id, u.code AS uom_code, p.source_uom_raw,
                       ident.value_raw AS identifier, ident.value_normalized AS identifier_normalized,
                       COALESCE(stock.stock_summary, '[]'::jsonb) AS stock_summary
@@ -334,7 +326,7 @@ def _products_query(where: str, order_by: str) -> str:
 
 
 _FUZZY_POOL_QUERY = f"""SELECT p.product_id, p.display_name, p.manufacturer, p.specification, p.status_id, p.category_id,
-        p.created_at, p.updated_at,
+        p.serialized, p.created_at, p.updated_at,
         u.uom_id, u.code AS uom_code, p.source_uom_raw,
         ident.value_raw AS identifier, ident.value_normalized AS identifier_normalized,
         COALESCE(alias.aliases_normalized, '') AS aliases_normalized,
@@ -468,8 +460,8 @@ def create_product(payload: ProductCreateIn, request: Request, user: dict[str, A
         after = {**payload.model_dump(), "default_uom_id": uom_id}
         audit(conn, user, "CREATE", "product", after=after, request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
         with conn.cursor() as cur:
-            cur.execute("""INSERT INTO product(display_name,manufacturer,specification,default_uom_id,source_uom_raw,category_id,purchase_cost_price,sales_price)
-                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING product_id""", (payload.display_name.strip(), payload.manufacturer, payload.specification, uom_id, payload.source_uom_raw, payload.category_id, payload.purchase_cost_price or 0, payload.sales_price or 0))
+            cur.execute("""INSERT INTO product(display_name,manufacturer,specification,default_uom_id,source_uom_raw,category_id,purchase_cost_price,sales_price,serialized)
+                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING product_id""", (payload.display_name.strip(), payload.manufacturer, payload.specification, uom_id, payload.source_uom_raw, payload.category_id, payload.purchase_cost_price or 0, payload.sales_price or 0, payload.serialized or False))
             product_id = cur.fetchone()[0]
         _set_primary_identifier(conn, product_id, payload.primary_identifier, user, meta)
     return product_detail(product_id, user)
@@ -491,8 +483,8 @@ def update_product(product_id: int, payload: ProductUpdateIn, request: Request, 
         audit(conn, user, "EDIT", "product", target_id=product_id, before=before, after=after, field_diff={k: [before.get(k), v] for k, v in after.items() if before.get(k) != v}, request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
         with conn.cursor() as cur:
             cur.execute("""UPDATE product SET display_name=%s,manufacturer=%s,specification=%s,default_uom_id=%s,source_uom_raw=%s,
-                                 category_id=%s,purchase_cost_price=%s,sales_price=%s,updated_at=now()
-                         WHERE product_id=%s""", (after.get("display_name", before["display_name"]).strip(), after.get("manufacturer"), after.get("specification"), uom_id, after.get("source_uom_raw"), after.get("category_id"), after.get("purchase_cost_price", 0), after.get("sales_price", 0), product_id))
+                                 category_id=%s,purchase_cost_price=%s,sales_price=%s,serialized=%s,updated_at=now()
+                         WHERE product_id=%s""", (after.get("display_name", before["display_name"]).strip(), after.get("manufacturer"), after.get("specification"), uom_id, after.get("source_uom_raw"), after.get("category_id"), after.get("purchase_cost_price", 0), after.get("sales_price", 0), after.get("serialized", before.get("serialized", False)), product_id))
         conflicts = _set_primary_identifier(conn, product_id, values["primary_identifier"] if values["primary_identifier"] is not None else "", user, meta) if "primary_identifier" in values else []
     result = product_detail(product_id, user)
     result["identifier_conflicts"] = conflicts
@@ -654,12 +646,17 @@ def adjust_inventory(payload: InventoryAdjustIn, request: Request, user: dict[st
                   after={"product_id": payload.product_id, "location_id": payload.location_id,
                          "uom_id": payload.uom_id, "quantity": str(quantity), "delta": str(delta)},
                   request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
+            movement_id = None
             with conn.cursor() as cur:
                 cur.execute("""INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,source_uom_raw,notes,posted_at,posted_by)
-                             VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s)""",
+                             VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s) RETURNING inventory_movement_id""",
                             (_movement_id(conn, "ADJUSTMENT"), _status_id(conn, "posted"), payload.product_id,
                              quantity, payload.uom_id, condition_id, source_location, destination_location,
                              payload.source_uom_raw, payload.notes, user["username"]))
+                movement_id = cur.fetchone()[0]
+            if payload.serial_numbers:
+                apply_adjustment_serials(conn, user, req_meta, movement_id, product,
+                                         payload.serial_numbers, delta, condition_id, payload.location_id)
         if payload.change_default_unit and product["default_uom_id"] != payload.uom_id:
             audit(conn, user, "EDIT", "product", target_id=payload.product_id,
                   before={"default_uom_id": product["default_uom_id"]}, after={"default_uom_id": payload.uom_id},

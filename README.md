@@ -38,6 +38,8 @@ psql "$DATABASE_URL" -f db/migrations/001_inventory.sql
 psql "$DATABASE_URL" -f db/migrations/002_erp_oa.sql
 psql "$DATABASE_URL" -f db/migrations/003_full_erp.sql
 psql "$DATABASE_URL" -f db/migrations/004_product_images.sql
+psql "$DATABASE_URL" -f db/migrations/005_search_indexes.sql
+psql "$DATABASE_URL" -f db/migrations/006_serial_tracking.sql
 ```
 
 迁移只创建结构和参考数据，不会凭空生成可信期初余额。审核产品解析、库位、切账日期和期初量后，才可把候选流水转为 `status_id = posted`。余额视图只计算已过账流水；`inventory_snapshot` 仅用于与工作簿现有库存对账。
@@ -59,7 +61,7 @@ python3 -m py_compile scripts/import_inventory.py
 docker compose up --build
 ```
 
-浏览器打开 `http://localhost`。数据库容器首次初始化会按文件名顺序执行四份迁移；后续使用同一持久化卷不会重复执行。**已有卷（本地或 UAT）升级时需手动补跑一次 `004`**：`docker compose exec postgres psql -U inventory -d inventory -f /docker-entrypoint-initdb.d/004_product_images.sql`。`minio` 服务随栈启动，货品附图经 API 上传/展示，MinIO 仅内网。需要导入工作簿时，在能访问数据库的环境执行：
+浏览器打开 `http://localhost`。数据库容器首次初始化会按文件名顺序执行全部迁移（001–006）；后续使用同一持久化卷不会重复执行。**已有卷（本地或 UAT）升级时需手动补跑一次新增迁移（005/006，幂等可重复）**：`docker compose exec postgres psql -U inventory -d inventory -f /docker-entrypoint-initdb.d/005_search_indexes.sql`、`docker compose exec postgres psql -U inventory -d inventory -f /docker-entrypoint-initdb.d/006_serial_tracking.sql`（004 同理）。`minio` 服务随栈启动，货品附图经 API 上传/展示，MinIO 仅内网。需要导入工作簿时，在能访问数据库的环境执行：
 
 ```sh
 IMPORT_WORKBOOK_PASSWORD='在此输入密码' \

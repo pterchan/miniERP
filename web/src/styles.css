@@ -1009,6 +1009,56 @@ textarea:focus {
   margin-top: 9px;
 }
 
+/* 序列号登记（SN 追踪） */
+.line-serial {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  background: rgba(127, 255, 212, 0.03);
+}
+.line-serial-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+  margin-bottom: 6px;
+}
+.line-serial-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.line-serial textarea {
+  width: 100%;
+  min-height: 66px;
+  padding: 8px 10px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg, #0a1412);
+  color: inherit;
+  font: inherit;
+}
+.warning-text {
+  color: var(--warn, #e5b84c);
+  font-weight: 600;
+}
+.serial-tag {
+  display: inline-block;
+  margin-left: 10px;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: #7fffd4;
+  border: 1px solid rgba(127, 255, 212, 0.35);
+  border-radius: 999px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 40vw;
+}
+
 .detail-lines {
   display: grid;
   margin-top: 10px;

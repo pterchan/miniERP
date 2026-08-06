@@ -21,6 +21,7 @@ from .list_params import clamp_page, clamp_page_size, parse_filters, parse_ids, 
 from .helpers import _condition_id, _line_uom_id, _movement_id, _request_meta, _status_id
 from .permissions import DOC_TYPE_META, GROUP_META, _can_post, _csrf, require_user
 from .schemas import DocCreateIn, DocSubmitIn, DocUpdateIn
+from .serial_tracking import apply_line_serials, reverse_movement_serials
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 attachments_router = APIRouter(prefix="/api/attachments", tags=["documents"])
@@ -107,6 +108,7 @@ def _doc_detail(conn: Any, document_id: int, user: dict[str, Any]) -> dict[str, 
         row["party_name"] = None
     row["doc_type_label"] = meta["label"]
     lines = fetch_all(conn, """SELECT l.*, p.display_name AS product_name, p.manufacturer, p.specification,
+                                      p.serialized AS serialized,
                                       u.code AS uom_code, u.display_name AS uom_display_name,
                                       sl.name AS source_location_name, dl.name AS destination_location_name,
                                       ic.code AS condition_code
@@ -165,17 +167,18 @@ def _resolve_locations(conn: Any, doc: dict[str, Any], line: dict[str, Any], met
 
 def _insert_movement(conn: Any, user: dict[str, Any], req_meta: dict[str, Any], movement_code: str,
                      doc: dict[str, Any], line: dict[str, Any], quantity: Decimal,
-                     source: int | None, dest: int | None, reversal_of: int | None = None, document_id: int | None = None) -> None:
+                     source: int | None, dest: int | None, reversal_of: int | None = None, document_id: int | None = None) -> int:
     audit(conn, user, "POST", "inventory_movement",
           after={"document_id": doc["document_id"], "product_id": line["product_id"], "quantity": str(quantity),
                  "movement_type": movement_code, "reversal_of": reversal_of},
           request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
     with conn.cursor() as cur:
         cur.execute("""INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,document_id,reversal_of_movement_id,notes,posted_at,posted_by)
-                     VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s)""",
+                     VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s) RETURNING inventory_movement_id""",
                     (_movement_id(conn, movement_code), _status_id(conn, "posted"), line["product_id"], quantity,
                      line["uom_id"], _condition_id(conn, line["condition_id"]), source, dest,
                      document_id or doc["document_id"], reversal_of, doc["notes"], user["username"]))
+        return int(cur.fetchone()[0])
 
 
 def _insert_arap(conn: Any, user: dict[str, Any], req_meta: dict[str, Any], party_type: str, party_id: int,
@@ -214,11 +217,14 @@ def _post_line(conn: Any, user: dict[str, Any], req_meta: dict[str, Any], doc: d
         movement_code = MOVEMENT_FOR_DOC[doc["doc_type"]]
         qty = line["quantity"]
         if stock == "IN":
-            _insert_movement(conn, user, req_meta, movement_code, doc, line, qty, None, dest)
+            movement_id = _insert_movement(conn, user, req_meta, movement_code, doc, line, qty, None, dest)
         elif stock == "OUT":
-            _insert_movement(conn, user, req_meta, movement_code, doc, line, qty, source, None)
+            movement_id = _insert_movement(conn, user, req_meta, movement_code, doc, line, qty, source, None)
         else:
-            _insert_movement(conn, user, req_meta, movement_code, doc, line, qty, source, dest)
+            movement_id = _insert_movement(conn, user, req_meta, movement_code, doc, line, qty, source, dest)
+        # 序列号登记（软约束：serial_numbers 为空则跳过；填了则硬校验一致性）
+        apply_line_serials(conn, user, req_meta, movement_id, line["product_id"], line.get("serial_numbers"),
+                           stock, source, dest, qty, line.get("condition_id"))
     ap = meta["ap_effect"]
     if ap in ("PAYABLE_UP", "PAYABLE_DOWN"):
         amount = (line["quantity"] * line["price"]).quantize(Decimal("0.01"))
@@ -290,10 +296,10 @@ def _reverse_document(conn: Any, document_id: int, user: dict[str, Any], req_met
             audit(conn, user, "CREATE", "business_document_line",
                   after={"document_id": rev_doc_id, "line_no": ol["line_no"], "product_id": ol["product_id"]},
                   request_id=req_meta["request_id"])
-            cur.execute("""INSERT INTO business_document_line(document_id,line_no,product_id,uom_id,quantity,price,amount,condition_id,source_location_id,destination_location_id,counted_quantity,book_quantity,notes)
-                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            cur.execute("""INSERT INTO business_document_line(document_id,line_no,product_id,uom_id,quantity,price,amount,condition_id,source_location_id,destination_location_id,counted_quantity,book_quantity,serial_numbers,notes)
+                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                         (rev_doc_id, ol["line_no"], ol["product_id"], ol["uom_id"], ol["quantity"], ol["price"], ol["amount"],
-                         ol["condition_id"], ol["source_location_id"], ol["destination_location_id"], ol["counted_quantity"], ol["book_quantity"], ol["notes"]))
+                         ol["condition_id"], ol["source_location_id"], ol["destination_location_id"], ol["counted_quantity"], ol["book_quantity"], ol["serial_numbers"], ol["notes"]))
     # 反向库存流水：换反向类型 + 对调库位
     mtype_codes = {int(r["movement_type_id"]): r["code"] for r in fetch_all(conn, "SELECT movement_type_id, code FROM movement_type")}
     movements = fetch_all(conn, """SELECT * FROM inventory_movement
@@ -301,9 +307,11 @@ def _reverse_document(conn: Any, document_id: int, user: dict[str, Any], req_met
     for m in movements:
         code = mtype_codes.get(int(m["movement_type_id"]), "ADJUSTMENT")
         inv = INVERSE_MOVEMENT.get(code, code)
-        _insert_movement(conn, user, req_meta, inv, doc, m, m["quantity"],
-                         m["destination_location_id"], m["source_location_id"],
-                         reversal_of=int(m["inventory_movement_id"]), document_id=rev_doc_id)
+        rev_movement_id = _insert_movement(conn, user, req_meta, inv, doc, m, m["quantity"],
+                                           m["destination_location_id"], m["source_location_id"],
+                                           reversal_of=int(m["inventory_movement_id"]), document_id=rev_doc_id)
+        # 红冲原流水关联的资产：写反向事件（IN↔issued、OUT↔received、TRANSFER 反向）
+        reverse_movement_serials(conn, user, req_meta, m, rev_movement_id)
     # 反向应收应付：direction 翻转
     entries = fetch_all(conn, "SELECT * FROM ar_ap_entry WHERE document_id=%s", (document_id,))
     for e in entries:
@@ -480,11 +488,11 @@ def create_document(payload: DocCreateIn, request: Request, user: dict[str, Any]
                 audit(conn, user, "CREATE", "business_document_line",
                       after={"document_id": document_id, "line_no": i, "product_id": line.product_id},
                       request_id=req_meta["request_id"])
-                cur.execute("""INSERT INTO business_document_line(document_id,line_no,product_id,uom_id,quantity,price,amount,condition_id,source_location_id,destination_location_id,counted_quantity,notes)
-                             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                cur.execute("""INSERT INTO business_document_line(document_id,line_no,product_id,uom_id,quantity,price,amount,condition_id,source_location_id,destination_location_id,counted_quantity,serial_numbers,notes)
+                             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                             (document_id, i, line.product_id, uom_id, line.quantity, price, amount,
                              _condition_id(conn, line.condition_id), line.source_location_id, line.destination_location_id,
-                             line.counted_quantity, line.notes))
+                             line.counted_quantity, line.serial_numbers or None, line.notes))
         return _doc_detail(conn, document_id, user)
 
 
@@ -542,11 +550,11 @@ def update_document(document_id: int, payload: DocUpdateIn, request: Request, us
                     audit(conn, user, "CREATE", "business_document_line",
                           after={"document_id": document_id, "line_no": i, "product_id": line.product_id},
                           request_id=req_meta["request_id"])
-                    cur.execute("""INSERT INTO business_document_line(document_id,line_no,product_id,uom_id,quantity,price,amount,condition_id,source_location_id,destination_location_id,counted_quantity,notes)
-                                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    cur.execute("""INSERT INTO business_document_line(document_id,line_no,product_id,uom_id,quantity,price,amount,condition_id,source_location_id,destination_location_id,counted_quantity,serial_numbers,notes)
+                                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                                 (document_id, i, line.product_id, uom_id, line.quantity, price, amount,
                                  _condition_id(conn, line.condition_id), line.source_location_id, line.destination_location_id,
-                                 line.counted_quantity, line.notes))
+                                 line.counted_quantity, line.serial_numbers or None, line.notes))
         return _doc_detail(conn, document_id, user)
 
 

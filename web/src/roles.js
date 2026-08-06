@@ -10,6 +10,7 @@ export const ROLE_LABELS = {
 export const PAGE_ACCESS = {
   products: ['ADMIN', 'WAREHOUSE', 'SALES', 'FINANCE', 'COLLEAGUE'],
   count: ['WAREHOUSE', 'ADMIN'],
+  serials: ['WAREHOUSE', 'ADMIN'],
   purchase: ['WAREHOUSE', 'ADMIN', 'FINANCE'],
   sales: ['SALES', 'ADMIN', 'WAREHOUSE'],
   inventoryDocs: ['WAREHOUSE', 'ADMIN'],
