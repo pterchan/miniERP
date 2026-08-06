@@ -16,6 +16,7 @@ from .list_params import clamp_page, clamp_page_size, parse_composite_ids, parse
 from .helpers import _condition_id, _line_uom_id, _movement_id, _request_meta, _status_id
 from .ocr_client import OCRProxyError, forward_ocr
 from .permissions import CSRF_COOKIE, SESSION_COOKIE, _csrf, require_roles, require_user
+from .search import fuzzy_search, normalize_search
 from .schemas import (
     ChangePasswordIn,
     ConflictCreateProductIn,
@@ -253,15 +254,24 @@ _PRODUCT_COLUMNS = [
 
 
 def _product_where(q: str, filters: list[str]) -> tuple[str, list]:
-    """货品列表/导出的共享 WHERE 构造器。q 走名称/编号/别名 EXISTS 子查询避免行膨胀。"""
+    """货品列表/导出的共享 WHERE 构造器。
+
+    q 统一转成「NFKC + 去全部空白 + 小写」后再做子串匹配（strpos > 0），
+    对 OCR 常见的全/半角、空格、大小写差异免疫；编号/别名改查 *_normalized 列
+    （写入时已 NFKC + casefold，只需再去空格）。此层不做模糊，模糊见 fuzzy_search。
+    """
     clauses: list[str] = []
     params: list = []
     if q.strip():
-        needle = "%" + q.strip() + "%"
+        needle = normalize_search(q)
         clauses.append(
-            "(p.display_name ILIKE %s OR coalesce(p.manufacturer,'') ILIKE %s OR coalesce(p.specification,'') ILIKE %s"
-            " OR EXISTS (SELECT 1 FROM product_identifier pi WHERE pi.product_id=p.product_id AND pi.value_raw ILIKE %s)"
-            " OR EXISTS (SELECT 1 FROM product_name_alias pa WHERE pa.product_id=p.product_id AND pa.alias_raw ILIKE %s))"
+            "(strpos(lower(regexp_replace(pg_catalog.normalize(coalesce(p.display_name,''),'NFKC'), '[[:space:]]', '', 'g')), %s) > 0"
+            " OR strpos(lower(regexp_replace(pg_catalog.normalize(coalesce(p.manufacturer,''),'NFKC'), '[[:space:]]', '', 'g')), %s) > 0"
+            " OR strpos(lower(regexp_replace(pg_catalog.normalize(coalesce(p.specification,''),'NFKC'), '[[:space:]]', '', 'g')), %s) > 0"
+            " OR EXISTS (SELECT 1 FROM product_identifier pi WHERE pi.product_id=p.product_id"
+            "            AND strpos(regexp_replace(pi.value_normalized, '[[:space:]]', '', 'g'), %s) > 0)"
+            " OR EXISTS (SELECT 1 FROM product_name_alias pa WHERE pa.product_id=p.product_id"
+            "            AND strpos(regexp_replace(pa.alias_normalized, '[[:space:]]', '', 'g'), %s) > 0))"
         )
         params.extend([needle] * 5)
     filter_parts, filter_params = parse_filters(filters, _PRODUCT_FILTERS)
@@ -283,6 +293,20 @@ def _products_query(where: str, order_by: str) -> str:
                 WHERE {where} ORDER BY {order_by}"""
 
 
+_FUZZY_POOL_QUERY = """SELECT p.product_id, p.display_name, p.manufacturer, p.specification, p.status_id, p.category_id,
+        p.created_at, p.updated_at,
+        u.uom_id, u.code AS uom_code, p.source_uom_raw,
+        ident.value_raw AS identifier, ident.value_normalized AS identifier_normalized,
+        COALESCE(alias.aliases_normalized, '') AS aliases_normalized
+   FROM product p
+   LEFT JOIN uom u ON u.uom_id = p.default_uom_id
+   LEFT JOIN LATERAL (SELECT value_raw, value_normalized FROM product_identifier p0
+                       WHERE p0.product_id = p.product_id AND p0.is_primary
+                       ORDER BY p0.product_identifier_id LIMIT 1) ident ON TRUE
+   LEFT JOIN LATERAL (SELECT string_agg(pa.alias_normalized, '') AS aliases_normalized
+                       FROM product_name_alias pa WHERE pa.product_id = p.product_id) alias ON TRUE"""
+
+
 @app.get("/api/products")
 def products(q: str = "", page: int = 1, page_size: int = 30, sort: str = "", order: str = "asc",
              f: list[str] = Query(default=[]), user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
@@ -295,7 +319,15 @@ def products(q: str = "", page: int = 1, page_size: int = 30, sort: str = "", or
     with connection() as conn:
         rows = fetch_all(conn, _products_query(where, order_by) + " LIMIT %s OFFSET %s", tuple(params + [page_size, (page - 1) * page_size]))
         total = fetch_one(conn, f"SELECT count(*) AS n FROM product p WHERE {where}", tuple(params))
-    return {"items": rows, "page": page, "page_size": page_size, "total": int(total["n"])}
+    total_n = int(total["n"])
+    if not rows and q.strip() and not f:
+        with connection() as conn:
+            pool = fetch_all(conn, _FUZZY_POOL_QUERY, ())
+        fuzzy_items = fuzzy_search(q, pool)
+        if fuzzy_items:
+            return {"items": fuzzy_items, "page": 1, "page_size": len(fuzzy_items),
+                    "total": len(fuzzy_items), "fuzzy": True}
+    return {"items": rows, "page": page, "page_size": page_size, "total": total_n}
 
 
 @app.get("/api/products/export")

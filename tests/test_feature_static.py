@@ -4,6 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 API = (ROOT / "api/main.py").read_text(encoding="utf-8")
+SEARCH = (ROOT / "api/search.py").read_text(encoding="utf-8")
 SCHEMAS = (ROOT / "api/schemas.py").read_text(encoding="utf-8")
 FRONTEND = (ROOT / "web/src/main.jsx").read_text(encoding="utf-8")
 SCAN_UTILS = (ROOT / "web/src/scan-utils.js").read_text(encoding="utf-8")
@@ -63,6 +64,17 @@ class FeatureContractTests(unittest.TestCase):
         self.assertIn("关联现有货品", FRONTEND)
         self.assertIn("按观测新建货品", FRONTEND)
         self.assertIn("编辑货品主数据", FRONTEND)
+
+    def test_fuzzy_search_contract(self):
+        for token in ("normalize_search", "fuzzy_search", "SequenceMatcher"):
+            self.assertIn(token, SEARCH)
+        self.assertIn("strpos(", API)
+        self.assertIn("_FUZZY_POOL_QUERY", API)
+        self.assertIn("match_type", SEARCH)
+        self.assertIn("match_score", SEARCH)
+        self.assertIn("FuzzyTag", FRONTEND)
+        self.assertIn("fuzzy-badge", FRONTEND)
+        self.assertIn("fuzzy-badge", STYLES)
 
 
 if __name__ == "__main__":
