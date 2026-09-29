@@ -145,6 +145,7 @@ function DocumentForm({ docType, id, user }) {
       }
       const result = isEdit ? await api.updateDocument(id, { ...payload, version: form.version }) : await api.createDocument({ doc_type: docType, ...payload })
       if (submit) await api.submitDocument(result.document_id)
+      baseline.current = JSON.stringify(form)  // 已保存，导航不再触发脏确认
       navigate(`/${cfg.group}/${docType.toLowerCase()}/${result.document_id}`)
     } catch (err) { setError(err) } finally { setBusy(false) }
   }

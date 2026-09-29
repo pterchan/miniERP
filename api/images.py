@@ -174,11 +174,13 @@ def reorder_product_images(
     with connection() as conn:
         if not fetch_one(conn, "SELECT product_id FROM product WHERE product_id=%s", (product_id,)):
             raise HTTPException(status_code=404, detail="货品不存在")
-        rows = fetch_all(conn, "SELECT image_id FROM product_image WHERE product_id=%s ORDER BY sort_order, image_id FOR UPDATE", (product_id,))
+        rows = fetch_all(conn, "SELECT image_id, sort_order FROM product_image WHERE product_id=%s ORDER BY sort_order, image_id FOR UPDATE", (product_id,))
         existing = [int(r["image_id"]) for r in rows]
         if sorted(payload.order) != sorted(existing):
             raise HTTPException(status_code=422, detail="排序清单必须恰好包含该货品的全部图片")
-        audit(conn, user, "EDIT", "product_image", after={"product_id": product_id, "order": payload.order},
+        audit(conn, user, "EDIT", "product_image",
+              before={"order": [[int(r["image_id"]), int(r["sort_order"])] for r in rows]},
+              after={"product_id": product_id, "order": payload.order},
               request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
         with conn.cursor() as cur:
             for sort_order, image_id in enumerate(payload.order, start=1):

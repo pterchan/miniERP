@@ -28,7 +28,7 @@ cd web && npm ci && npm run dev              # :5173，/api 代理到 localhost:
 
 | 套件 | 命令 | 说明 |
 |---|---|---|
-| 后端 | `python3 -m unittest discover -s tests -v` | 静态契约 + 纯函数测试；不依赖外部数据库 |
+| 后端 | `python3 -m unittest discover -s tests -v` | 静态契约 + 纯函数 + 行为测试（配合一次性测试库） |
 | 后端（行为测试） | 见下方「行为测试与一次性测试库」 | TestClient + 真实 PostgreSQL，复现后端缺陷 |
 | 前端 | `cd web && npm test` | Vitest + Testing Library，测试与源码同目录 |
 | OCR 服务 | `python3 -m unittest discover -s ocr_service/tests -t .` | 契约/字段/几何/图像 IO/模型金标 |
@@ -68,7 +68,7 @@ docker compose -f docker-compose.test.yml down -v        # 测试完销毁
 | `test_ocr_static.py` | `ocr_service/contracts.py`、pipeline、`api/main.py`、compose | OCR 传输契约与代理封装 |
 | `test_serial_static.py` | 006 迁移、serial_tracking、documents、前端 serial 页 | SN 台账跨层契约 |
 
-行为型测试（真正跑逻辑）只有成本低、无需数据库的几类：`test_search.py`（模糊搜索）、`test_list_params.py`、`test_inventory_import.py`（xlsx 解析）、`test_ocr_proxy.py`（假 httpx 客户端）。
+行为型测试（真正跑逻辑）分两类：无需数据库的 `test_search.py`、`test_list_params.py`、`test_inventory_import.py`、`test_ocr_proxy.py`、`test_export_behavior.py` 等；以及需要一次性测试库的 `test_serial_flow`、`test_posting_guards`、`test_core_invariants`、`test_migrations_idempotent` 等行为套件（见上方「行为测试与一次性测试库」）。
 
 **规则：改了被断言的文件，必须同步更新对应静态测试**——反过来，这些测试失败时先怀疑是跨层约定被破坏，而不是测试过时。
 
@@ -78,7 +78,7 @@ docker compose -f docker-compose.test.yml down -v        # 测试完销毁
 
 **新增前端页面**：`web/src/` 新建组件 → `main.jsx` 的 `routeView()` 加路径映射 → `roles.js` 的 `PAGE_ACCESS` 声明可见角色（记得这只是 UX，后端权限才是强制层）→ 补 vitest。
 
-**新增迁移**：见[数据模型·迁移约定](data-model.md#迁移约定新增迁移时)（幂等、补跑路径、同步 `test_schema_static.py`/相关静态测试）；新增幂等迁移需同步加入 `deploy/deploy_remote.sh` 的补跑清单，并把重放验证交给 `tests/test_migrations_idempotent.py`。
+**新增迁移**：见[数据模型·迁移约定](data-model.md#迁移约定新增迁移时)（幂等、补跑路径、同步 `test_schema_static.py`/相关静态测试）；`deploy/deploy_remote.sh` 按文件名序 glob 重放全部迁移（新增迁移无需改清单），重放正确性由 `tests/test_migrations_idempotent.py` 持续保证。
 
 **新增单据类型**：`api/permissions.py` 的 `DOC_TYPE_META`（前缀/角色/库存与往来效果）→ 003 迁移的字典/约束 → `test_erp_static.py` → 前端 `documents.jsx`。
 

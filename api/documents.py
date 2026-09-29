@@ -441,7 +441,10 @@ def _resolve_doc_types(doc_type: str, group: str, user: dict[str, Any]) -> list[
 def _doc_where(allowed: list[str], filters: list[str]) -> tuple[str, list]:
     clauses = ["d.doc_type = ANY(%s)"]
     params: list = [list(allowed)]
-    filter_parts, filter_params = parse_filters(filters, _DOC_FILTERS)
+    try:
+        filter_parts, filter_params = parse_filters(filters, _DOC_FILTERS)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
     clauses.extend(filter_parts)
     params.extend(filter_params)
     return " AND ".join(clauses), params
@@ -719,6 +722,11 @@ def add_attachment(document_id: int, file: UploadFile = File(...), request: Requ
             data, content_type, _ = re
     with connection() as conn:
         doc = _require_doc_view(conn, document_id, user)
+        # 上传比查看更敏感：限定创建人或 ADMIN（与编辑权限一致），并锁行防并发绕过数量上限
+        if user["role"] != "ADMIN" and int(doc["created_by"]) != int(user["user_id"]):
+            raise HTTPException(status_code=403, detail="仅创建人或管理员可添加附件")
+        with conn.cursor() as cur:
+            cur.execute("SELECT document_id FROM business_document WHERE document_id=%s FOR UPDATE", (document_id,))
         if doc["status"] not in ("DRAFT", "SUBMITTED"):
             raise HTTPException(status_code=409, detail="仅草稿或已提交单据可添加附件")
         count = fetch_one(conn, "SELECT count(*) AS n FROM document_attachment WHERE document_id=%s", (document_id,))

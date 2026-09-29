@@ -99,12 +99,12 @@ def parse_date(value: Any) -> tuple[str | None, str | None]:
     if value is None or normalize_text(value) is None:
         return None, "missing_date"
     parsed: date | None = None
+    text = normalize_text(value) or "" if not isinstance(value, (datetime, date)) else ""
     if isinstance(value, datetime):
         parsed = value.date()
     elif isinstance(value, date):
         parsed = value
     else:
-        text = normalize_text(value) or ""
         for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y年%m月%d日", "%m/%d/%Y", "%d/%m/%Y"):
             try:
                 parsed = datetime.strptime(text, fmt).date()

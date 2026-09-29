@@ -163,7 +163,7 @@ WEB_DOCKERFILE=Dockerfile.remote
 EOF_ENV
 fi
 chmod 600 .env
-if grep -Eq '^(POSTGRES_PASSWORD|SESSION_SECRET|BOOTSTRAP_ADMIN_PASSWORD|BOOTSTRAP_REQUESTER_PASSWORD|OCR_INTERNAL_TOKEN|MINIO_ACCESS_KEY|MINIO_SECRET_KEY)=(change-me|replace-with)' .env; then
+if grep -Eq '^(POSTGRES_PASSWORD|SESSION_SECRET|BOOTSTRAP_ADMIN_PASSWORD|BOOTSTRAP_REQUESTER_PASSWORD|OCR_INTERNAL_TOKEN|MINIO_ACCESS_KEY|MINIO_SECRET_KEY)=.*change-me' .env; then
   echo "dotenv 含占位密码或令牌，请先配置随机值" >&2
   exit 1
 fi
@@ -182,7 +182,7 @@ for attempt in $(seq 1 30); do
   sleep 2
 done
 
-# 全部迁移按文件名序幂等重放（001-008 均已幂等；重放正确性由
+# 全部迁移按文件名序幂等重放（全部迁移均已幂等；重放正确性由
 # tests/test_migrations_idempotent.py 持续保证），新增迁移无需改本清单。
 DB_USER="$(grep -E '^POSTGRES_USER=' .env | cut -d= -f2-)"
 DB_NAME="$(grep -E '^POSTGRES_DB=' .env | cut -d= -f2-)"

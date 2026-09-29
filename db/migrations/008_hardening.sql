@@ -74,6 +74,8 @@ ALTER TABLE business_document ADD COLUMN IF NOT EXISTS posted_by_user_id BIGINT 
 ALTER TABLE business_document ADD COLUMN IF NOT EXISTS reversed_by_user_id BIGINT REFERENCES app_user(user_id);
 
 -- 5) 单位小数位与数量列精度一致 ----------------------------------------------
+-- 先收敛存量（001 旧约束允许 0-6），否则 ADD CONSTRAINT 全表校验失败会回滚整个迁移
+UPDATE uom SET decimal_scale = 3 WHERE decimal_scale > 3;
 ALTER TABLE uom DROP CONSTRAINT IF EXISTS uom_decimal_scale_check;
 ALTER TABLE uom ADD CONSTRAINT uom_decimal_scale_check CHECK (decimal_scale BETWEEN 0 AND 3);
 

@@ -27,7 +27,7 @@ function handleUnauthorized(path) {
 
 // pydantic 422 校验消息的中文化映射（常见类型错误兜底为中文提示）
 function localizeValidationDetail(messages) {
-  return messages.map(msg => String(msg)
+  return messages.map(msg => String(msg ?? '')
     .replace(/Input should be a valid integer/, '请输入整数')
     .replace(/Input should be a valid number/, '请输入数字')
     .replace(/Input should be a valid date/, '日期格式应为 YYYY-MM-DD')

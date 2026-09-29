@@ -24,10 +24,9 @@ export function Link({ to, children, className = '', onClick, ...props }) {
     if (onClick) onClick(e)
     // 修饰键/非左键点击（新标签、下载等）交给浏览器原生行为
     if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return
-    // 脏表单守卫在共享层拦截（AppRouter.navigate 亦同），未确认不离开当前页
-    if (!confirmDirtyLeave()) return
+    // 先取消默认导航再判定守卫：拒绝时停留在当前页（navigate 本身不再二次确认）
     e.preventDefault()
-    navigate(to)
+    if (confirmDirtyLeave()) navigate(to)
   }} {...props}>{children}</a>
 }
 
@@ -94,13 +93,16 @@ export function useFetchOne(fetch, deps) {
 }
 
 /** 表单防重复提交：连点只发一次；返回 [busy, wrap]，wrap 包裹 async 保存函数。 */
+/** 表单防重复提交：连点只发一次；返回 [busy, wrap]，wrap 包裹 async 保存函数。 */
 export function useBusy() {
   const [busy, setBusy] = useState(false)
+  const busyRef = useRef(false)  // ref 判重：同一渲染帧内二次调用也能挡住
   const wrap = useCallback(async fn => {
-    if (busy) return undefined
+    if (busyRef.current) return undefined
+    busyRef.current = true
     setBusy(true)
-    try { return await fn() } finally { setBusy(false) }
-  }, [busy])  // eslint-disable-line react-hooks/exhaustive-deps
+    try { return await fn() } finally { busyRef.current = false; setBusy(false) }
+  }, [])
   return [busy, wrap]
 }
 

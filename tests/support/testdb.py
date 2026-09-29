@@ -42,7 +42,10 @@ def probe() -> bool:
         conn = psycopg2.connect(test_database_url(), connect_timeout=2)
         conn.close()
         return True
-    except Exception:
+    except Exception as exc:
+        if os.environ.get("TEST_DATABASE_URL"):
+            # 显式指定却不可达：这是配置/启动故障，静默跳过会掩盖问题
+            raise RuntimeError(f"TEST_DATABASE_URL 已设置但不可达：{exc}") from exc
         return False
 
 

@@ -46,6 +46,7 @@ export default function ProductGallery({ productId, canEdit }) {
   }
 
   async function move(image, dir) {
+    if (busy) return
     const sorted = [...images].sort((a, b) => a.sort_order - b.sort_order || a.image_id - b.image_id)
     const index = sorted.findIndex(x => x.image_id === image.image_id)
     const target = index + dir

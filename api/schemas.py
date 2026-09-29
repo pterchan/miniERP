@@ -152,7 +152,7 @@ class StockRequestPatch(BaseModel):
     source_location_id: int | None = None
     destination_location_id: int | None = None
     reason: str | None = None
-    lines: list[RequestLineIn] | None = None
+    lines: list[RequestLineIn] | None = Field(default=None, max_length=2000)
 
 
 class RejectIn(BaseModel):
@@ -286,7 +286,7 @@ class DocUpdateIn(BaseModel):
     destination_location_id: int | None = None
     deposit_amount: Decimal | None = None
     notes: str | None = None
-    lines: list[DocLineIn] | None = None
+    lines: list[DocLineIn] | None = Field(default=None, max_length=2000)
 
     _d = field_validator("deposit_amount")(_money_scale)
 
@@ -311,7 +311,7 @@ class SerialParseIn(BaseModel):
 
 class ImageReorderIn(BaseModel):
     """按目标顺序提交货品全部图片的 image_id 列表，服务端一次性原子重排。"""
-    order: list[int] = Field(min_length=1, max_length=500)
+    order: list[int] = Field(min_length=1, max_length=5000)  # 与「全量一致」校验语义对齐（单请求上传上限 10 张，累计可超 500）
 
 
 class AttachmentIn(BaseModel):

@@ -6,7 +6,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from decimal import Decimal
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import documents, images, master, reports, serial_tracking
 from .db import PoolExhaustedError, audit, connection, ensure_bootstrap_users, fetch_all, fetch_one
-from .export import export_response, export_rows_by_ids
+from .export import MAX_EXPORT_ROWS, export_response, export_rows_by_ids
 from .list_params import clamp_page, clamp_page_size, like_escape, parse_composite_ids, parse_filters, parse_ids, parse_sort
 from .helpers import _condition_id, _line_uom_id, _movement_id, _normalize_identifier, _normalize_query, _request_meta, _status_id, lock_products
 from .ocr_client import OCRProxyError, forward_ocr
@@ -269,6 +269,7 @@ def login(payload: LoginIn, response: Response, request: Request) -> dict[str, A
         audit(conn, {"user_id": user_row["user_id"], "role": user_row["role"]}, "LOGIN", "app_session", request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
         with conn.cursor() as cur:
             cur.execute("DELETE FROM app_session WHERE expires_at<now()")
+            cur.execute("DELETE FROM login_attempt WHERE attempted_at < now() - interval '30 days'")
             cur.execute("INSERT INTO app_session(user_id,token_hash,csrf_token_hash,expires_at) VALUES (%s,%s,%s,%s)", (user_row["user_id"], token_hash(session_token), token_hash(csrf_token), utc_after()))
     secure = os.environ.get("ERP_SECURE_COOKIES", "0") == "1"
     response.set_cookie(SESSION_COOKIE, session_token, path=COOKIE_PATH, httponly=True, secure=secure, samesite="lax", max_age=12 * 3600)
@@ -354,6 +355,10 @@ def _product_where(q: str, filters: list[str]) -> tuple[str, list]:
     """
     clauses: list[str] = []
     params: list = []
+    try:
+        filter_parts, filter_params = parse_filters(filters, _PRODUCT_FILTERS)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
     if q.strip():
         # 模式 %needle% 并入绑定参数，SQL 里不再出现字面量 %（psycopg2 会把 % 当占位符）。
         needle = "%" + _like_escape(normalize_search(q)) + "%"
@@ -367,7 +372,6 @@ def _product_where(q: str, filters: list[str]) -> tuple[str, list]:
             "            AND regexp_replace(pa.alias_normalized, '[[:space:]]', '', 'g') LIKE %s ESCAPE '\\'))"
         )
         params.extend([needle] * 5)
-    filter_parts, filter_params = parse_filters(filters, _PRODUCT_FILTERS)
     clauses.extend(filter_parts)
     params.extend(filter_params)
     return " AND ".join(clauses), params
@@ -514,7 +518,7 @@ def products_export(q: str = "", sort: str = "", order: str = "asc", f: list[str
     order_by = parse_sort(sort, order, _PRODUCT_SORT, "display_name")
     where = where or "TRUE"
     with connection() as conn:
-        rows = fetch_all(conn, _products_query(where, order_by), tuple(params))
+        rows = fetch_all(conn, _products_query(where, order_by) + " LIMIT %s", tuple(params + [MAX_EXPORT_ROWS + 1]))
     return export_response(rows, _PRODUCT_COLUMNS, "货品", fmt)
 
 
@@ -659,11 +663,14 @@ def inventory_balance_export(q: str = "", sort: str = "", order: str = "asc", f:
     clauses: list[str] = []
     params: list = []
     if q.strip():
-        needle = "%" + q.strip() + "%"
+        needle = "%" + _like_escape(q.strip()) + "%"
         clauses.append("(b.product_name ILIKE %s OR coalesce(p.manufacturer,'') ILIKE %s OR coalesce(p.specification,'') ILIKE %s"
                        " OR coalesce(ident.value_raw,'') ILIKE %s OR b.location_name ILIKE %s OR b.condition_code ILIKE %s OR b.uom_code ILIKE %s)")
         params.extend([needle] * 7)
-    filter_parts, filter_params = parse_filters(f, _INVENTORY_FILTERS)
+    try:
+        filter_parts, filter_params = parse_filters(f, _INVENTORY_FILTERS)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
     clauses.extend(filter_parts)
     params.extend(filter_params)
     if ids:
@@ -678,7 +685,7 @@ def inventory_balance_export(q: str = "", sort: str = "", order: str = "asc", f:
     where = " AND ".join(clauses) if clauses else "TRUE"
     order_by = parse_sort(sort, order, _INVENTORY_SORT, "product_name")
     with connection() as conn:
-        rows = fetch_all(conn, _INVENTORY_EXPORT_QUERY.format(where=where, order_by=order_by), tuple(params))
+        rows = fetch_all(conn, _INVENTORY_EXPORT_QUERY.format(where=where, order_by=order_by) + " LIMIT %s", tuple(params + [MAX_EXPORT_ROWS + 1]))
     return export_response(rows, _INVENTORY_COLUMNS, "库存余额", fmt)
 
 
@@ -1031,7 +1038,7 @@ def stock_requests_export(ids: str = "", fmt: str = "xlsx", user: dict[str, Any]
                                      JOIN app_user u ON u.user_id=sr.requester_user_id
                                      LEFT JOIN LATERAL (SELECT count(*) AS line_count FROM stock_request_line l
                                                          WHERE l.stock_request_id = sr.stock_request_id) line ON TRUE
-                                    WHERE {where} ORDER BY sr.created_at DESC""", tuple(params))
+                                    WHERE {where} ORDER BY sr.created_at DESC LIMIT %s""", tuple(params + [MAX_EXPORT_ROWS + 1]))
     return export_response(rows, _STOCK_REQUEST_COLUMNS, "库存申请", fmt)
 
 
@@ -1198,8 +1205,8 @@ def _transition(request_id: int, target: str, request: Request, user: dict[str, 
                     if movement_type in {"RECEIPT", "RETURN"} and destination_location is None:
                         raise HTTPException(status_code=422, detail="入库/退回放行前必须存在目的库位")
                     audit(conn, user, "RELEASE", "inventory_movement", after={"stock_request_id": request_id, "product_id": line["product_id"], "quantity": str(line["quantity"])}, request_id=meta["request_id"])
-                    cur.execute("""INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,source_uom_raw,notes,posted_at,posted_by)
-                                 VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s)""", (_movement_id(conn, row["request_type"]), posted, line["product_id"], line["quantity"], line["uom_id"], line["condition_id"], source_location, destination_location, line["source_uom_raw"], f"OA申请 {row['request_no']}", user["username"]))
+                    cur.execute("""INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,source_uom_raw,notes,posted_at,posted_by,posted_by_user_id)
+                                 VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s,%s)""", (_movement_id(conn, row["request_type"]), posted, line["product_id"], line["quantity"], line["uom_id"], line["condition_id"], source_location, destination_location, line["source_uom_raw"], f"OA申请 {row['request_no']}", user["username"], user["user_id"]))
     return stock_request_detail(request_id, user)
 
 
@@ -1325,7 +1332,7 @@ def conflicts_export(ids: str = "", fmt: str = "xlsx", user: dict[str, Any] = De
         where += f" AND rc.resolution_case_id IN ({', '.join(['%s'] * len(id_list))})"
         params.extend(id_list)
     with connection() as conn:
-        rows = fetch_all(conn, _CONFLICT_QUERY.format(where=where), tuple(params))
+        rows = fetch_all(conn, _CONFLICT_QUERY.format(where=where) + " LIMIT %s", tuple(params + [MAX_EXPORT_ROWS + 1]))
     return export_response(rows, _CONFLICT_COLUMNS, "冲突", fmt)
 
 
@@ -1497,12 +1504,11 @@ def audit_export(ids: str = "", fmt: str = "xlsx", user: dict[str, Any] = Depend
             rows = fetch_all(conn, """SELECT audit_event_id,actor_user_id,actor_role,action,target_table,target_id,request_id,before_data,after_data,field_diff,created_at
                                          FROM audit_event
                                         WHERE audit_event_id = ANY(%s)
-                                         -- unnest 保序：与用户看到的勾选顺序一致
-                                         ORDER BY array_position(unnest(%s), audit_event_id)""", (id_list, id_list))
+                                         ORDER BY array_position(%s::bigint[], audit_event_id)""", (id_list, id_list))
     else:
         with connection() as conn:
             rows = fetch_all(conn, """SELECT audit_event_id,actor_user_id,actor_role,action,target_table,target_id,request_id,before_data,after_data,field_diff,created_at
-                                        FROM audit_event ORDER BY created_at DESC LIMIT 500""")
+                                        FROM audit_event ORDER BY created_at DESC LIMIT %s""", (MAX_EXPORT_ROWS + 1,))
     return export_response(rows, _AUDIT_COLUMNS, "审计日志", fmt)
 
 

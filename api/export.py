@@ -118,7 +118,8 @@ def export_rows_by_ids(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
         where = f"{id_column} = ANY(%s)"
-        order_by = f"array_position(unnest(%s), {id_column})"  # 保序：与用户看到的勾选顺序一致
+        # 保序：与用户看到的勾选顺序一致（psycopg2 把 list 适配为数组；::bigint[] 对齐列类型）
+        order_by = f"array_position(%s::bigint[], {id_column})"
         params: list[Any] = [id_list, id_list]
     else:
         where, params, order_by = "TRUE", [], default_order

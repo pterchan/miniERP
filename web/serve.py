@@ -115,19 +115,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def send_head(self):
         """静态响应：/assets/* 哈希资源打 immutable 长缓存；文本资源按
-        Accept-Encoding gzip（HEAD 同样带正确头部，body 不写出）。"""
+        Accept-Encoding gzip（HEAD 同样带正确头部，body 不写出）。
+        非文件路径（含目录）不落入父类的目录列表，按 SPA 回退 index.html；
+        index.html 自身缺失则交父类返回 404，避免无限递归。"""
         clean = self.path.split("?", 1)[0]
         path = self.translate_path(clean)
         if not os.path.isfile(path):
-            # 非文件路径（含目录）不落入父类的目录列表，按 SPA 回退；
-            # index.html 自身缺失则交父类返回 404，避免无限递归
             if clean == "/index.html":
                 return super().send_head()
-            return self._fallback_index()
-
-    def _fallback_index(self):
-        self.path = "/index.html"
-        return self.send_head()
+            self.path = "/index.html"
+            return self.send_head()
         ctype = self.guess_type(path)
         with open(path, "rb") as fh:
             data = fh.read()

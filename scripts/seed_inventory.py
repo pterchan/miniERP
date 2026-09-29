@@ -62,13 +62,21 @@ def resolve_uom(conn: Any, raw: str | None) -> int | None:
     return int(row["uom_id"]) if row else None
 
 
-def already_posted_content(conn: Any, row_hash: str) -> bool:
-    """同一内容（row_hash）的历史流水是否已过账——跨 import_batch 识别重复导入。"""
-    return bool(one(conn, """SELECT im.inventory_movement_id FROM inventory_movement im
-                              JOIN source_record sr ON sr.source_record_id=im.source_record_id
-                             WHERE sr.row_hash=%s
-                               AND im.status_id=(SELECT status_id FROM record_status WHERE code='posted')
-                             LIMIT 1""", (row_hash,)))
+def already_posted_content(conn: Any, row_hash: str, exclude_record_id: int | None = None) -> bool:
+    """同一内容（row_hash）的历史流水是否已过账——跨 import_batch 识别重复导入。
+
+    排除当前 source_record：同一文件（同 SHA）幂等重跑命中的是自己上一遍的
+    流水，不是「换文件重导」，不应误开复核案例。
+    """
+    sql = """SELECT im.inventory_movement_id FROM inventory_movement im
+              JOIN source_record sr ON sr.source_record_id=im.source_record_id
+             WHERE sr.row_hash=%s
+               AND im.status_id=(SELECT status_id FROM record_status WHERE code='posted')"""
+    args: list[Any] = [row_hash]
+    if exclude_record_id is not None:
+        sql += " AND sr.source_record_id <> %s"
+        args.append(exclude_record_id)
+    return bool(one(conn, sql + " LIMIT 1", tuple(args)))
 
 
 def set_context(conn: Any, action: str) -> None:
@@ -237,7 +245,7 @@ def load(args: argparse.Namespace) -> dict[str, Any]:
                     cur.execute("INSERT INTO inventory_snapshot(snapshot_date,product_id,location_id,condition_id,uom_id,reported_quantity,source_record_id) VALUES (NULL,%s,%s,%s,%s,%s,%s) ON CONFLICT (source_record_id,source_line_no) DO NOTHING", (product_ids[key], main_location, new_condition, product_uoms[product_ids[key]], existing_qty, sid))
                     counts["snapshots"] += cur.rowcount
                 if opening is not None and opening > 0 and opening_issue is None and getattr(args, "post_opening", False):
-                    if already_posted_content(conn, product_row_hash):
+                    if already_posted_content(conn, product_row_hash, exclude_record_id=sid):
                         if record_quality_issue(conn, sid, "duplicate_movement", status_review, "期初数量与历史批次已过账内容重复，需人工确认", None, source_batch=batch_id):
                             counts["quality_issues"] += 1
                         counts["duplicates"] += 1
@@ -286,7 +294,7 @@ def load(args: argparse.Namespace) -> dict[str, Any]:
                     if open_case(conn, sid, "other", status_review, "历史流水未满足自动过账条件，需仓管复核", batch_id):
                         counts["movement_conflicts"] += 1
                     continue
-                if already_posted_content(conn, movement_row_hash):
+                if already_posted_content(conn, movement_row_hash, exclude_record_id=sid):
                     # 同一逻辑数据换了文件（不同 SHA/批次）再来：不重复过账，转人工复核
                     if record_quality_issue(conn, sid, "duplicate_movement", status_review, "与历史批次已过账内容重复，需人工确认是否为重复导出", None, movement_candidate_id=movement_candidate_id, source_batch=batch_id):
                         counts["quality_issues"] += 1

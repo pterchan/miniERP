@@ -36,8 +36,11 @@ class BackendContractTests(unittest.TestCase):
         # tests/test_core_invariants.AuditTriggerTests.test_passwords_never_appear_in_audit_payloads
         self.assertIn("hash_password", API)
         self.assertNotIn("print(payload.password", API)
-        login_body = API.split("def login")[1].split("\n\n\n")[0] if "def login" in API else ""
-        self.assertNotIn("logger", login_body)
+        if "def login" in API:
+            body = API.split("def login", 1)[1]
+            body = body.split("\ndef ", 1)[0]
+            self.assertTrue(body.strip(), "应能提取 login 函数体")
+            self.assertNotIn("logger", body)
 
     def test_admin_management_and_seed_observation_contract(self):
         for route in ("/api/uoms", "/api/locations", "/api/admin/users"):

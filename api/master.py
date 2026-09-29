@@ -56,12 +56,14 @@ def update_category(category_id: int, payload: CategoryIn, request: Request, use
         if payload.parent_category_id and payload.parent_category_id == category_id:
             raise HTTPException(status_code=422, detail="父分类不能是自己")
         if payload.parent_category_id:
-            # 沿祖先链上溯，防止把祖先挂到子孙形成环（环上节点会从树中「消失」）
+            # 沿祖先链上溯（加行锁防并发成环），防止把祖先挂到子孙形成环
+            if not fetch_one(conn, "SELECT category_id FROM product_category WHERE category_id=%s", (payload.parent_category_id,)):
+                raise HTTPException(status_code=422, detail="父分类不存在")
             ancestor = payload.parent_category_id
             for _ in range(100):
                 if ancestor == category_id:
                     raise HTTPException(status_code=422, detail="父分类不能是自己的子孙分类")
-                row = fetch_one(conn, "SELECT parent_category_id FROM product_category WHERE category_id=%s", (ancestor,))
+                row = fetch_one(conn, "SELECT parent_category_id FROM product_category WHERE category_id=%s FOR UPDATE", (ancestor,))
                 ancestor = row["parent_category_id"] if row else None
                 if ancestor is None:
                     break

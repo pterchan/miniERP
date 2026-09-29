@@ -5,8 +5,6 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 
-from fastapi import HTTPException
-
 from tests.support.testdb import DbTestCase
 
 
@@ -29,12 +27,11 @@ class RequestMetaTests(unittest.TestCase):
 
 class ConditionIdTests(unittest.TestCase):
     def test_nonexistent_condition_rejected_422(self) -> None:
-        from tests.support.testdb import DbTestCase  # noqa: F401
+        from fastapi import HTTPException
 
-        # 真实库验证（fetch_one 依赖 RealDictCursor，fake 过脆）
         from api.db import connection
         from api.helpers import _condition_id
-        from tests.support.testdb import probe, setup_test_env
+        from tests.support.testdb import DbTestCase, probe, setup_test_env
         if not probe():
             raise unittest.SkipTest("测试数据库不可达")
         setup_test_env()
@@ -75,9 +72,6 @@ class SerialsFileTests(unittest.TestCase):
             _extract_serials_from_file(b"garbage", "清单.xls")
         self.assertEqual(ctx.exception.status_code, 422, "openpyxl 不支持旧版 .xls，应明确 422 提示另存")
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class MasterBehaviorTests(DbTestCase):

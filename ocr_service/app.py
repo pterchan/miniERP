@@ -65,7 +65,10 @@ class RequestGateMiddleware:
         expected = os.environ.get("OCR_INTERNAL_TOKEN", "")
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
         provided = headers.get("x-internal-token")
-        if not expected or provided != expected:
+        if not expected:
+            await self._reject(send, 503, "OCR 内部令牌未配置")
+            return
+        if not provided or not hmac.compare_digest(provided, expected):
             await self._reject(send, 401, "OCR 内部令牌无效")
             return
         raw_length = headers.get("content-length")

@@ -92,7 +92,8 @@ describe('DataTable client mode', () => {
   })
 })
 
-describe('DataTable server mode', () => {  it('fetches pages through fetchData and renders them', async () => {
+describe('DataTable server mode', () => {
+  it('fetches pages through fetchData and renders them', async () => {
     const fetchData = vi.fn(async (params, signal) => ({ items: rows, total: rows.length }))
     render(<DataTable mode="server" columns={columns} rows={[]} fetchData={fetchData} rowKey={r => String(r.id)} />)
     // 等待组件内部 200ms 防抖拉取

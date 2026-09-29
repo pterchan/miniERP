@@ -4,7 +4,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { documentRoute } from './documents'
 
 const documentMock = vi.fn()
-vi.mock('./api', () => ({ default: { document: (...a) => documentMock(...a) } }))
+vi.mock('./api', () => ({
+  default: {
+    document: (...a) => documentMock(...a),
+    locations: async () => [], uoms: async () => [], customers: async () => [], suppliers: async () => [],
+    products: async () => ({ items: [] }), productStocks: async () => ({ items: {} }),
+  },
+}))
 
 afterEach(cleanup)
 
@@ -27,10 +33,8 @@ describe('document edit route guard', () => {
   })
 
   it('shows Forbidden for a non-creator on someone else\'s draft', async () => {
-    render(<div />)
     documentMock.mockResolvedValue({ document_id: 7, doc_type: 'PURCHASE_ORDER', status: 'DRAFT', created_by: 99, lines: [] })
-    cleanup()
-    const { container } = render(documentRoute('purchase', ['purchase', 'purchase_order', '7', 'edit'], WAREHOUSE_USER))
+    render(documentRoute('purchase', ['purchase', 'purchase_order', '7', 'edit'], WAREHOUSE_USER))
     await waitFor(() => expect(screen.getByText('无权访问')).toBeInTheDocument())
   })
 })

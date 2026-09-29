@@ -22,7 +22,7 @@
 |---|---|---|
 | `POSTGRES_DB` / `POSTGRES_USER` | `inventory` | 数据库与数据库用户 |
 | `POSTGRES_PORT` | `127.0.0.1:5432` | PostgreSQL 宿主机映射端口（缺省仅绑回环） |
-| `API_PORT` | `127.0.0.1:8000` | API 宿主机映射端口（缺省仅绑回环；对外请走网关） |
+| `API_PORT` | `127.0.0.1:8000` | API 宿主机映射端口（缺省仅绑回环；**必须保持回环**——API 以 `--forwarded-allow-ips=*` 信任代理头，直接暴露会允许伪造审计 IP） |
 | `WEB_PORT` | `127.0.0.1:18080` | Web 容器宿主机映射；推荐由前置 HTTPS 网关访问 |
 | `WEB_DOCKERFILE` | `Dockerfile` | Web 镜像构建方式；可选 `Dockerfile.remote` |
 | `ERP_COOKIE_PATH` | `/` | Cookie 路径；通过 `/erp/` 子路径访问时设为 `/erp` |
