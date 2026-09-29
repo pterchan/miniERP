@@ -48,6 +48,8 @@ class RequestLineIn(BaseModel):
     destination_location_id: int | None = None
     notes: str | None = None
 
+    _q = field_validator("quantity")(_qty_scale)
+
 
 class StockRequestIn(BaseModel):
     request_type: str
@@ -252,6 +254,13 @@ class DocLineIn(BaseModel):
 
     _q = field_validator("quantity")(_qty_scale)
     _cq = field_validator("counted_quantity")(_qty_scale)
+
+    @field_validator("counted_quantity")
+    @classmethod
+    def _counted_non_negative(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and value < 0:
+            raise ValueError("盘点实盘数不能为负")
+        return value
     _p = field_validator("price")(_money_scale)
 
 

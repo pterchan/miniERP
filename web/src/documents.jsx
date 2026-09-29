@@ -7,7 +7,7 @@ import { can, canEdit, canView } from './roles'
 import { SerialEntry } from './serial'
 import {
   Back, Badge, Button, Empty, ErrorBox, Field, Forbidden, Link, Loading,
-  PageHeading, useDirtyLeaveGuard, useRouter,
+  PageHeading, useDirtyLeaveGuard, useFetchOne, useRouter,
 } from './ui'
 
 export const DOC_TYPE_CONFIG = {
@@ -155,9 +155,7 @@ function DocumentForm({ docType, id, user }) {
 
 function DocumentEditLoader({ id, user }) {
   // 编辑表单前置校验：与详情页同一判定（创建人/ADMIN 且 DRAFT），无权直接 403
-  const [data, setData] = useState(null)
-  const [error, setError] = useState(null)
-  useEffect(() => { api.document(id).then(setData).catch(setError) }, [id])
+  const { data, error } = useFetchOne(() => api.document(id), [id])
   if (error) return <section><Back to="/" /><ErrorBox error={error} /></section>
   if (!data) return <Loading />
   const editable = data.status === 'DRAFT' && (user.user_id === data.created_by || user.role === 'ADMIN')

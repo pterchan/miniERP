@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import uuid
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -73,8 +74,8 @@ app.include_router(reports.router)
 app.include_router(serial_tracking.router)
 
 
-@app.on_event("startup")
-def startup() -> None:
+@asynccontextmanager
+async def lifespan(_app):
     # Compose starts the API after postgres health is ready. The try keeps the
     # API usable for migrations run after container startup.
     try:
@@ -89,6 +90,10 @@ def startup() -> None:
         ensure_bucket()
     except Exception:
         pass
+    yield
+
+
+app.router.lifespan_context = lifespan
 
 
 def _valid_location_type(value: str | None) -> bool:
@@ -263,6 +268,7 @@ def login(payload: LoginIn, response: Response, request: Request) -> dict[str, A
         _record_login_attempt(conn, username, meta, True)
         audit(conn, {"user_id": user_row["user_id"], "role": user_row["role"]}, "LOGIN", "app_session", request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
         with conn.cursor() as cur:
+            cur.execute("DELETE FROM app_session WHERE expires_at<now()")
             cur.execute("INSERT INTO app_session(user_id,token_hash,csrf_token_hash,expires_at) VALUES (%s,%s,%s,%s)", (user_row["user_id"], token_hash(session_token), token_hash(csrf_token), utc_after()))
     secure = os.environ.get("ERP_SECURE_COOKIES", "0") == "1"
     response.set_cookie(SESSION_COOKIE, session_token, path=COOKIE_PATH, httponly=True, secure=secure, samesite="lax", max_age=12 * 3600)
@@ -907,12 +913,15 @@ def user_detail(user_id: int, user: dict[str, Any] = Depends(require_roles("ADMI
 @app.post("/api/admin/users")
 def create_user(payload: UserCreateIn, request: Request, user: dict[str, Any] = Depends(require_roles("ADMIN"))) -> dict[str, Any]:
     _csrf(request)
+    meta = _request_meta(request)
     if payload.role not in {"ADMIN", "WAREHOUSE", "SALES", "FINANCE", "COLLEAGUE"}:
         raise HTTPException(status_code=422, detail="角色无效")
     with connection() as conn:
         if fetch_one(conn, "SELECT user_id FROM app_user WHERE username=%s", (payload.username.strip(),)):
             raise HTTPException(status_code=409, detail="用户名已存在")
-        audit(conn, user, "CREATE", "app_user", after={"username": payload.username.strip(), "display_name": payload.display_name, "role": payload.role})
+        audit(conn, user, "CREATE", "app_user",
+              after={"username": payload.username.strip(), "display_name": payload.display_name, "role": payload.role},
+              request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO app_user(username,display_name,role,password_hash)
                          VALUES (%s,%s,%s,%s) RETURNING user_id,username,display_name,role,is_active,created_at""", (payload.username.strip(), payload.display_name.strip(), payload.role, hash_password(payload.password)))
@@ -1192,13 +1201,6 @@ def _transition(request_id: int, target: str, request: Request, user: dict[str, 
                     cur.execute("""INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,source_uom_raw,notes,posted_at,posted_by)
                                  VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s)""", (_movement_id(conn, row["request_type"]), posted, line["product_id"], line["quantity"], line["uom_id"], line["condition_id"], source_location, destination_location, line["source_uom_raw"], f"OA申请 {row['request_no']}", user["username"]))
     return stock_request_detail(request_id, user)
-
-
-def _action_endpoint(target: str) -> Callable[..., dict[str, Any]]:
-    def endpoint(request_id: int, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
-        _csrf(request)
-        return _transition(request_id, target, request, user)
-    return endpoint
 
 
 @app.post("/api/stock-requests/{request_id}/submit")
@@ -1491,12 +1493,12 @@ def audit_export(ids: str = "", fmt: str = "xlsx", user: dict[str, Any] = Depend
             id_list = parse_ids(ids)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
-        arr = ", ".join(str(i) for i in id_list)
-        placeholders = ", ".join(["%s"] * len(id_list))
         with connection() as conn:
-            rows = fetch_all(conn, f"""SELECT audit_event_id,actor_user_id,actor_role,action,target_table,target_id,request_id,before_data,after_data,field_diff,created_at
-                                         FROM audit_event WHERE audit_event_id IN ({placeholders})
-                                         ORDER BY array_position(ARRAY[{arr}], audit_event_id)""", tuple(id_list))
+            rows = fetch_all(conn, """SELECT audit_event_id,actor_user_id,actor_role,action,target_table,target_id,request_id,before_data,after_data,field_diff,created_at
+                                         FROM audit_event
+                                        WHERE audit_event_id = ANY(%s)
+                                         -- unnest 保序：与用户看到的勾选顺序一致
+                                         ORDER BY array_position(unnest(%s), audit_event_id)""", (id_list, id_list))
     else:
         with connection() as conn:
             rows = fetch_all(conn, """SELECT audit_event_id,actor_user_id,actor_role,action,target_table,target_id,request_id,before_data,after_data,field_diff,created_at

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import threading
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException, Request
 
@@ -13,7 +15,31 @@ from .pipeline import extract_from_image
 
 
 logger = logging.getLogger("ocr_service")
-app = FastAPI(title="Offline Product Label OCR", version="0.1.0")
+
+
+def _load_backend() -> None:
+    global _backend, _backend_error
+    try:
+        if not os.environ.get("OCR_INTERNAL_TOKEN"):
+            raise RuntimeError("OCR_INTERNAL_TOKEN is required")
+        from .engines.rapidocr import RapidOCRBackend
+
+        _backend = RapidOCRBackend()
+        _backend_error = None
+        logger.info("OCR engine ready: %s", _backend.name)
+    except Exception as exc:  # Keep liveness available so Compose can report readiness accurately.
+        _backend = None
+        _backend_error = type(exc).__name__
+        logger.exception("OCR engine failed to load")
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    _load_backend()
+    yield
+
+
+app = FastAPI(title="Offline Product Label OCR", version="0.1.0", lifespan=lifespan)
 _backend: object | None = None
 _backend_error: str | None = None
 _inference_slot = threading.BoundedSemaphore(1)
@@ -75,23 +101,6 @@ class RequestGateMiddleware:
         await send({"type": "http.response.body", "body": payload})
 
 
-@app.on_event("startup")
-def load_backend() -> None:
-    global _backend, _backend_error
-    try:
-        if not os.environ.get("OCR_INTERNAL_TOKEN"):
-            raise RuntimeError("OCR_INTERNAL_TOKEN is required")
-        from .engines.rapidocr import RapidOCRBackend
-
-        _backend = RapidOCRBackend()
-        _backend_error = None
-        logger.info("OCR engine ready: %s", _backend.name)
-    except Exception as exc:  # Keep liveness available so Compose can report readiness accurately.
-        _backend = None
-        _backend_error = type(exc).__name__
-        logger.exception("OCR engine failed to load")
-
-
 def _request_id(request: Request) -> str:
     return request.headers.get("X-Request-ID") or str(uuid.uuid4())
 
@@ -100,7 +109,7 @@ def _check_internal_token(provided: str | None) -> None:
     expected = os.environ.get("OCR_INTERNAL_TOKEN", "")
     if not expected:
         raise HTTPException(status_code=503, detail="OCR 内部令牌未配置")
-    if provided != expected:
+    if not provided or not hmac.compare_digest(provided, expected):
         raise HTTPException(status_code=401, detail="OCR 内部令牌无效")
 
 

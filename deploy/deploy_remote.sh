@@ -182,12 +182,13 @@ for attempt in $(seq 1 30); do
   sleep 2
 done
 
+# 全部迁移按文件名序幂等重放（001-008 均已幂等；重放正确性由
+# tests/test_migrations_idempotent.py 持续保证），新增迁移无需改本清单。
 DB_USER="$(grep -E '^POSTGRES_USER=' .env | cut -d= -f2-)"
 DB_NAME="$(grep -E '^POSTGRES_DB=' .env | cut -d= -f2-)"
-for migration in 005_search_indexes.sql 006_serial_tracking.sql 007_login_throttle.sql 008_hardening.sql; do
-  docker compose --env-file .env exec -T postgres psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" \
-    -f "/docker-entrypoint-initdb.d/$migration"
-done
+docker compose --env-file .env exec -T postgres sh -c \
+  'for f in /docker-entrypoint-initdb.d/*.sql; do echo "== 重放 $f"; psql -v ON_ERROR_STOP=1 -U "$1" -d "$2" -f "$f" || exit 1; done' \
+  sh "$DB_USER" "$DB_NAME"
 
 if [[ "$DO_SEED" == "1" ]]; then
   [[ -s .mini-erp-seed.xlsx && -s .mini-erp-import-map.json && -s .mini-erp-import-password ]] || {

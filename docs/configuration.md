@@ -9,7 +9,7 @@
 | 变量 | 用途 |
 |---|---|
 | `POSTGRES_PASSWORD` | PostgreSQL 密码 |
-| `SESSION_SECRET` | 保留的会话配置项；设置为长随机值 |
+| `SESSION_SECRET` | 保留的会话配置项（当前应用代码未读取，Compose 以 `:?` 强制非空防误配）；设置为长随机值 |
 | `BOOTSTRAP_ADMIN_PASSWORD` | 首次启动创建的管理员密码 |
 | `BOOTSTRAP_REQUESTER_PASSWORD` | 首次启动创建的普通用户密码 |
 | `OCR_INTERNAL_TOKEN` | API 调用 OCR 服务时的内部令牌 |

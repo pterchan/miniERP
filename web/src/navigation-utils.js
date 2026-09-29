@@ -1,7 +1,8 @@
 export function normalizePath(path) {
   const pathname = String(path || '/').split(/[?#]/, 1)[0] || '/'
   const absolutePath = pathname.startsWith('/') ? pathname : `/${pathname}`
-  return absolutePath.replace(/\/+$/, '') || '/'
+  // 折叠重复斜杠（手输 //products 这类路径），否则严格相等匹配会落错路由
+  return absolutePath.replace(/\/+/g, '/').replace(/\/+$/, '') || '/'
 }
 
 /** Return whether a path under /inventory belongs to the inventory document group.

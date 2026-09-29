@@ -6,11 +6,24 @@ ALTER TABLE inventory_movement ADD COLUMN IF NOT EXISTS source_uom_raw TEXT;
 
 -- Additional dictionary values used by the workbook.  Quantities remain in
 -- their source unit; no conversion factors are implied by these rows.
+-- 重跑时 uom 审计触发器已存在且先于 ON CONFLICT 执行，须先设审计上下文（仿 003）。
+-- 首跑时 audit_event 尚未创建（在本文件后文），守卫须先判断表是否存在。
+SELECT set_config('app.actor_id', 'SYSTEM', true);
+SELECT set_config('app.audit_action', 'MIGRATE_002_UOM', true);
+DO $$ BEGIN
+    -- EXECUTE 延迟解析：首跑时 audit_event 尚不存在，静态引用会在计划期失败。
+    -- 重放时必须重新插入审计行（require_audit_context 只认本事务内的行）。
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='audit_event') THEN
+        EXECUTE $sql$INSERT INTO audit_event (actor_user_id, actor_role, action, target_table, target_id, after_data)
+                 SELECT NULL, 'SYSTEM', 'MIGRATE_002_UOM', 'uom', NULL,
+                        '{"migration":"002_erp_oa","change":"add M/KG/L dictionary units (replay)"}'::jsonb$sql$;
+    END IF;
+END $$;
 INSERT INTO uom (code, display_name, decimal_scale)
 VALUES ('M', 'Meter', 3), ('KG', 'Kilogram', 3), ('L', 'Litre', 3)
 ON CONFLICT (code) DO NOTHING;
 
-CREATE TABLE app_user (
+CREATE TABLE IF NOT EXISTS app_user (
     user_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     username TEXT NOT NULL UNIQUE CHECK (length(btrim(username)) >= 3),
     display_name TEXT NOT NULL,
@@ -21,7 +34,7 @@ CREATE TABLE app_user (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE app_session (
+CREATE TABLE IF NOT EXISTS app_session (
     session_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     user_id BIGINT NOT NULL REFERENCES app_user(user_id) ON DELETE CASCADE,
     token_hash TEXT NOT NULL UNIQUE,
@@ -32,9 +45,9 @@ CREATE TABLE app_session (
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (expires_at > created_at)
 );
-CREATE INDEX app_session_active_idx ON app_session(token_hash, expires_at) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS app_session_active_idx ON app_session(token_hash, expires_at) WHERE revoked_at IS NULL;
 
-CREATE TABLE audit_event (
+CREATE TABLE IF NOT EXISTS audit_event (
     audit_event_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     actor_user_id BIGINT REFERENCES app_user(user_id),
     actor_role TEXT,
@@ -50,14 +63,14 @@ CREATE TABLE audit_event (
     import_batch_id BIGINT REFERENCES import_batch(import_batch_id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX audit_event_target_idx ON audit_event(target_table, target_id, created_at DESC);
-CREATE INDEX audit_event_actor_idx ON audit_event(actor_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS audit_event_target_idx ON audit_event(target_table, target_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS audit_event_actor_idx ON audit_event(actor_user_id, created_at DESC);
 
 CREATE OR REPLACE FUNCTION forbid_audit_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     RAISE EXCEPTION 'audit_event is append-only';
 END; $$;
-CREATE TRIGGER audit_event_immutable_trg
+CREATE OR REPLACE TRIGGER audit_event_immutable_trg
     BEFORE UPDATE OR DELETE ON audit_event FOR EACH ROW EXECUTE FUNCTION forbid_audit_mutation();
 
 -- Every write path must set app.actor_id and insert an audit_event in the same
@@ -81,7 +94,7 @@ BEGIN
     RETURN COALESCE(NEW, OLD);
 END; $$;
 
-CREATE TABLE stock_request (
+CREATE TABLE IF NOT EXISTS stock_request (
     stock_request_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     request_no TEXT NOT NULL UNIQUE,
     request_type TEXT NOT NULL CHECK (request_type IN ('RECEIPT','ISSUE_OTHER','ISSUE_SALE','ISSUE_CONSUMPTION','ISSUE_GIFT','ISSUE_SCRAP','TRANSFER','RETURN')),
@@ -99,9 +112,9 @@ CREATE TABLE stock_request (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (source_location_id IS NULL OR destination_location_id IS NULL OR source_location_id <> destination_location_id)
 );
-CREATE INDEX stock_request_queue_idx ON stock_request(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS stock_request_queue_idx ON stock_request(status, created_at DESC);
 
-CREATE TABLE stock_request_line (
+CREATE TABLE IF NOT EXISTS stock_request_line (
     stock_request_line_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     stock_request_id BIGINT NOT NULL REFERENCES stock_request(stock_request_id) ON DELETE CASCADE,
     product_id BIGINT NOT NULL REFERENCES product(product_id),
@@ -115,7 +128,7 @@ CREATE TABLE stock_request_line (
     UNIQUE(stock_request_id, stock_request_line_id)
 );
 
-CREATE TABLE stock_request_action (
+CREATE TABLE IF NOT EXISTS stock_request_action (
     stock_request_action_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     stock_request_id BIGINT NOT NULL REFERENCES stock_request(stock_request_id) ON DELETE CASCADE,
     actor_user_id BIGINT NOT NULL REFERENCES app_user(user_id),
@@ -126,7 +139,7 @@ CREATE TABLE stock_request_action (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX resolution_case_open_idx ON resolution_case(status_id, opened_at DESC);
+CREATE INDEX IF NOT EXISTS resolution_case_open_idx ON resolution_case(status_id, opened_at DESC);
 
 -- Units are first-class values.  The importer preserves the source unit in
 -- source_uom_raw and selects a dictionary row when it can identify one.  No
@@ -134,47 +147,47 @@ CREATE INDEX resolution_case_open_idx ON resolution_case(status_id, opened_at DE
 
 -- Attach audit guards to production-domain writes. API/import transactions must
 -- insert audit_event first and set the local GUCs documented above.
-CREATE TRIGGER app_user_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON app_user
+CREATE OR REPLACE TRIGGER app_user_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON app_user
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER app_session_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON app_session
+CREATE OR REPLACE TRIGGER app_session_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON app_session
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER product_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON product
+CREATE OR REPLACE TRIGGER product_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON product
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER uom_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON uom
+CREATE OR REPLACE TRIGGER uom_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON uom
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER organization_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON organization
+CREATE OR REPLACE TRIGGER organization_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON organization
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER location_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON location
+CREATE OR REPLACE TRIGGER location_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON location
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER product_identifier_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON product_identifier
+CREATE OR REPLACE TRIGGER product_identifier_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON product_identifier
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER product_name_alias_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON product_name_alias
+CREATE OR REPLACE TRIGGER product_name_alias_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON product_name_alias
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER location_alias_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON location_alias
+CREATE OR REPLACE TRIGGER location_alias_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON location_alias
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER asset_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON asset
+CREATE OR REPLACE TRIGGER asset_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON asset
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER asset_identifier_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON asset_identifier
+CREATE OR REPLACE TRIGGER asset_identifier_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON asset_identifier
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER asset_component_assignment_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON asset_component_assignment
+CREATE OR REPLACE TRIGGER asset_component_assignment_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON asset_component_assignment
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER asset_event_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON asset_event
+CREATE OR REPLACE TRIGGER asset_event_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON asset_event
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER inventory_movement_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON inventory_movement
+CREATE OR REPLACE TRIGGER inventory_movement_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON inventory_movement
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER inventory_snapshot_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON inventory_snapshot
+CREATE OR REPLACE TRIGGER inventory_snapshot_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON inventory_snapshot
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER inventory_movement_asset_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON inventory_movement_asset
+CREATE OR REPLACE TRIGGER inventory_movement_asset_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON inventory_movement_asset
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER stock_request_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON stock_request
+CREATE OR REPLACE TRIGGER stock_request_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON stock_request
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER stock_request_line_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON stock_request_line
+CREATE OR REPLACE TRIGGER stock_request_line_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON stock_request_line
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER stock_request_action_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON stock_request_action
+CREATE OR REPLACE TRIGGER stock_request_action_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON stock_request_action
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER resolution_case_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON resolution_case
+CREATE OR REPLACE TRIGGER resolution_case_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON resolution_case
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER data_quality_issue_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON data_quality_issue
+CREATE OR REPLACE TRIGGER data_quality_issue_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON data_quality_issue
     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
 
 COMMENT ON TABLE audit_event IS 'Append-only audit trail; production writes require a same-transaction audit event.';

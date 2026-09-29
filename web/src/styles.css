@@ -1664,3 +1664,7 @@ textarea:focus {
 .dt-pagination button:disabled { opacity: 0.4; cursor: default; }
 .dt-pagination button:hover:not(:disabled) { background: var(--surface-hover); }
 .dt-page-info { font-size: 13px; color: var(--text-muted); padding: 0 4px; }
+
+/* 货品图库：缩略图按钮化后的基础样式（继承原 tile 内 img 尺寸行为） */
+.gallery-thumb { padding: 0; border: none; background: none; cursor: zoom-in; display: block; width: 100%; }
+.gallery-thumb img { width: 100%; display: block; }

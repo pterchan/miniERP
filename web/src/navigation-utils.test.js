@@ -62,3 +62,11 @@ describe('isNavigationItemActive', () => {
     expect(isNavigationItemActive('/inventory/42/#history', '/?from=nav')).toBe(true)
   })
 })
+
+describe('normalizePath edge cases', () => {
+  it('folds repeated slashes so route matching cannot miss', async () => {
+    const { normalizePath } = await import('./navigation-utils')
+    expect(normalizePath('//products')).toBe('/products')
+    expect(normalizePath('/products///5')).toBe('/products/5')
+  })
+})

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from datetime import date, datetime
 from decimal import Decimal
 from contextlib import contextmanager
@@ -32,6 +33,7 @@ def database_url() -> str:
 
 
 _pool: Any = None
+_pool_lock = threading.Lock()
 
 
 class PoolExhaustedError(RuntimeError):
@@ -46,9 +48,12 @@ def _get_pool() -> Any:
     """
     global _pool
     if _pool is None:
-        _pool = _pg_pool.ThreadedConnectionPool(
-            0, 30, database_url(), connect_timeout=5, options="-c statement_timeout=30000",
-        )
+        # 多线程首请求并发建池会创建两个池（其一泄漏、连接上限翻倍）
+        with _pool_lock:
+            if _pool is None:
+                _pool = _pg_pool.ThreadedConnectionPool(
+                    0, 30, database_url(), connect_timeout=5, options="-c statement_timeout=30000",
+                )
     return _pool
 
 

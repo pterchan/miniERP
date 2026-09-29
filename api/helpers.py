@@ -4,6 +4,7 @@ router can reuse them without a circular import (main <-> documents)."""
 from __future__ import annotations
 
 import ipaddress
+import re
 import unicodedata
 import uuid
 from typing import Any
@@ -28,8 +29,12 @@ def _request_meta(request: Request) -> dict[str, str | None]:
         ip_address = str(ipaddress.ip_address(raw_ip)) if raw_ip else None
     except ValueError:
         ip_address = None
+    # X-Request-ID 用户可控：白名单+截断，防审计日志关联投毒
+    raw_request_id = (request.headers.get("X-Request-ID") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", raw_request_id):
+        raw_request_id = ""
     return {
-        "request_id": request.headers.get("X-Request-ID", str(uuid.uuid4())),
+        "request_id": raw_request_id or str(uuid.uuid4()),
         "ip_address": ip_address,
         "user_agent": request.headers.get("User-Agent"),
     }
@@ -66,6 +71,8 @@ def lock_products(conn: Any, product_ids: Any) -> list[dict[str, Any]]:
 
 def _condition_id(conn: Any, value: int | None) -> int:
     if value:
+        if not fetch_one(conn, "SELECT condition_id FROM inventory_condition WHERE condition_id=%s", (value,)):
+            raise HTTPException(status_code=422, detail="成色不存在")
         return value
     row = fetch_one(conn, "SELECT condition_id FROM inventory_condition WHERE code='new'")
     return int(row["condition_id"])

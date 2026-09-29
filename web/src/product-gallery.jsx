@@ -71,7 +71,7 @@ export default function ProductGallery({ productId, canEdit }) {
       <span className="muted">{images.length} 张</span>
     </div>
     {sorted.length ? <div className="gallery-grid">{sorted.map(image => <figure className="gallery-tile" key={image.image_id}>
-      <img src={api.productImageContent(image.image_id, 'thumb')} alt={image.filename || `图片 ${image.image_id}`} loading="lazy" onClick={() => setPreview(image)} />
+      <button type="button" className="gallery-thumb" onClick={() => setPreview(image)} aria-label={`预览 ${image.filename || `图片 ${image.image_id}`}`}><img src={api.productImageContent(image.image_id, 'thumb')} alt={image.filename || `图片 ${image.image_id}`} loading="lazy" /></button>
       <figcaption><span title={image.filename}>{image.filename || `图片 ${image.image_id}`}</span><small>{fmtSize(image.size)}</small></figcaption>
       {canEdit && <div className="gallery-actions">
         <button type="button" onClick={() => move(image, -1)} disabled={sorted[0].image_id === image.image_id} aria-label="前移">↑</button>
@@ -79,9 +79,22 @@ export default function ProductGallery({ productId, canEdit }) {
         <button type="button" className="danger-link" onClick={() => remove(image)}>删除</button>
       </div>}
     </figure>)}</div> : <Empty>暂无图片</Empty>}
-    {preview && <div className="lightbox" role="dialog" aria-modal="true" onClick={() => setPreview(null)}>
-      <img src={api.productImageContent(preview.image_id)} alt={preview.filename || ''} onClick={e => e.stopPropagation()} />
-      <button type="button" className="close-button" onClick={() => setPreview(null)} aria-label="关闭预览">×</button>
-    </div>}
+    {preview && <Lightbox preview={preview} onClose={() => setPreview(null)} />}
+  </div>
+}
+
+
+/** 灯箱：Esc 关闭、点击遮罩关闭、打开时焦点落在关闭按钮上（键盘可达）。 */
+function Lightbox({ preview, onClose }) {
+  const closeRef = useRef(null)
+  useEffect(() => {
+    closeRef.current?.focus()
+    const onKey = e => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+  return <div className="lightbox" role="dialog" aria-modal="true" aria-label="图片预览" onClick={onClose}>
+    <img src={api.productImageContent(preview.image_id)} alt={preview.filename || ''} onClick={e => e.stopPropagation()} />
+    <button ref={closeRef} type="button" className="close-button" onClick={onClose} aria-label="关闭预览">×</button>
   </div>
 }

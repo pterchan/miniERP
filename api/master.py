@@ -55,6 +55,16 @@ def update_category(category_id: int, payload: CategoryIn, request: Request, use
             raise HTTPException(status_code=404, detail="分类不存在")
         if payload.parent_category_id and payload.parent_category_id == category_id:
             raise HTTPException(status_code=422, detail="父分类不能是自己")
+        if payload.parent_category_id:
+            # 沿祖先链上溯，防止把祖先挂到子孙形成环（环上节点会从树中「消失」）
+            ancestor = payload.parent_category_id
+            for _ in range(100):
+                if ancestor == category_id:
+                    raise HTTPException(status_code=422, detail="父分类不能是自己的子孙分类")
+                row = fetch_one(conn, "SELECT parent_category_id FROM product_category WHERE category_id=%s", (ancestor,))
+                ancestor = row["parent_category_id"] if row else None
+                if ancestor is None:
+                    break
         audit(conn, user, "EDIT", "product_category", target_id=category_id, before=before,
               after={"name": payload.name, "parent_category_id": payload.parent_category_id, "sort_order": payload.sort_order, "is_active": payload.is_active},
               request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
@@ -137,8 +147,10 @@ def update_customer(customer_id: int, payload: CustomerIn, request: Request, use
         before = fetch_one(conn, "SELECT * FROM customer WHERE customer_id=%s FOR UPDATE", (customer_id,))
         if not before:
             raise HTTPException(status_code=404, detail="客户不存在")
-        audit(conn, user, "EDIT", "customer", target_id=customer_id, before={"name": before["name"]},
-              after={"name": payload.name, "settlement_method": payload.settlement_method},
+        audit(conn, user, "EDIT", "customer", target_id=customer_id, before=before,
+              after={"name": payload.name, "contact_person": payload.contact_person, "phone": payload.phone,
+                     "address": payload.address, "settlement_method": payload.settlement_method, "level": payload.level,
+                     "credit_limit": str(payload.credit_limit), "notes": payload.notes, "is_active": payload.is_active},
               request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
         with conn.cursor() as cur:
             cur.execute("""UPDATE customer SET name=%s,contact_person=%s,phone=%s,address=%s,settlement_method=%s,level=%s,credit_limit=%s,notes=%s,is_active=%s,updated_at=now()
@@ -226,8 +238,11 @@ def update_supplier(supplier_id: int, payload: SupplierIn, request: Request, use
         before = fetch_one(conn, "SELECT * FROM supplier WHERE supplier_id=%s FOR UPDATE", (supplier_id,))
         if not before:
             raise HTTPException(status_code=404, detail="供应商不存在")
-        audit(conn, user, "EDIT", "supplier", target_id=supplier_id, before={"name": before["name"]},
-              after={"name": payload.name}, request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
+        audit(conn, user, "EDIT", "supplier", target_id=supplier_id, before=before,
+              after={"name": payload.name, "contact_person": payload.contact_person, "phone": payload.phone,
+                     "address": payload.address, "settlement_days": payload.settlement_days,
+                     "notes": payload.notes, "is_active": payload.is_active},
+              request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
         with conn.cursor() as cur:
             cur.execute("""UPDATE supplier SET name=%s,contact_person=%s,phone=%s,address=%s,settlement_days=%s,notes=%s,is_active=%s,updated_at=now()
                          WHERE supplier_id=%s""",
@@ -238,7 +253,7 @@ def update_supplier(supplier_id: int, payload: SupplierIn, request: Request, use
 @router.get("/products/{product_id}/price-tiers")
 def price_tiers(product_id: int, user: dict[str, Any] = Depends(require_user)) -> list[dict[str, Any]]:
     with connection() as conn:
-        return fetch_all(conn, "SELECT price_tier_id,tier_name,min_quantity,price FROM product_price_tier WHERE product_id=%s ORDER BY min_quantity", (product_id,))
+        return fetch_all(conn, "SELECT price_tier_id,tier_name,min_quantity,price FROM product_price_tier WHERE product_id=%s ORDER BY min_quantity, price_tier_id", (product_id,))
 
 
 @router.post("/products/{product_id}/price-tiers")
@@ -250,6 +265,8 @@ def create_price_tier(product_id: int, payload: PriceTierIn, request: Request, u
             raise HTTPException(status_code=404, detail="货品不存在")
         if fetch_one(conn, "SELECT price_tier_id FROM product_price_tier WHERE product_id=%s AND tier_name=%s", (product_id, payload.tier_name)):
             raise HTTPException(status_code=409, detail="批发档名称已存在")
+        if fetch_one(conn, "SELECT price_tier_id FROM product_price_tier WHERE product_id=%s AND min_quantity=%s AND price_tier_id<>%s", (product_id, payload.min_quantity, -1)):
+            raise HTTPException(status_code=409, detail="同一起订数量已存在批发档")
         audit(conn, user, "CREATE", "product_price_tier", after={"product_id": product_id, "tier_name": payload.tier_name, "price": str(payload.price)},
               request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
         with conn.cursor() as cur:
@@ -267,6 +284,8 @@ def update_price_tier(product_id: int, price_tier_id: int, payload: PriceTierIn,
         before = fetch_one(conn, "SELECT * FROM product_price_tier WHERE price_tier_id=%s AND product_id=%s FOR UPDATE", (price_tier_id, product_id))
         if not before:
             raise HTTPException(status_code=404, detail="批发档不存在")
+        if fetch_one(conn, "SELECT price_tier_id FROM product_price_tier WHERE product_id=%s AND min_quantity=%s AND price_tier_id<>%s", (product_id, payload.min_quantity, price_tier_id)):
+            raise HTTPException(status_code=409, detail="同一起订数量已存在批发档")
         audit(conn, user, "EDIT", "product_price_tier", target_id=price_tier_id, before=before,
               after={"tier_name": payload.tier_name, "min_quantity": str(payload.min_quantity), "price": str(payload.price)},
               request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])

@@ -5,6 +5,7 @@ helpers without a circular import (main <-> documents)."""
 
 from __future__ import annotations
 
+import hmac
 from typing import Any
 
 from fastapi import Depends, HTTPException, Request
@@ -106,7 +107,7 @@ def _csrf(request: Request) -> None:
         return
     expected = request.cookies.get(CSRF_COOKIE)
     provided = request.headers.get("X-CSRF-Token")
-    if not expected or not provided or expected != provided:
+    if not expected or not provided or not hmac.compare_digest(expected, provided):
         raise HTTPException(status_code=403, detail="CSRF token 无效")
     session = request.cookies.get(SESSION_COOKIE)
     if not session:

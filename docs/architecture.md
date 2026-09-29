@@ -93,7 +93,7 @@ API 容器 :8000 ─────────────────────
 
 ## OCR 服务（`ocr_service/`）
 
-独立 FastAPI 进程，与 ERP 仅通过内网 HTTP 交互：ERP 端唯一入口是 `/api/ocr/extract` 薄代理。RapidOCR 3.9.2（PP-OCRv4 / ONNX，CPU-only），模型随 wheel 打包并以 `MODEL_MANIFEST.txt` 校验和固定；运行期无网络、不访问数据库、不写磁盘。接口契约（`/healthz`、`/readyz`、`POST /v1/extract` + `X-Internal-Token`）见 [ocr_service/README.md](../ocr_service/README.md) 与 `ocr_service/contracts.py`。
+独立 FastAPI 进程，与 ERP 仅通过内网 HTTP 交互：ERP 端唯一入口是 `/api/ocr/extract` 薄代理。RapidOCR 3.9.2（PP-OCRv6 / ONNX，CPU-only），模型随 wheel 打包并以 `MODEL_MANIFEST.txt` 校验和固定；运行期无网络、不访问数据库、不写磁盘。接口契约（`/healthz`、`/readyz`、`POST /v1/extract` + `X-Internal-Token`）见 [ocr_service/README.md](../ocr_service/README.md) 与 `ocr_service/contracts.py`。
 
 ## 关键设计决策
 

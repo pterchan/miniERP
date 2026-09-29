@@ -117,11 +117,9 @@ def export_rows_by_ids(
             id_list = parse_ids(ids)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
-        array_literal = ", ".join(str(i) for i in id_list)  # 纯整数，安全
-        placeholders = ", ".join(["%s"] * len(id_list))
-        where = f"{id_column} IN ({placeholders})"
-        order_by = f"array_position(ARRAY[{array_literal}], {id_column})"
-        params: list[Any] = id_list
+        where = f"{id_column} = ANY(%s)"
+        order_by = f"array_position(unnest(%s), {id_column})"  # 保序：与用户看到的勾选顺序一致
+        params: list[Any] = [id_list, id_list]
     else:
         where, params, order_by = "TRUE", [], default_order
         # 全量导出在 SQL 层限行（上限+1），超限由 export_response 统一 422，避免先物化

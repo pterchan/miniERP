@@ -77,7 +77,7 @@ const { makeApi } = vi.hoisted(() => {
   return { makeApi }
 })
 
-vi.mock('./api', () => ({ default: makeApi() }))
+vi.mock('./api', () => ({ default: makeApi(), setUnauthorizedHandler: () => {}, invalidateInventory: () => {} }))
 
 import { App } from './main'
 

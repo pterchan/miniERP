@@ -105,17 +105,16 @@ class OversellSwitchTests(DbTestCase):
             response = self.warehouse.post(f"/api/documents/{receipt_id}/reverse")
         self.assertEqual(response.status_code, 200, response.text)
 
-    def test_count_down_below_stock_rejected_when_switch_on(self) -> None:
+    def test_negative_counted_quantity_rejected_at_validation(self) -> None:
+        """盘点实盘数为负无业务意义：入参校验层即 422（与开关无关，先于过账）。"""
         product_id = self._fresh_product()
         self._receipt(product_id, 5)
-        doc = self.warehouse.post("/api/documents", json={
+        response = self.warehouse.post("/api/documents", json={
             "doc_type": "STOCK_COUNT",
             "lines": [{"product_id": product_id, "quantity": 5, "counted_quantity": -1,
                        "source_location_id": self.loc1}],
-        }).json()
-        with patch.dict(os.environ, FORBID):
-            response = self.warehouse.post(f"/api/documents/{doc['document_id']}/post", json={})
-        self.assertEqual(response.status_code, 422, "盘点为负无业务意义，开启开关后应拒绝")
+        })
+        self.assertEqual(response.status_code, 422)
 
 
 class ReverseSerialGuardTests(DbTestCase):

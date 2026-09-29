@@ -257,8 +257,11 @@ def delete_product_image(
               request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
         with conn.cursor() as cur:
             cur.execute("DELETE FROM product_image WHERE image_id=%s", (image_id,))
-    try:
-        get_client().remove_object(before["bucket"], before["object_key"])
-    except Exception:
-        pass
+    for key in (before["object_key"], before.get("thumb_object_key")):
+        if not key:
+            continue
+        try:
+            get_client().remove_object(before["bucket"], key)
+        except Exception:
+            pass  # 对象存储不可达时不阻塞元数据删除，孤儿对象由存储侧回收
     return {"status": "ok"}

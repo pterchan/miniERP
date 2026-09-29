@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import date as _date
+
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -13,7 +15,7 @@ router = APIRouter(prefix="/api/reports", tags=["reports"])
 
 
 @router.get("/purchase-reconciliation")
-def purchase_reconciliation(supplier_id: int | None = None, start_date: str = "", end_date: str = "",
+def purchase_reconciliation(supplier_id: int | None = None, start_date: _date | None = None, end_date: _date | None = None,
                             user: dict[str, Any] = Depends(require_roles("FINANCE", "ADMIN"))) -> dict[str, Any]:
     sql = """SELECT s.supplier_id, s.name AS supplier_name, d.doc_no, d.doc_date, d.total_amount, d.posted_by
                FROM business_document d

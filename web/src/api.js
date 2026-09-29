@@ -5,12 +5,35 @@ class ApiError extends Error {
 }
 
 // 会话级库存余额缓存：多个页面（Dashboard/清点/单据）避免各自重复下载全量余额。
-// 只在真正写入 inventory_movement 的操作后失效（调整库存 / 过账 / 红冲 / 放行）。
+// 写入 inventory_movement 的操作立即失效；另有 60s TTL 兜底（他人过账/多标签页陈旧）。
+const INVENTORY_CACHE_TTL_MS = 60_000
 let inventoryPromise = null
-const invalidateInventory = () => { inventoryPromise = null }
+let inventoryCachedAt = 0
+const invalidateInventory = () => { inventoryPromise = null; inventoryCachedAt = 0 }
 const cachedInventory = () => {
-  if (!inventoryPromise) inventoryPromise = api.request('/inventory/balance').catch(err => { invalidateInventory(); throw err })
+  if (!inventoryPromise || Date.now() - inventoryCachedAt > INVENTORY_CACHE_TTL_MS) {
+    inventoryCachedAt = Date.now()
+    inventoryPromise = api.request('/inventory/balance').catch(err => { invalidateInventory(); throw err })
+  }
   return inventoryPromise
+}
+
+// 会话过期（401）全局处理：App 注册回调后统一回到登录页，避免每个页面各自报错。
+let unauthorizedHandler = null
+export function setUnauthorizedHandler(fn) { unauthorizedHandler = fn }
+function handleUnauthorized(path) {
+  if (unauthorizedHandler && !path.startsWith('/auth/')) unauthorizedHandler()
+}
+
+// pydantic 422 校验消息的中文化映射（常见类型错误兜底为中文提示）
+function localizeValidationDetail(messages) {
+  return messages.map(msg => String(msg)
+    .replace(/Input should be a valid integer/, '请输入整数')
+    .replace(/Input should be a valid number/, '请输入数字')
+    .replace(/Input should be a valid date/, '日期格式应为 YYYY-MM-DD')
+    .replace(/Input should be a valid decimal/, '请输入有效数字')
+    .replace(/String should have at most (\d+) characters?/, '长度超过上限（最多 $1 字符）')
+    .replace(/Field required/, '缺少必填字段'))
 }
 
 function csrfToken() {
@@ -63,7 +86,10 @@ const api = {
     if (response.status === 204) return null
     const body = await response.json().catch(() => ({}))
     if (!response.ok) {
-      const detail = Array.isArray(body.detail) ? body.detail.map(x => x.msg || x.message).join('；') : (body.detail || body.message)
+      if (response.status === 401) handleUnauthorized(path)
+      const detail = Array.isArray(body.detail)
+        ? localizeValidationDetail(body.detail.map(x => x.msg || x.message)).join('；')
+        : (body.detail || body.message)
       throw new ApiError(detail || `请求失败 (${response.status})`, response.status, response.headers.get('Retry-After'))
     }
     return body
@@ -93,7 +119,10 @@ const api = {
         if (xhr.status === 204) { resolve(null); return }
         const body = xhr.response || {}
         if (xhr.status >= 200 && xhr.status < 300) { resolve(body); return }
-        const detail = Array.isArray(body.detail) ? body.detail.map(x => x.msg || x.message).join('；') : (body.detail || body.message)
+        if (xhr.status === 401) handleUnauthorized(path)
+        const detail = Array.isArray(body.detail)
+          ? localizeValidationDetail(body.detail.map(x => x.msg || x.message)).join('；')
+          : (body.detail || body.message)
         reject(new ApiError(detail || `请求失败 (${xhr.status})`, xhr.status, xhr.getResponseHeader('Retry-After')))
       }
       xhr.onerror = () => { cleanup(); reject(new ApiError('网络错误，上传失败', 0)) }
@@ -215,4 +244,4 @@ const api = {
 }
 
 export default api
-export { ApiError }
+export { ApiError, invalidateInventory }

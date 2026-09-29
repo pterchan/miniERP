@@ -109,6 +109,8 @@ class GatewayContractTests(unittest.TestCase):
         self.assertIn('REMOTE_DIR="${DEPLOY_DIR:-}"', DEPLOY)
         # REMOTE_HOST 嵌入远端 shell 串，必须有字符集白名单
         self.assertIn('[[ "$REMOTE_HOST" =~ ^[A-Za-z0-9._:-]+$ ]]', DEPLOY)
+        # 迁移补跑按序 glob 全量幂等重放，新增迁移无需改清单
+        self.assertIn("for f in /docker-entrypoint-initdb.d/*.sql", DEPLOY)
         self.assertIn("--host HOST --user USER --remote-dir ABSOLUTE_PATH", DEPLOY)
         self.assertIn('--mapping FILE', DEPLOY)
         self.assertIn('[[ -f "$MAPPING_FILE" ]] || { echo "--seed-workbook 需要同时提供 --mapping"', DEPLOY)

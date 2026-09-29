@@ -16,18 +16,22 @@ ALTER TABLE app_user DROP CONSTRAINT IF EXISTS app_user_role_check;
 SELECT set_config('app.actor_id', 'SYSTEM', true);
 SELECT set_config('app.audit_action', 'MIGRATE_003_ROLES', true);
 INSERT INTO audit_event (actor_user_id, actor_role, action, target_table, target_id, after_data)
-VALUES (NULL, 'SYSTEM', 'MIGRATE_003_ROLES', 'app_user', NULL,
-        '{"migration":"003_full_erp","change":"WAREHOUSE_ADMIN/REQUESTER -> ADMIN/COLLEAGUE"}'::jsonb);
+SELECT NULL, 'SYSTEM', 'MIGRATE_003_ROLES', 'app_user', NULL,
+        '{"migration":"003_full_erp","change":"WAREHOUSE_ADMIN/REQUESTER -> ADMIN/COLLEAGUE"}'::jsonb;
 UPDATE app_user SET role = 'ADMIN'     WHERE role = 'WAREHOUSE_ADMIN';
 UPDATE app_user SET role = 'COLLEAGUE' WHERE role = 'REQUESTER';
-ALTER TABLE app_user
-    ADD CONSTRAINT app_user_role_check
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'app_user_role_check') THEN
+        ALTER TABLE app_user
+            ADD CONSTRAINT app_user_role_check
     CHECK (role IN ('ADMIN','WAREHOUSE','SALES','FINANCE','COLLEAGUE'));
+    END IF;
+END $$;
 
 -- ---------------------------------------------------------------------------
 -- 2. 部门（先建表，app_user.department_id 再引用）
 -- ---------------------------------------------------------------------------
-CREATE TABLE department (
+CREATE TABLE IF NOT EXISTS department (
     department_id   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     name            TEXT NOT NULL CHECK (length(btrim(name)) > 0),
     sort_order      INTEGER NOT NULL DEFAULT 0,
@@ -39,7 +43,7 @@ ALTER TABLE app_user ADD COLUMN IF NOT EXISTS department_id BIGINT REFERENCES de
 -- ---------------------------------------------------------------------------
 -- 3. 商品分类（树）
 -- ---------------------------------------------------------------------------
-CREATE TABLE product_category (
+CREATE TABLE IF NOT EXISTS product_category (
     category_id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     parent_category_id  BIGINT REFERENCES product_category(category_id),
     name                TEXT NOT NULL CHECK (length(btrim(name)) > 0),
@@ -55,7 +59,7 @@ ALTER TABLE product ADD COLUMN IF NOT EXISTS purchase_cost_price NUMERIC(18,2) N
 ALTER TABLE product ADD COLUMN IF NOT EXISTS sales_price         NUMERIC(18,2) NOT NULL DEFAULT 0 CHECK (sales_price >= 0);
 
 -- 多阶梯批发价：min_quantity 达标即按该档价格销售
-CREATE TABLE product_price_tier (
+CREATE TABLE IF NOT EXISTS product_price_tier (
     price_tier_id  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     product_id     BIGINT NOT NULL REFERENCES product(product_id) ON DELETE CASCADE,
     tier_name      TEXT NOT NULL,
@@ -67,7 +71,7 @@ CREATE TABLE product_price_tier (
 -- ---------------------------------------------------------------------------
 -- 5. 客户 / 供应商档案
 -- ---------------------------------------------------------------------------
-CREATE TABLE customer (
+CREATE TABLE IF NOT EXISTS customer (
     customer_id        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     name               TEXT NOT NULL CHECK (length(btrim(name)) > 0),
     contact_person     TEXT,
@@ -82,7 +86,7 @@ CREATE TABLE customer (
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE supplier (
+CREATE TABLE IF NOT EXISTS supplier (
     supplier_id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     name              TEXT NOT NULL CHECK (length(btrim(name)) > 0),
     contact_person    TEXT,
@@ -119,7 +123,7 @@ CREATE SEQUENCE IF NOT EXISTS document_no_seq;
 -- ---------------------------------------------------------------------------
 -- 8. 业务单据：表头 + 明细
 -- ---------------------------------------------------------------------------
-CREATE TABLE business_document (
+CREATE TABLE IF NOT EXISTS business_document (
     document_id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     doc_type                TEXT NOT NULL CHECK (doc_type IN
         ('PURCHASE_ORDER','PURCHASE_RECEIPT','PURCHASE_RETURN',
@@ -152,10 +156,10 @@ CREATE TABLE business_document (
            OR source_location_id <> destination_location_id),
     CHECK (reversal_of_document_id IS NULL OR reversal_of_document_id <> document_id)
 );
-CREATE INDEX business_document_type_status_idx ON business_document(doc_type, status, created_at DESC);
-CREATE INDEX business_document_party_idx ON business_document(party_type, party_id);
+CREATE INDEX IF NOT EXISTS business_document_type_status_idx ON business_document(doc_type, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS business_document_party_idx ON business_document(party_type, party_id);
 
-CREATE TABLE business_document_line (
+CREATE TABLE IF NOT EXISTS business_document_line (
     document_line_id        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     document_id             BIGINT NOT NULL REFERENCES business_document(document_id) ON DELETE CASCADE,
     line_no                 INTEGER NOT NULL CHECK (line_no > 0),
@@ -176,12 +180,12 @@ CREATE TABLE business_document_line (
 
 -- 单据与库存流水挂钩，供红冲按原单找流水
 ALTER TABLE inventory_movement ADD COLUMN IF NOT EXISTS document_id BIGINT REFERENCES business_document(document_id);
-CREATE INDEX inventory_movement_document_idx ON inventory_movement(document_id);
+CREATE INDEX IF NOT EXISTS inventory_movement_document_idx ON inventory_movement(document_id);
 
 -- ---------------------------------------------------------------------------
 -- 9. 应收应付台账 + 余额视图
 -- ---------------------------------------------------------------------------
-CREATE TABLE ar_ap_entry (
+CREATE TABLE IF NOT EXISTS ar_ap_entry (
     ar_ap_entry_id  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     party_type      TEXT NOT NULL CHECK (party_type IN ('CUSTOMER','SUPPLIER')),
     party_id        BIGINT NOT NULL,
@@ -192,28 +196,38 @@ CREATE TABLE ar_ap_entry (
     created_by      BIGINT NOT NULL REFERENCES app_user(user_id),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX ar_ap_party_idx ON ar_ap_entry(party_type, party_id, created_at);
+CREATE INDEX IF NOT EXISTS ar_ap_party_idx ON ar_ap_entry(party_type, party_id, created_at);
 
-CREATE OR REPLACE VIEW v_customer_balance AS
+DO $$ BEGIN
+    -- 存在即跳过：视图可能已被后续迁移演进（如 006 追加列），重放不得回退定义
+    IF NOT EXISTS (SELECT 1 FROM information_schema.views WHERE table_schema='public' AND table_name='v_customer_balance') THEN
+        EXECUTE $sql$CREATE VIEW v_customer_balance AS
 SELECT c.customer_id, c.name, c.is_active,
        COALESCE(SUM(ae.amount) FILTER (WHERE ae.direction='UP'),0)
      - COALESCE(SUM(ae.amount) FILTER (WHERE ae.direction='DOWN'),0) AS receivable_balance
 FROM customer c
 LEFT JOIN ar_ap_entry ae ON ae.party_type='CUSTOMER' AND ae.party_id=c.customer_id
-GROUP BY c.customer_id, c.name, c.is_active;
+GROUP BY c.customer_id, c.name, c.is_active;$sql$;
+    END IF;
+END $$;
 
-CREATE OR REPLACE VIEW v_supplier_balance AS
+DO $$ BEGIN
+    -- 存在即跳过：视图可能已被后续迁移演进（如 006 追加列），重放不得回退定义
+    IF NOT EXISTS (SELECT 1 FROM information_schema.views WHERE table_schema='public' AND table_name='v_supplier_balance') THEN
+        EXECUTE $sql$CREATE VIEW v_supplier_balance AS
 SELECT s.supplier_id, s.name, s.is_active,
        COALESCE(SUM(ae.amount) FILTER (WHERE ae.direction='UP'),0)
      - COALESCE(SUM(ae.amount) FILTER (WHERE ae.direction='DOWN'),0) AS payable_balance
 FROM supplier s
 LEFT JOIN ar_ap_entry ae ON ae.party_type='SUPPLIER' AND ae.party_id=s.supplier_id
-GROUP BY s.supplier_id, s.name, s.is_active;
+GROUP BY s.supplier_id, s.name, s.is_active;$sql$;
+    END IF;
+END $$;
 
 -- ---------------------------------------------------------------------------
 -- 10. 附件（BYTEA，存库；受代理 14MB 限制，单文件 ≤10MB）
 -- ---------------------------------------------------------------------------
-CREATE TABLE document_attachment (
+CREATE TABLE IF NOT EXISTS document_attachment (
     attachment_id  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     document_id    BIGINT NOT NULL REFERENCES business_document(document_id) ON DELETE CASCADE,
     filename       TEXT NOT NULL,
@@ -227,15 +241,15 @@ CREATE TABLE document_attachment (
 -- ---------------------------------------------------------------------------
 -- 11. 审计触发器：每个新业务表都必须先写 audit_event 再写库
 -- ---------------------------------------------------------------------------
-CREATE TRIGGER business_document_audit_trg     BEFORE INSERT OR UPDATE OR DELETE ON business_document     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER business_document_line_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON business_document_line FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER ar_ap_entry_audit_trg           BEFORE INSERT OR UPDATE OR DELETE ON ar_ap_entry           FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER document_attachment_audit_trg   BEFORE INSERT OR UPDATE OR DELETE ON document_attachment   FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER product_category_audit_trg      BEFORE INSERT OR UPDATE OR DELETE ON product_category      FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER customer_audit_trg              BEFORE INSERT OR UPDATE OR DELETE ON customer              FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER supplier_audit_trg              BEFORE INSERT OR UPDATE OR DELETE ON supplier              FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER department_audit_trg            BEFORE INSERT OR UPDATE OR DELETE ON department            FOR EACH ROW EXECUTE FUNCTION require_audit_context();
-CREATE TRIGGER product_price_tier_audit_trg    BEFORE INSERT OR UPDATE OR DELETE ON product_price_tier    FOR EACH ROW EXECUTE FUNCTION require_audit_context();
+CREATE OR REPLACE TRIGGER business_document_audit_trg     BEFORE INSERT OR UPDATE OR DELETE ON business_document     FOR EACH ROW EXECUTE FUNCTION require_audit_context();
+CREATE OR REPLACE TRIGGER business_document_line_audit_trg BEFORE INSERT OR UPDATE OR DELETE ON business_document_line FOR EACH ROW EXECUTE FUNCTION require_audit_context();
+CREATE OR REPLACE TRIGGER ar_ap_entry_audit_trg           BEFORE INSERT OR UPDATE OR DELETE ON ar_ap_entry           FOR EACH ROW EXECUTE FUNCTION require_audit_context();
+CREATE OR REPLACE TRIGGER document_attachment_audit_trg   BEFORE INSERT OR UPDATE OR DELETE ON document_attachment   FOR EACH ROW EXECUTE FUNCTION require_audit_context();
+CREATE OR REPLACE TRIGGER product_category_audit_trg      BEFORE INSERT OR UPDATE OR DELETE ON product_category      FOR EACH ROW EXECUTE FUNCTION require_audit_context();
+CREATE OR REPLACE TRIGGER customer_audit_trg              BEFORE INSERT OR UPDATE OR DELETE ON customer              FOR EACH ROW EXECUTE FUNCTION require_audit_context();
+CREATE OR REPLACE TRIGGER supplier_audit_trg              BEFORE INSERT OR UPDATE OR DELETE ON supplier              FOR EACH ROW EXECUTE FUNCTION require_audit_context();
+CREATE OR REPLACE TRIGGER department_audit_trg            BEFORE INSERT OR UPDATE OR DELETE ON department            FOR EACH ROW EXECUTE FUNCTION require_audit_context();
+CREATE OR REPLACE TRIGGER product_price_tier_audit_trg    BEFORE INSERT OR UPDATE OR DELETE ON product_price_tier    FOR EACH ROW EXECUTE FUNCTION require_audit_context();
 
 COMMENT ON TABLE business_document IS '泛型业务单据表头：状态机 DRAFT/SUBMITTED/POSTED/REVERSED，已过账仅可红冲。';
 COMMENT ON TABLE ar_ap_entry IS '应收/应付/定金台账；余额 = SUM(UP) - SUM(DOWN)，负数表示预收/预付。';

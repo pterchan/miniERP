@@ -12,7 +12,7 @@ BEGIN;
 -- Reference data
 -- ---------------------------------------------------------------------------
 
-CREATE TABLE record_status (
+CREATE TABLE IF NOT EXISTS record_status (
     status_id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     code            TEXT NOT NULL UNIQUE,
     display_name    TEXT NOT NULL,
@@ -22,7 +22,7 @@ CREATE TABLE record_status (
     description     TEXT
 );
 
-CREATE TABLE movement_type (
+CREATE TABLE IF NOT EXISTS movement_type (
     movement_type_id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     code                            TEXT NOT NULL UNIQUE,
     display_name                    TEXT NOT NULL,
@@ -33,7 +33,7 @@ CREATE TABLE movement_type (
     description                     TEXT
 );
 
-CREATE TABLE inventory_condition (
+CREATE TABLE IF NOT EXISTS inventory_condition (
     condition_id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     code            TEXT NOT NULL UNIQUE,
     display_name    TEXT NOT NULL,
@@ -84,7 +84,7 @@ INSERT INTO inventory_condition (code, display_name) VALUES
     ('unknown',      'Unknown')
 ON CONFLICT (code) DO NOTHING;
 
-CREATE TABLE uom (
+CREATE TABLE IF NOT EXISTS uom (
     uom_id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     code            TEXT NOT NULL UNIQUE,
     display_name    TEXT NOT NULL,
@@ -92,6 +92,16 @@ CREATE TABLE uom (
     is_active       BOOLEAN NOT NULL DEFAULT TRUE
 );
 
+-- 重放时 uom 审计触发器（002 安装）已存在且先于 ON CONFLICT 执行，须先设审计上下文。
+SELECT set_config('app.actor_id', 'SYSTEM', true);
+SELECT set_config('app.audit_action', 'MIGRATE_001_UOM', true);
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='audit_event') THEN
+        EXECUTE $sql$INSERT INTO audit_event (actor_user_id, actor_role, action, target_table, target_id, after_data)
+                 SELECT NULL, 'SYSTEM', 'MIGRATE_001_UOM', 'uom', NULL,
+                        '{"migration":"001_inventory","change":"seed base units (replay)"}'::jsonb$sql$;
+    END IF;
+END $$;
 INSERT INTO uom (code, display_name, decimal_scale) VALUES
     ('EA', 'Each', 0),
     ('BOX', 'Box', 0),
@@ -104,7 +114,7 @@ ON CONFLICT (code) DO NOTHING;
 -- Master data: products, organisations and locations
 -- ---------------------------------------------------------------------------
 
-CREATE TABLE product (
+CREATE TABLE IF NOT EXISTS product (
     product_id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     system_sku          TEXT UNIQUE,
     display_name        TEXT NOT NULL CHECK (length(btrim(display_name)) > 0),
@@ -118,7 +128,7 @@ CREATE TABLE product (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE organization (
+CREATE TABLE IF NOT EXISTS organization (
     organization_id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     organization_type   TEXT NOT NULL DEFAULT 'company'
         CHECK (organization_type IN ('company', 'hospital', 'department', 'customer', 'supplier', 'external', 'other')),
@@ -130,7 +140,7 @@ CREATE TABLE organization (
     UNIQUE (organization_type, name)
 );
 
-CREATE TABLE location (
+CREATE TABLE IF NOT EXISTS location (
     location_id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     organization_id     BIGINT REFERENCES organization (organization_id),
     parent_location_id  BIGINT REFERENCES location (location_id),
@@ -147,7 +157,7 @@ CREATE TABLE location (
 -- A source number can be shared by multiple products while it is unverified.
 -- The partial index below enforces uniqueness only after human review marks an
 -- identifier as both verified and exclusive.
-CREATE TABLE product_identifier (
+CREATE TABLE IF NOT EXISTS product_identifier (
     product_identifier_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     product_id          BIGINT NOT NULL REFERENCES product (product_id),
     identifier_type     TEXT NOT NULL DEFAULT 'source_number'
@@ -163,11 +173,11 @@ CREATE TABLE product_identifier (
     UNIQUE (product_id, identifier_type, namespace, value_normalized)
 );
 
-CREATE UNIQUE INDEX product_identifier_verified_exclusive_uq
+CREATE UNIQUE INDEX IF NOT EXISTS product_identifier_verified_exclusive_uq
     ON product_identifier (namespace, identifier_type, value_normalized)
     WHERE is_verified AND is_exclusive;
 
-CREATE TABLE product_name_alias (
+CREATE TABLE IF NOT EXISTS product_name_alias (
     product_name_alias_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     product_id          BIGINT NOT NULL REFERENCES product (product_id),
     alias_raw           TEXT NOT NULL,
@@ -179,11 +189,11 @@ CREATE TABLE product_name_alias (
     UNIQUE (product_id, alias_normalized)
 );
 
-CREATE UNIQUE INDEX product_name_alias_verified_exclusive_uq
+CREATE UNIQUE INDEX IF NOT EXISTS product_name_alias_verified_exclusive_uq
     ON product_name_alias (alias_normalized)
     WHERE is_verified AND is_exclusive;
 
-CREATE TABLE location_alias (
+CREATE TABLE IF NOT EXISTS location_alias (
     location_alias_id   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     location_id         BIGINT NOT NULL REFERENCES location (location_id),
     alias_raw           TEXT NOT NULL,
@@ -194,7 +204,7 @@ CREATE TABLE location_alias (
     UNIQUE (location_id, alias_normalized)
 );
 
-CREATE UNIQUE INDEX location_alias_verified_exclusive_uq
+CREATE UNIQUE INDEX IF NOT EXISTS location_alias_verified_exclusive_uq
     ON location_alias (alias_normalized)
     WHERE is_verified AND is_exclusive;
 
@@ -202,7 +212,7 @@ CREATE UNIQUE INDEX location_alias_verified_exclusive_uq
 -- Staging and audit records
 -- ---------------------------------------------------------------------------
 
-CREATE TABLE import_batch (
+CREATE TABLE IF NOT EXISTS import_batch (
     import_batch_id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     source_file_name    TEXT NOT NULL,
     source_sha256       TEXT NOT NULL CHECK (source_sha256 ~ '^[0-9A-Fa-f]{64}$'),
@@ -215,7 +225,7 @@ CREATE TABLE import_batch (
     UNIQUE (source_sha256)
 );
 
-CREATE TABLE source_record (
+CREATE TABLE IF NOT EXISTS source_record (
     source_record_id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     import_batch_id     BIGINT NOT NULL REFERENCES import_batch (import_batch_id),
     sheet_name          TEXT NOT NULL,
@@ -232,24 +242,36 @@ CREATE TABLE source_record (
     UNIQUE (import_batch_id, sheet_name, block_name, source_row_number)
 );
 
-CREATE INDEX source_record_row_hash_idx
+CREATE INDEX IF NOT EXISTS source_record_row_hash_idx
     ON source_record (import_batch_id, sheet_name, block_name, row_hash);
 
 -- These FKs are added after source_record because product/location master
 -- tables are created before the staging layer.
-ALTER TABLE product_identifier
-    ADD CONSTRAINT product_identifier_source_record_fk
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'product_identifier_source_record_fk') THEN
+        ALTER TABLE product_identifier
+            ADD CONSTRAINT product_identifier_source_record_fk
     FOREIGN KEY (source_record_id) REFERENCES source_record (source_record_id);
+    END IF;
+END $$;
 
-ALTER TABLE product_name_alias
-    ADD CONSTRAINT product_name_alias_source_record_fk
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'product_name_alias_source_record_fk') THEN
+        ALTER TABLE product_name_alias
+            ADD CONSTRAINT product_name_alias_source_record_fk
     FOREIGN KEY (source_record_id) REFERENCES source_record (source_record_id);
+    END IF;
+END $$;
 
-ALTER TABLE location_alias
-    ADD CONSTRAINT location_alias_source_record_fk
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'location_alias_source_record_fk') THEN
+        ALTER TABLE location_alias
+            ADD CONSTRAINT location_alias_source_record_fk
     FOREIGN KEY (source_record_id) REFERENCES source_record (source_record_id);
+    END IF;
+END $$;
 
-CREATE TABLE product_observation (
+CREATE TABLE IF NOT EXISTS product_observation (
     product_observation_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     source_record_id    BIGINT NOT NULL REFERENCES source_record (source_record_id),
     observation_ordinal INTEGER NOT NULL DEFAULT 1 CHECK (observation_ordinal > 0),
@@ -273,7 +295,7 @@ CREATE TABLE product_observation (
     UNIQUE (source_record_id, observation_ordinal)
 );
 
-CREATE TABLE movement_candidate (
+CREATE TABLE IF NOT EXISTS movement_candidate (
     movement_candidate_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     source_record_id    BIGINT NOT NULL REFERENCES source_record (source_record_id),
     candidate_ordinal   INTEGER NOT NULL DEFAULT 1 CHECK (candidate_ordinal > 0),
@@ -297,7 +319,7 @@ CREATE TABLE movement_candidate (
     UNIQUE (source_record_id, candidate_ordinal)
 );
 
-CREATE TABLE asset_observation (
+CREATE TABLE IF NOT EXISTS asset_observation (
     asset_observation_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     source_record_id    BIGINT NOT NULL REFERENCES source_record (source_record_id),
     observation_ordinal INTEGER NOT NULL DEFAULT 1 CHECK (observation_ordinal > 0),
@@ -316,7 +338,7 @@ CREATE TABLE asset_observation (
     UNIQUE (source_record_id, observation_ordinal)
 );
 
-CREATE TABLE resolution_case (
+CREATE TABLE IF NOT EXISTS resolution_case (
     resolution_case_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     source_record_id   BIGINT REFERENCES source_record (source_record_id),
     product_observation_id BIGINT REFERENCES product_observation (product_observation_id),
@@ -333,7 +355,7 @@ CREATE TABLE resolution_case (
     CHECK (source_record_id IS NOT NULL OR product_observation_id IS NOT NULL OR movement_candidate_id IS NOT NULL OR asset_observation_id IS NOT NULL)
 );
 
-CREATE TABLE data_quality_issue (
+CREATE TABLE IF NOT EXISTS data_quality_issue (
     data_quality_issue_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     source_record_id   BIGINT REFERENCES source_record (source_record_id),
     product_observation_id BIGINT REFERENCES product_observation (product_observation_id),
@@ -355,7 +377,7 @@ CREATE TABLE data_quality_issue (
 -- Assets and serial-number history
 -- ---------------------------------------------------------------------------
 
-CREATE TABLE asset (
+CREATE TABLE IF NOT EXISTS asset (
     asset_id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     asset_type         TEXT NOT NULL CHECK (length(btrim(asset_type)) > 0),
     manufacturer       TEXT,
@@ -369,11 +391,15 @@ CREATE TABLE asset (
     CHECK (acquired_date IS NULL OR acquired_date BETWEEN DATE '1900-01-01' AND DATE '2200-01-01')
 );
 
-ALTER TABLE asset_observation
-    ADD CONSTRAINT asset_observation_resolved_asset_fk
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'asset_observation_resolved_asset_fk') THEN
+        ALTER TABLE asset_observation
+            ADD CONSTRAINT asset_observation_resolved_asset_fk
     FOREIGN KEY (resolved_asset_id) REFERENCES asset (asset_id);
+    END IF;
+END $$;
 
-CREATE TABLE asset_identifier (
+CREATE TABLE IF NOT EXISTS asset_identifier (
     asset_identifier_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     asset_id           BIGINT NOT NULL REFERENCES asset (asset_id),
     identifier_type    TEXT NOT NULL
@@ -390,11 +416,11 @@ CREATE TABLE asset_identifier (
     UNIQUE (asset_id, identifier_type, namespace, value_normalized)
 );
 
-CREATE UNIQUE INDEX asset_identifier_verified_exclusive_uq
+CREATE UNIQUE INDEX IF NOT EXISTS asset_identifier_verified_exclusive_uq
     ON asset_identifier (namespace, identifier_type, value_normalized)
     WHERE is_verified AND is_exclusive;
 
-CREATE TABLE asset_component_assignment (
+CREATE TABLE IF NOT EXISTS asset_component_assignment (
     asset_component_assignment_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     parent_asset_id    BIGINT NOT NULL REFERENCES asset (asset_id),
     component_asset_id BIGINT NOT NULL REFERENCES asset (asset_id),
@@ -410,15 +436,15 @@ CREATE TABLE asset_component_assignment (
     UNIQUE (parent_asset_id, component_asset_id, component_role, valid_from)
 );
 
-CREATE UNIQUE INDEX asset_component_active_role_uq
+CREATE UNIQUE INDEX IF NOT EXISTS asset_component_active_role_uq
     ON asset_component_assignment (parent_asset_id, component_role)
     WHERE valid_to IS NULL;
 
-CREATE UNIQUE INDEX asset_component_active_component_uq
+CREATE UNIQUE INDEX IF NOT EXISTS asset_component_active_component_uq
     ON asset_component_assignment (component_asset_id)
     WHERE valid_to IS NULL;
 
-CREATE TABLE asset_event (
+CREATE TABLE IF NOT EXISTS asset_event (
     asset_event_id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     asset_id           BIGINT NOT NULL REFERENCES asset (asset_id),
     event_type         TEXT NOT NULL
@@ -439,7 +465,7 @@ CREATE TABLE asset_event (
 -- Inventory ledger and snapshots
 -- ---------------------------------------------------------------------------
 
-CREATE TABLE inventory_movement (
+CREATE TABLE IF NOT EXISTS inventory_movement (
     inventory_movement_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     movement_type_id    BIGINT NOT NULL REFERENCES movement_type (movement_type_id),
     status_id           BIGINT NOT NULL REFERENCES record_status (status_id),
@@ -512,7 +538,7 @@ BEGIN
 END;
 $function$;
 
-CREATE TRIGGER inventory_movement_posted_shape_trg
+CREATE OR REPLACE TRIGGER inventory_movement_posted_shape_trg
     BEFORE INSERT OR UPDATE OF movement_type_id, status_id,
         source_location_id, destination_location_id
     ON inventory_movement
@@ -522,13 +548,13 @@ CREATE TRIGGER inventory_movement_posted_shape_trg
 -- Each source row/line can be posted at most once.  A NULL source row is
 -- allowed for a manually entered opening/adjustment and is intentionally not
 -- covered by the unique constraint semantics of PostgreSQL.
-CREATE INDEX inventory_movement_product_date_idx
+CREATE INDEX IF NOT EXISTS inventory_movement_product_date_idx
     ON inventory_movement (product_id, movement_date);
 
-CREATE INDEX inventory_movement_location_date_idx
+CREATE INDEX IF NOT EXISTS inventory_movement_location_date_idx
     ON inventory_movement (source_location_id, destination_location_id, movement_date);
 
-CREATE TABLE inventory_snapshot (
+CREATE TABLE IF NOT EXISTS inventory_snapshot (
     inventory_snapshot_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     snapshot_date       DATE,
     product_id          BIGINT NOT NULL REFERENCES product (product_id),
@@ -546,7 +572,7 @@ CREATE TABLE inventory_snapshot (
     UNIQUE (source_record_id, source_line_no)
 );
 
-CREATE TABLE inventory_movement_asset (
+CREATE TABLE IF NOT EXISTS inventory_movement_asset (
     inventory_movement_asset_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     inventory_movement_id BIGINT NOT NULL REFERENCES inventory_movement (inventory_movement_id),
     asset_id           BIGINT NOT NULL REFERENCES asset (asset_id),
@@ -560,15 +586,22 @@ CREATE TABLE inventory_movement_asset (
 -- tables exist, so asset events can point back to the ledger without cycles
 -- during table creation.
 
-ALTER TABLE asset_event
-    ADD CONSTRAINT asset_event_inventory_movement_fk
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'asset_event_inventory_movement_fk') THEN
+        ALTER TABLE asset_event
+            ADD CONSTRAINT asset_event_inventory_movement_fk
     FOREIGN KEY (inventory_movement_id) REFERENCES inventory_movement (inventory_movement_id);
+    END IF;
+END $$;
 
 -- ---------------------------------------------------------------------------
 -- Reporting views
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE VIEW v_inventory_balance AS
+DO $$ BEGIN
+    -- 存在即跳过：视图可能已被后续迁移演进（如 006 追加列），重放不得回退定义
+    IF NOT EXISTS (SELECT 1 FROM information_schema.views WHERE table_schema='public' AND table_name='v_inventory_balance') THEN
+        EXECUTE $sql$CREATE VIEW v_inventory_balance AS
 WITH posted_movements AS (
     SELECT
         im.product_id,
@@ -608,9 +641,14 @@ JOIN location l ON l.location_id = pm.location_id
 JOIN inventory_condition ic ON ic.condition_id = pm.condition_id
 JOIN uom u ON u.uom_id = pm.uom_id
 GROUP BY pm.product_id, p.display_name, pm.location_id, l.name,
-         pm.condition_id, ic.code, pm.uom_id, u.code;
+         pm.condition_id, ic.code, pm.uom_id, u.code;$sql$;
+    END IF;
+END $$;
 
-CREATE OR REPLACE VIEW v_company_inventory_balance AS
+DO $$ BEGIN
+    -- 存在即跳过：视图可能已被后续迁移演进（如 006 追加列），重放不得回退定义
+    IF NOT EXISTS (SELECT 1 FROM information_schema.views WHERE table_schema='public' AND table_name='v_company_inventory_balance') THEN
+        EXECUTE $sql$CREATE VIEW v_company_inventory_balance AS
 SELECT
     b.product_id,
     b.product_name,
@@ -622,9 +660,14 @@ SELECT
 FROM v_inventory_balance b
 JOIN location l ON l.location_id = b.location_id
 WHERE l.is_company_inventory
-GROUP BY b.product_id, b.product_name, b.condition_id, b.condition_code, b.uom_id, b.uom_code;
+GROUP BY b.product_id, b.product_name, b.condition_id, b.condition_code, b.uom_id, b.uom_code;$sql$;
+    END IF;
+END $$;
 
-CREATE OR REPLACE VIEW v_asset_current_state AS
+DO $$ BEGIN
+    -- 存在即跳过：视图可能已被后续迁移演进（如 006 追加列），重放不得回退定义
+    IF NOT EXISTS (SELECT 1 FROM information_schema.views WHERE table_schema='public' AND table_name='v_asset_current_state') THEN
+        EXECUTE $sql$CREATE VIEW v_asset_current_state AS
 WITH latest_event AS (
     SELECT DISTINCT ON (ae.asset_id)
         ae.asset_id,
@@ -689,9 +732,14 @@ LEFT JOIN LATERAL (
       AND ai0.is_primary
     ORDER BY ai0.asset_identifier_id
     LIMIT 1
-) ai ON TRUE;
+) ai ON TRUE;$sql$;
+    END IF;
+END $$;
 
-CREATE OR REPLACE VIEW v_migration_reconciliation AS
+DO $$ BEGIN
+    -- 存在即跳过：视图可能已被后续迁移演进（如 006 追加列），重放不得回退定义
+    IF NOT EXISTS (SELECT 1 FROM information_schema.views WHERE table_schema='public' AND table_name='v_migration_reconciliation') THEN
+        EXECUTE $sql$CREATE VIEW v_migration_reconciliation AS
 WITH latest_snapshot AS (
     SELECT DISTINCT ON (s.product_id, s.location_id, s.condition_id, s.uom_id)
         s.inventory_snapshot_id,
@@ -736,7 +784,9 @@ FULL OUTER JOIN ledger le
 JOIN product p ON p.product_id = COALESCE(ls.product_id, le.product_id)
 JOIN location l ON l.location_id = COALESCE(ls.location_id, le.location_id)
 JOIN inventory_condition ic ON ic.condition_id = COALESCE(ls.condition_id, le.condition_id)
-JOIN uom u ON u.uom_id = COALESCE(ls.uom_id, le.uom_id);
+JOIN uom u ON u.uom_id = COALESCE(ls.uom_id, le.uom_id);$sql$;
+    END IF;
+END $$;
 
 -- Column-level comments document the intentional distinction between source
 -- identifiers and stable internal keys.

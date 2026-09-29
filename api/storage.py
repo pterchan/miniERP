@@ -23,13 +23,19 @@ _client: Minio | None = None
 
 
 def get_client() -> Minio:
-    """Lazily build and cache the Minio client from environment variables."""
+    """Lazily build and cache the Minio client from environment variables.
+
+    密钥缺失时直接抛错而不是回退公开已知的 minioadmin——后者等于把对象存储
+    敞开给任何内网调用方。
+    """
     global _client
     if _client is None:
         endpoint = os.environ.get("MINIO_ENDPOINT", "minio:9000")
-        access_key = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
-        secret_key = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
+        access_key = os.environ.get("MINIO_ACCESS_KEY")
+        secret_key = os.environ.get("MINIO_SECRET_KEY")
         secure = os.environ.get("MINIO_SECURE", "0") == "1"
+        if not access_key or not secret_key:
+            raise RuntimeError("MINIO_ACCESS_KEY/MINIO_SECRET_KEY 未配置；拒绝使用默认凭据连接对象存储")
         _client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
     return _client
 

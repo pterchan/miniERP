@@ -56,8 +56,14 @@ def _extract_serials_from_file(data: bytes, filename: str) -> list[str]:
     """从 xlsx / csv 第一列提取 SN 原始值（纯解析，不写库）。"""
     name = (filename or "").lower()
     raw_values: list[str] = []
-    if name.endswith(".xlsx") or name.endswith(".xlsm") or name.endswith(".xls"):
-        wb = load_workbook(io.BytesIO(data), read_only=True)
+    if name.endswith(".xls") and not name.endswith(".xlsx"):
+        # openpyxl 不支持旧版 BIFF（.xls）；明确提示而不是解析异常 500
+        raise HTTPException(status_code=422, detail="不支持旧版 .xls，请用 Excel 另存为 .xlsx 或导出 .csv 后重试")
+    if name.endswith(".xlsx") or name.endswith(".xlsm"):
+        try:
+            wb = load_workbook(io.BytesIO(data), read_only=True)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="无法解析的表格文件，请确认是有效的 .xlsx") from exc
         ws = wb.worksheets[0]
         for row in ws.iter_rows(values_only=True):
             if row and row[0] is not None and str(row[0]).strip():
@@ -363,11 +369,20 @@ def parse_serials(payload: SerialParseIn, request: Request = None,
     _csrf(request)
     sns = parse_serial_block(payload.text)
     with connection() as conn:
-        items = []
-        for sn in sns:
-            asset = _asset_by_sn(conn, payload.product_id, sn)
-            items.append({"serial_number": sn, "exists": bool(asset),
-                          "status": asset["status_code"] if asset else None})
+        items: list[dict[str, Any]] = []
+        if sns:
+            # 一次批量查询代替逐 SN 往返（文本最长 2 万字符可拆数千 SN）
+            rows = fetch_all(conn, """SELECT ai.value_normalized AS sn, s.status_code
+                                        FROM asset_identifier ai
+                                        JOIN v_asset_current_state s ON s.asset_id = ai.asset_id
+                                       WHERE ai.namespace=%s AND ai.identifier_type=%s
+                                         AND ai.value_normalized = ANY(%s)
+                                         AND ai.is_verified AND ai.is_exclusive""",
+                             (f"{SN_IDENT_TYPE}.{payload.product_id}", SN_IDENT_TYPE, sns))
+            by_sn = {row["sn"]: row["status_code"] for row in rows}
+            for sn in sns:
+                status = by_sn.get(sn)
+                items.append({"serial_number": sn, "exists": status is not None, "status": status})
     return {"items": items}
 
 

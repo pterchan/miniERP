@@ -75,13 +75,21 @@ def _main_location(conn: Any) -> int | None:
     return int(row["location_id"]) if row else None
 
 
+def _line_amount(line: Any, price: Decimal) -> Decimal:
+    """数量×单价并量化；乘积超出 NUMERIC(18,2) 量级时 422 而不是 InvalidOperation 500。"""
+    try:
+        return (line.quantity * price).quantize(Decimal("0.01"))
+    except ArithmeticError:
+        raise HTTPException(status_code=422, detail="明细金额超出允许量级（数量×单价过大）") from None
+
+
 def _resolve_price(conn: Any, doc_type: str, line: Any, product: dict[str, Any]) -> Decimal:
     if line.price is not None:
         return line.price
     source = PRICE_SOURCE.get(doc_type)
     if source == "sales":
         chosen: Decimal | None = None
-        tiers = fetch_all(conn, "SELECT min_quantity, price FROM product_price_tier WHERE product_id=%s ORDER BY min_quantity", (line.product_id,))
+        tiers = fetch_all(conn, "SELECT min_quantity, price FROM product_price_tier WHERE product_id=%s ORDER BY min_quantity, price_tier_id", (line.product_id,))
         for tier in tiers:
             if line.quantity >= tier["min_quantity"]:
                 chosen = tier["price"]
@@ -516,7 +524,7 @@ def create_document(payload: DocCreateIn, request: Request, user: dict[str, Any]
                 raise HTTPException(status_code=404, detail=f"明细第 {i} 行货品不存在")
             uom_id = _line_uom_id(conn, line)
             price = _resolve_price(conn, payload.doc_type, line, product)
-            amount = (line.quantity * price).quantize(Decimal("0.01"))
+            amount = _line_amount(line, price)
             total += amount
             line_rows.append((i, line, product, uom_id, price, amount))
         doc_no = _next_doc_no(conn, payload.doc_type)
@@ -572,7 +580,7 @@ def update_document(document_id: int, payload: DocUpdateIn, request: Request, us
                     raise HTTPException(status_code=404, detail=f"明细第 {i} 行货品不存在")
                 uom_id = _line_uom_id(conn, line)
                 price = _resolve_price(conn, doc["doc_type"], line, product)
-                amount = (line.quantity * price).quantize(Decimal("0.01"))
+                amount = _line_amount(line, price)
                 total += amount
                 line_rows.append((i, line, product, uom_id, price, amount))
         values = payload.model_dump(exclude_unset=True, exclude={"lines", "version"})

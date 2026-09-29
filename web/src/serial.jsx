@@ -3,7 +3,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import api from './api'
 import DataTable, { toServerFilters } from './data-table'
 import { prepareImage } from './image-utils'
-import { Back, Badge, Button, Empty, ErrorBox, Loading, PageHeading, useRouter } from './ui'
+import { Back, Badge, Button, Empty, ErrorBox, Loading, PageHeading, useFetchOne, useRouter } from './ui'
 
 const EVENT_LABELS = {
   observed: '观测', received: '入库', issued: '出库', transferred: '调拨', returned: '退回',
@@ -13,6 +13,8 @@ const EVENT_LABELS = {
 const eventLabel = (t) => EVENT_LABELS[t] || t || '—'
 
 const STATUS_TONE = { active: 'teal', retired: 'neutral', lost: 'red' }
+const STATUS_LABELS = { active: '在库', retired: '已出库', lost: '遗失' }
+const statusLabel = code => STATUS_LABELS[code] || code || '—'
 
 // ---------------------------------------------------------------------------
 // 行内 SN 登记组件：textarea（扫码/粘贴，回车换行）+ OCR 识别 + Excel 导入 + 预检
@@ -97,7 +99,7 @@ export function SerialLedger() {
     { key: 'serial_number', label: '序列号', filterType: 'search' },
     { key: 'product_name', label: '货品' },
     { key: 'current_location_name', label: '当前库位' },
-    { key: 'status_code', label: '状态' },
+    { key: 'status_code', label: '状态', render: r => statusLabel(r.status_code) },
     { key: 'latest_event_type', label: '最近事件' },
     { key: 'latest_event_date', label: '最近日期' },
   ], [])
@@ -123,9 +125,8 @@ export function SerialLedger() {
 // ---------------------------------------------------------------------------
 export function SerialDetail({ id }) {
   const { navigate } = useRouter()
-  const [data, setData] = useState(null); const [error, setError] = useState(null)
-  useEffect(() => { api.serialAsset(id).then(setData).catch(setError) }, [id])
+  const { data, error } = useFetchOne(() => api.serialAsset(id), [id])
   if (error) return <section><Back to="/serials" /><ErrorBox error={error} /></section>
   if (!data) return <Loading />
-  return <section><Back to="/serials" /><PageHeading eyebrow="序列台账" title={data.primary_identifier || `资产 ${data.asset_id}`} description={data.product_name ? `${data.product_name} · ${data.status_code || '—'}` : data.status_code || '—'}><Badge tone={STATUS_TONE[data.status_code] || 'neutral'}>{data.status_code || '—'}</Badge></PageHeading><div className="detail-grid"><div className="panel"><h2>当前状态</h2><dl className="detail-list"><dt>货品</dt><dd>{data.product_name || '—'}</dd><dt>序列号</dt><dd>{data.primary_identifier || '—'}</dd><dt>当前库位</dt><dd>{data.current_location_name || '—'}</dd><dt>成色</dt><dd>{data.condition_code || '—'}</dd><dt>最近事件</dt><dd>{eventLabel(data.latest_event_type)}{data.latest_event_date ? ` · ${data.latest_event_date}` : ''}</dd></dl></div><div className="panel"><h2>流向历史</h2>{data.events?.length ? <div className="record-list">{data.events.map(e => <div className="record-card" key={e.asset_event_id}><div><strong>{eventLabel(e.event_type)}</strong><span>{e.from_location_name || '—'} → {e.to_location_name || '—'}</span></div><div className="record-value"><b>{e.event_date}</b><small>{e.doc_no ? `${e.doc_no} · ${e.doc_type || ''}` : (e.notes || '')}</small></div></div>)}</div> : <Empty>暂无流向记录</Empty>}</div></div><div className="panel"><h2>标识</h2><div className="tag-list">{(data.identifiers || []).map(x => <Badge key={`${x.identifier_type}-${x.value_raw}`} tone="neutral">{x.value_raw}</Badge>)}</div></div></section>
+  return <section><Back to="/serials" /><PageHeading eyebrow="序列台账" title={data.primary_identifier || `资产 ${data.asset_id}`} description={data.product_name ? `${data.product_name} · ${statusLabel(data.status_code)}` : statusLabel(data.status_code)}><Badge tone={STATUS_TONE[data.status_code] || 'neutral'}>{statusLabel(data.status_code)}</Badge></PageHeading><div className="detail-grid"><div className="panel"><h2>当前状态</h2><dl className="detail-list"><dt>货品</dt><dd>{data.product_name || '—'}</dd><dt>序列号</dt><dd>{data.primary_identifier || '—'}</dd><dt>当前库位</dt><dd>{data.current_location_name || '—'}</dd><dt>成色</dt><dd>{data.condition_code || '—'}</dd><dt>最近事件</dt><dd>{eventLabel(data.latest_event_type)}{data.latest_event_date ? ` · ${data.latest_event_date}` : ''}</dd></dl></div><div className="panel"><h2>流向历史</h2>{data.events?.length ? <div className="record-list">{data.events.map(e => <div className="record-card" key={e.asset_event_id}><div><strong>{eventLabel(e.event_type)}</strong><span>{e.from_location_name || '—'} → {e.to_location_name || '—'}</span></div><div className="record-value"><b>{e.event_date}</b><small>{e.doc_no ? `${e.doc_no} · ${e.doc_type || ''}` : (e.notes || '')}</small></div></div>)}</div> : <Empty>暂无流向记录</Empty>}</div></div><div className="panel"><h2>标识</h2><div className="tag-list">{(data.identifiers || []).map(x => <Badge key={`${x.identifier_type}-${x.value_raw}`} tone="neutral">{x.value_raw}</Badge>)}</div></div></section>
 }

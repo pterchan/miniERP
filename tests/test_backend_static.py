@@ -13,7 +13,7 @@ SEED = (ROOT / "scripts/seed_inventory.py").read_text(encoding="utf-8")
 class BackendContractTests(unittest.TestCase):
     def test_approval_and_audit_tables(self):
         for table in ("app_user", "app_session", "audit_event", "stock_request", "stock_request_line", "stock_request_action"):
-            self.assertIn(f"CREATE TABLE {table} (", DDL)
+            self.assertIn(f"CREATE TABLE IF NOT EXISTS {table} (", DDL)
         self.assertIn("audit_event_immutable_trg", DDL)
         self.assertIn("production write requires app.actor_id", DDL)
 

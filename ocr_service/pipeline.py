@@ -44,7 +44,7 @@ def _line_center_y(line: dict[str, Any]) -> float:
     return statistics.fmean(float(point[1]) for point in line["polygon"])
 
 
-def _run_backend(backend: object, image: object, width: int, height: int, scale: float, prefix: str = "line", source_variant: str = "raw", map_back: Any = None, offset: tuple[float, float] = (0.0, 0.0)) -> list[dict[str, Any]]:
+def _run_backend(backend: object, image: object, scale: float, prefix: str = "line", source_variant: str = "raw", map_back: Any = None, offset: tuple[float, float] = (0.0, 0.0)) -> list[dict[str, Any]]:
     raw = backend.recognize(_as_array(image))
     output: list[dict[str, Any]] = []
     for index, item in enumerate(raw.lines):
@@ -91,8 +91,6 @@ def _replace_low_confidence_regions(lines: list[dict[str, Any]], groups: list[li
             candidate = _run_backend(
                 backend,
                 variant.image,
-                crop.width,
-                crop.height,
                 1.0,
                 prefix=f"{label_id}-{variant.source_variant}",
                 source_variant=variant.source_variant,
@@ -117,7 +115,7 @@ def extract_from_image(image_info: Any, request_id: str, backend: object) -> Ext
     image = image_info.image
     width, height = image_info.width, image_info.height
     working, scale = resize_for_detection(image)
-    lines = _run_backend(backend, working, working.width, working.height, scale)
+    lines = _run_backend(backend, working, scale)
     groups = _assign_labels(lines, width, height)
     _replace_low_confidence_regions(lines, groups, image, width, height, backend)
     lines.sort(key=lambda line: (_line_center_y(line), line["polygon"][0][0]))

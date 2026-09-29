@@ -18,15 +18,15 @@ ROLES_JS = (ROOT / "web/src/roles.js").read_text(encoding="utf-8")
 class ERPContractTests(unittest.TestCase):
     def test_full_erp_tables_and_sequences(self):
         for token in (
-            "CREATE TABLE business_document (",
-            "CREATE TABLE business_document_line (",
-            "CREATE TABLE ar_ap_entry (",
-            "CREATE TABLE document_attachment (",
-            "CREATE TABLE product_category (",
-            "CREATE TABLE customer (",
-            "CREATE TABLE supplier (",
-            "CREATE TABLE product_price_tier (",
-            "CREATE TABLE department (",
+            "CREATE TABLE IF NOT EXISTS business_document (",
+            "CREATE TABLE IF NOT EXISTS business_document_line (",
+            "CREATE TABLE IF NOT EXISTS ar_ap_entry (",
+            "CREATE TABLE IF NOT EXISTS document_attachment (",
+            "CREATE TABLE IF NOT EXISTS product_category (",
+            "CREATE TABLE IF NOT EXISTS customer (",
+            "CREATE TABLE IF NOT EXISTS supplier (",
+            "CREATE TABLE IF NOT EXISTS product_price_tier (",
+            "CREATE TABLE IF NOT EXISTS department (",
             "CREATE SEQUENCE IF NOT EXISTS document_no_seq",
             "app_user_role_check",
         ):

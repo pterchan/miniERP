@@ -18,7 +18,7 @@ NGINX = (ROOT / "web/nginx.conf").read_text(encoding="utf-8")
 
 class ImageFeatureContractTests(unittest.TestCase):
     def test_migration_defines_product_image_with_audit_trigger(self):
-        self.assertIn("CREATE TABLE product_image", MIGRATION)
+        self.assertIn("CREATE TABLE IF NOT EXISTS product_image", MIGRATION)
         self.assertIn("object_key", MIGRATION)
         self.assertIn("REFERENCES product(product_id) ON DELETE CASCADE", MIGRATION)
         self.assertIn("size          INTEGER NOT NULL CHECK (size >= 0 AND size <= 20971520)", MIGRATION)

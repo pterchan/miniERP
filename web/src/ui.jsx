@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useRef, useState } from 'react'
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { isNavigationItemActive } from './navigation-utils'
 import { withBasePath } from './app-path'
 
@@ -76,6 +76,32 @@ export function useDirtyLeaveGuard(dirty) {
     return () => window.removeEventListener('beforeunload', handler)
   }, [dirty])
   useEffect(() => registerDirtyLeave(() => (dirty ? window.confirm('有未保存的修改，确定离开？') : true)), [dirty])
+}
+
+/** 详情页统一数据拉取：竞态守卫（慢响应后到不覆盖新数据）+ 卸载不写入。 */
+export function useFetchOne(fetch, deps) {
+  const [data, setData] = useState(null)
+  const [error, setError] = useState(null)
+  useEffect(() => {
+    let active = true
+    setData(null)
+    setError(null)
+    fetch().then(result => { if (active) setData(result) }).catch(err => { if (active) setError(err) })
+    return () => { active = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps)
+  return { data, error }
+}
+
+/** 表单防重复提交：连点只发一次；返回 [busy, wrap]，wrap 包裹 async 保存函数。 */
+export function useBusy() {
+  const [busy, setBusy] = useState(false)
+  const wrap = useCallback(async fn => {
+    if (busy) return undefined
+    setBusy(true)
+    try { return await fn() } finally { setBusy(false) }
+  }, [busy])  // eslint-disable-line react-hooks/exhaustive-deps
+  return [busy, wrap]
 }
 
 export function useIsMobile(query = '(max-width: 760px)') {
