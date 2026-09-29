@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
 from decimal import Decimal
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +15,7 @@ from . import documents, images, master, reports, serial_tracking
 from .db import audit, connection, ensure_bootstrap_users, fetch_all, fetch_one
 from .export import export_response, export_rows_by_ids
 from .list_params import clamp_page, clamp_page_size, parse_composite_ids, parse_filters, parse_ids, parse_sort
-from .helpers import _condition_id, _line_uom_id, _movement_id, _normalize_identifier, _normalize_query, _request_meta, _status_id
+from .helpers import _condition_id, _line_uom_id, _movement_id, _normalize_identifier, _normalize_query, _request_meta, _status_id, lock_products
 from .ocr_client import OCRProxyError, forward_ocr
 from .permissions import CSRF_COOKIE, SESSION_COOKIE, _csrf, require_roles, require_user
 from .search import fuzzy_search, normalize_search
@@ -166,15 +168,88 @@ def ocr_extract(payload: OCRExtractIn, request: Request, user: dict[str, Any] = 
         raise HTTPException(status_code=exc.status_code, detail=exc.detail, headers=headers) from exc
 
 
+# ---------------------------------------------------------------------------
+# 登录加固：Origin 校验（防 login CSRF）、失败锁定（防在线爆破）、失败审计
+# ---------------------------------------------------------------------------
+
+LOGIN_FAIL_LIMIT = 5
+LOGIN_LOCKOUT_MINUTES = 15
+_DUMMY_PASSWORD_HASH: str | None = None
+
+
+def _require_same_origin(request: Request) -> None:
+    """浏览器跨站表单不允许打登录接口（login CSRF）；非浏览器客户端无 Origin 放行。"""
+    origin = request.headers.get("origin") or request.headers.get("referer")
+    if not origin:
+        return
+    host = request.headers.get("host")
+    parsed = urlparse(origin)
+    if not host or parsed.netloc != host:
+        raise HTTPException(status_code=403, detail="登录请求来源与当前站点不一致")
+
+
+def _username_hash(value: str) -> str:
+    return hashlib.sha256(("login-throttle:" + value.casefold()).encode()).hexdigest()
+
+
+def _login_locked(conn: Any, username: str, ip_address: str | None) -> bool:
+    row = fetch_one(conn, """SELECT count(*) AS n FROM login_attempt
+                              WHERE NOT succeeded AND attempted_at > now() - make_interval(mins => %s)
+                                AND (username_hash=%s OR (%s IS NOT NULL AND ip_address=%s))""",
+                    (LOGIN_LOCKOUT_MINUTES, _username_hash(username), ip_address, ip_address))
+    return bool(row) and int(row["n"]) >= LOGIN_FAIL_LIMIT
+
+
+def _record_login_attempt(conn: Any, username: str, meta: dict[str, Any], succeeded: bool) -> None:
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO login_attempt(username_hash,ip_address,succeeded) VALUES (%s,%s,%s)",
+                    (_username_hash(username), meta["ip_address"], succeeded))
+    if not succeeded:
+        # 失败也必须落审计，否则爆破行为在审计日志中不可见
+        audit(conn, None, "LOGIN_FAIL", "login_attempt",
+              after={"username_hash": _username_hash(username), "ip_address": meta["ip_address"]},
+              request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
+
+
+def _verify_dummy_password(password: str) -> bool:
+    """用户不存在时也执行一次真实哈希验证，消除用户名枚举时序差。"""
+    global _DUMMY_PASSWORD_HASH
+    if _DUMMY_PASSWORD_HASH is None:
+        _DUMMY_PASSWORD_HASH = hash_password("timing-equalizer-dummy-1")
+    return verify_password(password, _DUMMY_PASSWORD_HASH)
+
+
+def _revoke_sessions(conn: Any, user_id: int, actor: dict[str, Any] | None, keep_token_hash: str | None, reason: str) -> None:
+    """撤销用户会话（可保留当前会话）。app_session 有审计触发器，先审计再更新。"""
+    audit(conn, actor, "REVOKE_SESSIONS", "app_session", target_id=user_id, after={"reason": reason})
+    with conn.cursor() as cur:
+        if keep_token_hash:
+            cur.execute("UPDATE app_session SET revoked_at=now() WHERE user_id=%s AND token_hash<>%s AND revoked_at IS NULL",
+                        (user_id, keep_token_hash))
+        else:
+            cur.execute("UPDATE app_session SET revoked_at=now() WHERE user_id=%s AND revoked_at IS NULL", (user_id,))
+
+
 @app.post("/api/auth/login")
 def login(payload: LoginIn, response: Response, request: Request) -> dict[str, Any]:
+    _require_same_origin(request)
+    meta = _request_meta(request)
+    username = payload.username.strip()
     with connection() as conn:
-        user_row = fetch_one(conn, "SELECT * FROM app_user WHERE username=%s AND is_active", (payload.username.strip(),))
-        if not user_row or not verify_password(payload.password, user_row["password_hash"]):
-            raise HTTPException(status_code=401, detail="用户名或密码错误")
-        session_token = random_token()
-        csrf_token = random_token()
-        meta = _request_meta(request)
+        if _login_locked(conn, username, meta["ip_address"]):
+            raise HTTPException(status_code=429, detail="尝试次数过多，请稍后再试",
+                                headers={"Retry-After": str(LOGIN_LOCKOUT_MINUTES * 60)})
+        user_row = fetch_one(conn, "SELECT * FROM app_user WHERE username=%s AND is_active", (username,))
+    password_ok = verify_password(payload.password, user_row["password_hash"]) if user_row else _verify_dummy_password(payload.password)
+    if not user_row or not password_ok:
+        # 失败记录必须独立提交：401 抛出会回滚同事务的写入，爆破会因此不可见
+        with connection() as conn:
+            _record_login_attempt(conn, username, meta, False)
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    session_token = random_token()
+    csrf_token = random_token()
+    with connection() as conn:
+        _record_login_attempt(conn, username, meta, True)
         audit(conn, {"user_id": user_row["user_id"], "role": user_row["role"]}, "LOGIN", "app_session", request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
         with conn.cursor() as cur:
             cur.execute("INSERT INTO app_session(user_id,token_hash,csrf_token_hash,expires_at) VALUES (%s,%s,%s,%s)", (user_row["user_id"], token_hash(session_token), token_hash(csrf_token), utc_after()))
@@ -216,6 +291,8 @@ def change_password(payload: ChangePasswordIn, request: Request, user: dict[str,
               request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
         with conn.cursor() as cur:
             cur.execute("UPDATE app_user SET password_hash=%s,updated_at=now() WHERE user_id=%s", (hash_password(payload.new_password), user["user_id"]))
+        # 改密后撤销其它会话（保留当前），终结可能已被盗的旧会话
+        _revoke_sessions(conn, user["user_id"], user, token_hash(request.cookies.get(SESSION_COOKIE) or ""), "password_changed")
     return {"status": "ok"}
 
 
@@ -623,7 +700,8 @@ def adjust_inventory(payload: InventoryAdjustIn, request: Request, user: dict[st
     _csrf(request)
     meta = _request_meta(request)
     with connection() as conn:
-        product = fetch_one(conn, "SELECT * FROM product WHERE product_id=%s FOR UPDATE", (payload.product_id,))
+        locked = lock_products(conn, [payload.product_id])
+        product = locked[0] if locked else None
         if not product:
             raise HTTPException(status_code=404, detail="货品不存在")
         if not fetch_one(conn, "SELECT location_id FROM location WHERE location_id=%s AND is_active", (payload.location_id,)):
@@ -854,6 +932,8 @@ def update_user(user_id: int, payload: UserUpdateIn, request: Request, user: dic
                 cur.execute("""UPDATE app_user SET display_name=%s,role=%s,is_active=%s,password_hash=%s,updated_at=now() WHERE user_id=%s""", (after["display_name"].strip(), after["role"], after["is_active"], hash_password(values["password"]), user_id))
             else:
                 cur.execute("""UPDATE app_user SET display_name=%s,role=%s,is_active=%s,updated_at=now() WHERE user_id=%s""", (after["display_name"].strip(), after["role"], after["is_active"], user_id))
+        if "password" in values:
+            _revoke_sessions(conn, user_id, user, None, "password_updated_by_admin")
     return user_detail(user_id, user)
 
 
@@ -871,6 +951,8 @@ def reset_user_password(user_id: int, payload: UserUpdateIn, request: Request, u
         audit(conn, user, "RESET_PASSWORD", "app_user", target_id=user_id, before={"user_id": user_id}, after={"user_id": user_id}, request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
         with conn.cursor() as cur:
             cur.execute("UPDATE app_user SET password_hash=%s,updated_at=now() WHERE user_id=%s", (hash_password(payload.password), user_id))
+        # 管理员重置后目标用户全部会话失效
+        _revoke_sessions(conn, user_id, user, None, "password_reset_by_admin")
     return user_detail(user_id, user)
 
 

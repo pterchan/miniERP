@@ -49,6 +49,21 @@ def _movement_id(conn: Any, code: str) -> int:
     return int(row["movement_type_id"])
 
 
+def lock_products(conn: Any, product_ids: Any) -> list[dict[str, Any]]:
+    """按 product_id 升序对 product 行加 FOR UPDATE 锁并返回行数据。
+
+    同一货品的并发过账/清点/调整都先走这里串行化，防止「读账面数→写调整」
+    之间的丢失更新；升序加锁避免交叉死锁。
+    """
+    ids = sorted({int(p) for p in product_ids if p is not None})
+    if not ids:
+        return []
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM product WHERE product_id = ANY(%s) ORDER BY product_id FOR UPDATE", (ids,))
+        columns = [d.name for d in cur.description]
+        return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
 def _condition_id(conn: Any, value: int | None) -> int:
     if value:
         return value

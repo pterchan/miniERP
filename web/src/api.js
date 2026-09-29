@@ -18,6 +18,18 @@ function csrfToken() {
   return m ? decodeURIComponent(m) : ''
 }
 
+/** 列表查询串统一构造：数组参数逐项重复（f=a&f=b），空值剔除，其余标量透传。
+ * products / documents / serialLedger 共用，禁止各处手拼 URLSearchParams 漂移。 */
+export function buildListQuery(query = {}) {
+  const sp = new URLSearchParams()
+  Object.entries(query).forEach(([key, value]) => {
+    if (value == null || value === '' || key === 'signal' || key === 'timeoutMs') return
+    if (Array.isArray(value)) { value.forEach(item => sp.append(key, item)); return }
+    sp.set(key, String(value))
+  })
+  return sp.toString()
+}
+
 const api = {
   async request(path, options = {}) {
     const { timeoutMs = 15000, signal, ...rest } = options
@@ -106,15 +118,8 @@ const api = {
   products: (q = '', page = 1, pageSize = 30, options = {}) => {
     // 兼容旧调用 products(q)/products(q,page,size)；传对象时按 DataTable 参数构造。
     if (typeof q === 'object' && q !== null) {
-      const p = q
-      const sp = new URLSearchParams()
-      if (p.q) sp.set('q', p.q)
-      if (p.page) sp.set('page', p.page)
-      if (p.page_size) sp.set('page_size', p.page_size)
-      if (p.sort) sp.set('sort', p.sort)
-      if (p.order) sp.set('order', p.order)
-      ;(p.f || []).forEach(x => sp.append('f', x))
-      return api.request(`/products?${sp.toString()}`, { signal: p.signal })
+      const { signal, ...query } = q
+      return api.request(`/products?${buildListQuery(query)}`, { signal })
     }
     return api.request(`/products?q=${encodeURIComponent(q)}&page=${page}&page_size=${pageSize}`, options)
   },
@@ -147,7 +152,7 @@ const api = {
   // 进销存单据
   documents: (params = {}) => {
     const { signal, timeoutMs, ...query } = params
-    return api.request(`/documents?${new URLSearchParams(Object.entries(query).filter(([, v]) => v !== '' && v != null)).toString()}`, { signal, timeoutMs })
+    return api.request(`/documents?${buildListQuery(query)}`, { signal, timeoutMs })
   },
   document: (id) => api.request(`/documents/${id}`),
   createDocument: (payload) => api.request('/documents', { method: 'POST', body: JSON.stringify(payload) }),
@@ -199,14 +204,7 @@ const api = {
   // 序列台账（SN 追踪）
   serialLedger: (params = {}) => {
     const { signal, ...query } = params
-    const sp = new URLSearchParams()
-    if (query.q) sp.set('q', query.q)
-    if (query.page) sp.set('page', query.page)
-    if (query.page_size) sp.set('page_size', query.page_size)
-    if (query.sort) sp.set('sort', query.sort)
-    if (query.order) sp.set('order', query.order)
-    ;(query.f || []).forEach(x => sp.append('f', x))
-    return api.request(`/serial-ledger?${sp.toString()}`, { signal })
+    return api.request(`/serial-ledger?${buildListQuery(query)}`, { signal })
   },
   serialAsset: (id) => api.request(`/serial-ledger/${id}`),
   parseSerials: (payload) => api.request('/serial-ledger/parse', { method: 'POST', body: JSON.stringify(payload) }),

@@ -56,7 +56,7 @@ class StockRequestIn(BaseModel):
     reason: str | None = None
     # Drafts may be created before the requester has selected a product.
     # Submission performs the at-least-one-valid-line check server-side.
-    lines: list[RequestLineIn] = Field(default_factory=list)
+    lines: list[RequestLineIn] = Field(default_factory=list, max_length=2000)
 
 
 class ProductIn(BaseModel):
@@ -205,7 +205,7 @@ class InventoryAdjustIn(BaseModel):
     change_default_unit: bool = False
     source_uom_raw: str | None = None
     notes: str | None = None
-    serial_numbers: list[str] | None = None  # 可选 SN 清单；启用 SN 的货品填了则按件校验
+    serial_numbers: list[str] | None = Field(default=None, max_length=2000)  # 可选 SN 清单；启用 SN 的货品填了则按件校验
 
     @field_validator("counted_quantity")
     @classmethod
@@ -227,7 +227,7 @@ class UomIn(BaseModel):
 class OCRExtractIn(BaseModel):
     # The OCR service owns MIME validation so unsupported values map to 415.
     media_type: str = Field(min_length=1, max_length=100)
-    image_base64: str = Field(min_length=16)
+    image_base64: str = Field(min_length=16, max_length=20_000_000)  # ~15MB 原图的 base64 长度上限
 
     @field_validator("image_base64")
     @classmethod
@@ -248,7 +248,7 @@ class DocLineIn(BaseModel):
     price: Decimal | None = Field(default=None, ge=0)
     counted_quantity: Decimal | None = None  # STOCK_COUNT only
     notes: str | None = None
-    serial_numbers: list[str] | None = None  # 可选 SN 登记；过账时按 (product, SN) 写资产事件
+    serial_numbers: list[str] | None = Field(default=None, max_length=2000)  # 可选 SN 登记；过账时按 (product, SN) 写资产事件
 
     _q = field_validator("quantity")(_qty_scale)
     _cq = field_validator("counted_quantity")(_qty_scale)
@@ -263,7 +263,7 @@ class DocCreateIn(BaseModel):
     destination_location_id: int | None = None
     deposit_amount: Decimal | None = Field(default=None, ge=0)
     notes: str | None = None
-    lines: list[DocLineIn] = Field(default_factory=list)
+    lines: list[DocLineIn] = Field(default_factory=list, max_length=2000)
 
     _d = field_validator("deposit_amount")(_money_scale)
 
@@ -296,7 +296,7 @@ class AttachmentIn(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     content_type: str = Field(min_length=1, max_length=200)
     size: int = Field(gt=0, le=10 * 1024 * 1024)
-    data_base64: str = Field(min_length=16)
+    data_base64: str = Field(min_length=16, max_length=14_000_000)  # 10MB 原始数据的 base64 长度上限
 
     @field_validator("data_base64")
     @classmethod

@@ -56,8 +56,13 @@ class ImageFeatureContractTests(unittest.TestCase):
         self.assertIn("SERVER_MAX_EDGE = 1600", IMAGE_UTILS)
         self.assertIn("SERVER_MAX_BYTES = 700 * 1024", IMAGE_UTILS)
         self.assertIn("ImageOps.exif_transpose", IMAGE_UTILS)
-        # 附件（documents.py）与货品附图（images.py）共用同一套媒体工具
-        self.assertIn("from .image_utils import _reencode_to_cap, _sniff_image_type", DOCS)
+        # 附件（documents.py）与货品附图（images.py）共用同一套媒体工具；
+        # 解码必须走统一入口（解码前像素上限），超限 422 而非回退存原图
+        self.assertIn("from .image_utils import ImageTooLargeError, _reencode_to_cap, _sniff_image_type", DOCS)
+        self.assertIn("from .image_utils import ImageTooLargeError", IMAGES)
+        self.assertIn("MAX_IMAGE_PIXELS = 20_000_000", IMAGE_UTILS)
+        self.assertIn("except ImageTooLargeError", IMAGES)
+        self.assertIn("except ImageTooLargeError", DOCS)
 
     def test_object_key_never_serialized(self):
         # 客户端响应不得含 object_key/bucket

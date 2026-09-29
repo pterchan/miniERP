@@ -23,7 +23,7 @@
 | 货品 | `/api/products` | 列表 `q`/模糊搜索、`stock`、`export`、详情、POST、PUT | 搜索命中不佳时回退模糊匹配（`api/search.py`） |
 | 库存 | `/api/inventory` | GET `balance`、`balance/export`、`balance/{product}/{location}/{condition}/{uom}`、POST `adjust` | 清点=按实盘数覆写，写调整流水 |
 | 单位/库位 | `/api/uoms`、`/api/locations` | 列表/导出/详情/增改 | |
-| 业务单据 | `/api/documents` | 列表、`export`、详情、POST、PUT、`submit`、`post`、`reverse`、`attachments` | 采购/销售/库存 11 种 `doc_type` 通用引擎；过账写不可变流水 + 往来台账，红冲净额归零 |
+| 业务单据 | `/api/documents` | 列表、`export`、详情、POST、PUT、`submit`、`withdraw`、`reject`、`post`、`reverse`、`attachments` | 采购/销售/库存 11 种 `doc_type` 通用引擎；过账写不可变流水 + 往来台账，红冲净额归零 |
 | 附件 | `/api/attachments/{id}` | GET 下载 | 单据附件 BYTEA 存库；上传走单据的 `attachments` 端点 |
 | 货品图片 | `/api/products/{id}/images`、`/api/product-images/{image_id}` | 列表/上传/取图/改排序/删除 | 字节存 MinIO，单图 ≤20MB |
 | 主数据 | `/api` | `categories`、`customers`、`suppliers`、`departments`、`products/{id}/price-tiers` | 各带导出/增改 |

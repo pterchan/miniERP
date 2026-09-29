@@ -7,6 +7,7 @@ posts the inverse movements/entries so the ledger nets to zero.
 
 from __future__ import annotations
 
+import os
 from datetime import date
 from decimal import Decimal
 from typing import Any
@@ -16,9 +17,9 @@ from psycopg2 import Binary
 
 from .db import audit, connection, fetch_all, fetch_one
 from .export import attachment_disposition, export_response
-from .image_utils import _reencode_to_cap, _sniff_image_type
+from .image_utils import ImageTooLargeError, _reencode_to_cap, _sniff_image_type
 from .list_params import clamp_page, clamp_page_size, parse_filters, parse_ids, parse_sort
-from .helpers import _condition_id, _line_uom_id, _movement_id, _request_meta, _status_id
+from .helpers import _condition_id, _line_uom_id, _movement_id, _request_meta, _status_id, lock_products
 from .permissions import DOC_TYPE_META, GROUP_META, _can_post, _csrf, require_user
 from .schemas import DocCreateIn, DocSubmitIn, DocUpdateIn
 from .serial_tracking import apply_line_serials, reverse_movement_serials
@@ -143,6 +144,25 @@ def _doc_detail(conn: Any, document_id: int, user: dict[str, Any]) -> dict[str, 
     return row
 
 
+def _forbid_negative_stock() -> bool:
+    """ERP_FORBID_NEGATIVE_STOCK=1 时出库/调拨/红冲反向移动前校验余额（默认允许负库存）。"""
+    return os.environ.get("ERP_FORBID_NEGATIVE_STOCK", "0") == "1"
+
+
+def _require_sufficient_stock(conn: Any, line: dict[str, Any], location_id: int | None, quantity: Decimal) -> None:
+    """开关开启时校验 (product, location, condition, uom) 余额足够，不足 422。"""
+    if not _forbid_negative_stock() or location_id is None:
+        return
+    condition_id = _condition_id(conn, line.get("condition_id"))
+    row = fetch_one(conn, """SELECT on_hand_quantity FROM v_inventory_balance
+                              WHERE product_id=%s AND location_id=%s AND condition_id=%s AND uom_id=%s""",
+                    (line["product_id"], location_id, condition_id, line["uom_id"]))
+    on_hand = Decimal(row["on_hand_quantity"]) if row else Decimal(0)
+    if on_hand < quantity:
+        raise HTTPException(status_code=422,
+                            detail=f"库存不足：货品在库位 {location_id} 现存量 {on_hand}，本次需要 {quantity}（已启用禁止超卖）")
+
+
 def _resolve_locations(conn: Any, doc: dict[str, Any], line: dict[str, Any], meta: dict[str, Any]) -> tuple[int | None, int | None]:
     """Return (source_location_id, destination_location_id) for posting a line."""
     source = line["source_location_id"] or doc["source_location_id"]
@@ -205,11 +225,13 @@ def _post_line(conn: Any, user: dict[str, Any], req_meta: dict[str, Any], doc: d
     stock = meta["stock_effect"]
     if stock == "COUNT":
         condition_id = _condition_id(conn, line["condition_id"])
+        counted = Decimal(line["counted_quantity"]) if line["counted_quantity"] is not None else Decimal(line["quantity"])
+        if counted < 0:
+            raise HTTPException(status_code=422, detail="盘点实盘数不能为负")
         balance = fetch_one(conn, """SELECT on_hand_quantity FROM v_inventory_balance
                                       WHERE product_id=%s AND location_id=%s AND condition_id=%s AND uom_id=%s""",
                             (line["product_id"], source, condition_id, line["uom_id"]))
         book = Decimal(balance["on_hand_quantity"]) if balance else Decimal(0)
-        counted = Decimal(line["counted_quantity"]) if line["counted_quantity"] is not None else Decimal(line["quantity"])
         audit(conn, user, "COUNT_BOOK", "business_document_line", target_id=line["document_line_id"],
               after={"book_quantity": str(book), "counted_quantity": str(counted)},
               request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
@@ -217,12 +239,16 @@ def _post_line(conn: Any, user: dict[str, Any], req_meta: dict[str, Any], doc: d
             cur.execute("UPDATE business_document_line SET book_quantity=%s WHERE document_line_id=%s", (book, line["document_line_id"]))
         delta = counted - book
         if delta != 0:
+            if delta < 0:
+                _require_sufficient_stock(conn, line, source, abs(delta))
             _insert_movement(conn, user, req_meta, "ADJUSTMENT", doc, line, abs(delta),
                              source if delta < 0 else None, source if delta > 0 else None)
         return
     if stock in ("IN", "OUT", "TRANSFER"):
         movement_code = MOVEMENT_FOR_DOC[doc["doc_type"]]
         qty = line["quantity"]
+        if stock in ("OUT", "TRANSFER"):
+            _require_sufficient_stock(conn, line, source, qty)
         if stock == "IN":
             movement_id = _insert_movement(conn, user, req_meta, movement_code, doc, line, qty, None, dest)
         elif stock == "OUT":
@@ -254,6 +280,8 @@ def _post_document(conn: Any, document_id: int, user: dict[str, Any], req_meta: 
     lines = fetch_all(conn, "SELECT * FROM business_document_line WHERE document_id=%s ORDER BY line_no", (document_id,))
     if not lines:
         raise HTTPException(status_code=422, detail="单据至少需要一条明细")
+    # 对涉及货品加行锁：串行化并发的出库/入库/盘点，防止读账面数与写调整之间丢失更新
+    lock_products(conn, [line["product_id"] for line in lines])
     locations: dict[int, tuple[int | None, int | None]] = {}
     for line in lines:
         locations[line["document_line_id"]] = _resolve_locations(conn, doc, line, meta)
@@ -279,6 +307,15 @@ def _reverse_document(conn: Any, document_id: int, user: dict[str, Any], req_met
     if doc["reversal_of_document_id"]:
         raise HTTPException(status_code=409, detail="红冲单据不能再红冲")
     _can_post(user, doc, False)
+    movements = fetch_all(conn, """SELECT * FROM inventory_movement
+                                    WHERE document_id=%s AND status_id=(SELECT status_id FROM record_status WHERE code='posted')""", (document_id,))
+    # 红冲前先锁货品行并（开关开启时）校验反向出库侧余额，避免打出无解释的负库存
+    lock_products(conn, [m["product_id"] for m in movements])
+    if _forbid_negative_stock():
+        for m in movements:
+            reverse_source = m["destination_location_id"]
+            if reverse_source is not None:
+                _require_sufficient_stock(conn, m, reverse_source, m["quantity"])
     # 原单标记红冲
     audit(conn, user, "REVERSE", "business_document", target_id=document_id,
           before={"status": "POSTED"}, after={"status": "REVERSED"},
@@ -309,8 +346,6 @@ def _reverse_document(conn: Any, document_id: int, user: dict[str, Any], req_met
                          ol["condition_id"], ol["source_location_id"], ol["destination_location_id"], ol["counted_quantity"], ol["book_quantity"], ol["serial_numbers"], ol["notes"]))
     # 反向库存流水：换反向类型 + 对调库位
     mtype_codes = {int(r["movement_type_id"]): r["code"] for r in fetch_all(conn, "SELECT movement_type_id, code FROM movement_type")}
-    movements = fetch_all(conn, """SELECT * FROM inventory_movement
-                                    WHERE document_id=%s AND status_id=(SELECT status_id FROM record_status WHERE code='posted')""", (document_id,))
     for m in movements:
         code = mtype_codes.get(int(m["movement_type_id"]), "ADJUSTMENT")
         inv = INVERSE_MOVEMENT.get(code, code)
@@ -587,6 +622,48 @@ def submit_document(document_id: int, request: Request, user: dict[str, Any] = D
         return _doc_detail(conn, document_id, user)
 
 
+@router.post("/{document_id}/withdraw")
+def withdraw_document(document_id: int, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+    """创建人撤回已提交单据（SUBMITTED→DRAFT），可修改后重新提交。"""
+    _csrf(request)
+    req_meta = _request_meta(request)
+    with connection() as conn:
+        doc = fetch_one(conn, "SELECT * FROM business_document WHERE document_id=%s FOR UPDATE", (document_id,))
+        if not doc:
+            raise HTTPException(status_code=404, detail="单据不存在")
+        if int(doc["created_by"]) != int(user["user_id"]):
+            raise HTTPException(status_code=403, detail="仅创建人可撤回；管理员请使用驳回")
+        if doc["status"] != "SUBMITTED":
+            raise HTTPException(status_code=409, detail="仅已提交单据可撤回")
+        audit(conn, user, "WITHDRAW", "business_document", target_id=document_id,
+              before={"status": "SUBMITTED"}, after={"status": "DRAFT"},
+              request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
+        with conn.cursor() as cur:
+            cur.execute("UPDATE business_document SET status='DRAFT',submitted_at=NULL,updated_at=now() WHERE document_id=%s", (document_id,))
+        return _doc_detail(conn, document_id, user)
+
+
+@router.post("/{document_id}/reject")
+def reject_document(document_id: int, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+    """复核角色驳回已提交单据（SUBMITTED→DRAFT，审计动作区分驳回与撤回）。"""
+    _csrf(request)
+    req_meta = _request_meta(request)
+    with connection() as conn:
+        doc = fetch_one(conn, "SELECT * FROM business_document WHERE document_id=%s FOR UPDATE", (document_id,))
+        if not doc:
+            raise HTTPException(status_code=404, detail="单据不存在")
+        if user["role"] not in DOC_TYPE_META[doc["doc_type"]]["post_roles"] and user["role"] != "ADMIN":
+            raise HTTPException(status_code=403, detail="无权驳回此单据")
+        if doc["status"] != "SUBMITTED":
+            raise HTTPException(status_code=409, detail="仅已提交单据可驳回")
+        audit(conn, user, "REJECT", "business_document", target_id=document_id,
+              before={"status": "SUBMITTED"}, after={"status": "DRAFT"},
+              request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
+        with conn.cursor() as cur:
+            cur.execute("UPDATE business_document SET status='DRAFT',submitted_at=NULL,updated_at=now() WHERE document_id=%s", (document_id,))
+        return _doc_detail(conn, document_id, user)
+
+
 @router.post("/{document_id}/post")
 def post_document(document_id: int, payload: DocSubmitIn, request: Request, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
     _csrf(request)
@@ -618,7 +695,10 @@ def add_attachment(document_id: int, file: UploadFile = File(...), request: Requ
     sniffed = _sniff_image_type(data)
     if sniffed:
         content_type = sniffed
-        re = _reencode_to_cap(data, sniffed)
+        try:
+            re = _reencode_to_cap(data, sniffed)
+        except ImageTooLargeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
         if re:
             data, content_type, _ = re
     with connection() as conn:

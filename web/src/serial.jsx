@@ -1,5 +1,5 @@
 // 序列台账（SN 追踪）：列表 / 详情 / 行内 SN 登记组件（扫码·OCR·Excel·校验）。
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import api from './api'
 import DataTable, { toServerFilters } from './data-table'
 import { prepareImage } from './image-utils'
@@ -91,18 +91,21 @@ export function SerialEntry({ productId, value = '', onChange, quantity, label =
 // ---------------------------------------------------------------------------
 export function SerialLedger() {
   const [error, setError] = useState(null)
-  const columns = [
+  // 稳定引用：columns/fetchData 是 DataTable 拉取 effect 的依赖，
+  // 每次渲染新建会在请求失败（onError→重渲染）时形成无限重试循环。
+  const columns = useMemo(() => [
     { key: 'serial_number', label: '序列号', filterType: 'search' },
     { key: 'product_name', label: '货品' },
     { key: 'current_location_name', label: '当前库位' },
     { key: 'status_code', label: '状态' },
     { key: 'latest_event_type', label: '最近事件' },
     { key: 'latest_event_date', label: '最近日期' },
-  ]
+  ], [])
+  const fetchData = useCallback((p, signal) => api.serialLedger({ ...p, signal }), [])
   return <section><PageHeading eyebrow="库存" title="序列台账" description="启用 SN 追踪货品的单件在册状态与流向。" /><div className="panel"><ErrorBox error={error} /><DataTable
     mode="server"
     columns={columns}
-    fetchData={(p, signal) => api.serialLedger({ ...p, signal })}
+    fetchData={fetchData}
     rowKey={r => String(r.asset_id)}
     rowHref={r => `/serials/${r.asset_id}`}
     onError={setError}

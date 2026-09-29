@@ -46,6 +46,8 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    # 图片解码/导出等内存放大路径的兜底上限，与 ocr 服务一致
+    mem_limit: 1g
     ports:
       - "${API_PORT:-127.0.0.1:8000}:8000"
 

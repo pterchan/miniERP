@@ -10,6 +10,7 @@ without it the source is parsed and a summary is printed.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import unicodedata
@@ -35,17 +36,22 @@ def norm(value: Any) -> str | None:
     return normalize_identifier(value)
 
 
+def row_hash_of(item: dict[str, Any]) -> str:
+    """来源行内容哈希：跨批次识别同一逻辑数据，防止换文件重复过账。"""
+    return hashlib.sha256(json.dumps(item, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def source_unit(source: dict[str, Any]) -> str | None:
     """Return a whitelisted source unit cell without exposing unrelated fields."""
     value = source.get("uom")
     return str(value) if value is not None else None
 
 
-def uom_id_for(conn: Any, raw: str | None, fallback: int) -> int:
-    """Resolve a source unit to the dictionary; never perform a quantity conversion."""
+def resolve_uom(conn: Any, raw: str | None) -> int | None:
+    """把来源单位解析到字典行；未命中返回 None——绝不静默换算或回退默认单位。"""
     value = normalize_text(raw) if raw is not None else None
     if not value:
-        return fallback
+        return None
     aliases = {
         "个": "EA", "件": "EA", "台": "EA", "只": "EA", "部": "EA", "块": "EA", "枚": "EA", "支": "EA",
         "盒": "BOX", "箱": "BOX", "包": "BOX", "套": "SET", "米": "M", "m": "M",
@@ -53,7 +59,16 @@ def uom_id_for(conn: Any, raw: str | None, fallback: int) -> int:
     }
     code = aliases.get(value, value.upper())
     row = one(conn, "SELECT uom_id FROM uom WHERE code=%s AND is_active", (code,))
-    return int(row["uom_id"]) if row else fallback
+    return int(row["uom_id"]) if row else None
+
+
+def already_posted_content(conn: Any, row_hash: str) -> bool:
+    """同一内容（row_hash）的历史流水是否已过账——跨 import_batch 识别重复导入。"""
+    return bool(one(conn, """SELECT im.inventory_movement_id FROM inventory_movement im
+                              JOIN source_record sr ON sr.source_record_id=im.source_record_id
+                             WHERE sr.row_hash=%s
+                               AND im.status_id=(SELECT status_id FROM record_status WHERE code='posted')
+                             LIMIT 1""", (row_hash,)))
 
 
 def set_context(conn: Any, action: str) -> None:
@@ -77,15 +92,15 @@ def one(conn: Any, sql: str, args: tuple[Any, ...] = ()) -> dict[str, Any] | Non
         return dict(zip([d.name for d in cur.description], row))
 
 
-def source_record(conn: Any, batch_id: int, item: dict[str, Any], sheet: str, block: str, row_number: int, status_id: int) -> int:
-    row_hash = __import__("hashlib").sha256(json.dumps(item, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
+def source_record(conn: Any, batch_id: int, item: dict[str, Any], sheet: str, block: str, row_number: int, status_id: int) -> tuple[int, str]:
+    row_hash = row_hash_of(item)
     with conn.cursor() as cur:
         cur.execute("""INSERT INTO source_record(import_batch_id,sheet_name,block_name,source_row_number,row_hash,raw_values,display_values,normalized_values,parse_status_id)
                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                        ON CONFLICT (import_batch_id,sheet_name,block_name,source_row_number)
                        DO UPDATE SET row_hash=EXCLUDED.row_hash,raw_values=EXCLUDED.raw_values,display_values=EXCLUDED.display_values,normalized_values=EXCLUDED.normalized_values
                        RETURNING source_record_id""", (batch_id, sheet, block, row_number, row_hash, Json(item), Json(item), Json(item), status_id))
-        return int(cur.fetchone()[0])
+        return int(cur.fetchone()[0]), row_hash
 
 
 def open_case(conn: Any, source_record_id: int, case_type: str, status_id: int, notes: str, source_batch: int | None = None) -> bool:
@@ -155,7 +170,7 @@ def load(args: argparse.Namespace) -> dict[str, Any]:
             # Asset and intentionally non-posting sheets are still retained as
             # safe observations, never as inventory movements.
             for asset_obs in report["asset_observations"]:
-                sid = source_record(conn, batch_id, asset_obs.get("source", {}), asset_obs["sheet"], "assets", asset_obs["source_row_number"], status_observed)
+                sid, _asset_hash = source_record(conn, batch_id, asset_obs.get("source", {}), asset_obs["sheet"], "assets", asset_obs["source_row_number"], status_observed)
                 serials = asset_obs.get("serial_candidates", [])
                 serial_raw = " | ".join(str(x) for x in serials) or None
                 cur.execute("""INSERT INTO asset_observation(source_record_id,observation_ordinal,serial_raw,serial_normalized,resolution_status_id,notes)
@@ -166,7 +181,7 @@ def load(args: argparse.Namespace) -> dict[str, Any]:
                 source_record(conn, batch_id, staged.get("source", {}), staged["sheet"], "stage_only", staged["source_row_number"], status_observed)
                 counts["stage_only_loaded"] += 1
             for obs in report["product_observations"]:
-                sid = source_record(conn, batch_id, obs.get("source", {}), obs["sheet"], "products", obs["source_row_number"], status_observed)
+                sid, product_row_hash = source_record(conn, batch_id, obs.get("source", {}), obs["sheet"], "products", obs["source_row_number"], status_observed)
                 source_ids[(obs["sheet"], "products", obs["source_row_number"])] = sid
                 key = key_from_product(obs)
                 src = obs.get("source", {})
@@ -203,7 +218,7 @@ def load(args: argparse.Namespace) -> dict[str, Any]:
                 else:
                     audit(conn, "SEED_PRODUCT", "product", after={"display_name": display_name, "source_record_id": sid}, source_batch=batch_id)
                     raw_uom = source_unit(src)
-                    resolved_uom = uom_id_for(conn, raw_uom, unknown_uom)
+                    resolved_uom = resolve_uom(conn, raw_uom) or unknown_uom
                     cur.execute("INSERT INTO product(display_name,default_uom_id,default_condition_id,status_id,source_uom_raw) VALUES (%s,%s,%s,%s,%s) RETURNING product_id", (str(display_name), resolved_uom, new_condition, status_active, raw_uom))
                     product_id = int(cur.fetchone()[0]); counts["products"] += 1
                 product_ids[key] = product_id
@@ -221,9 +236,14 @@ def load(args: argparse.Namespace) -> dict[str, Any]:
                     cur.execute("INSERT INTO inventory_snapshot(snapshot_date,product_id,location_id,condition_id,uom_id,reported_quantity,source_record_id) VALUES (NULL,%s,%s,%s,%s,%s,%s) ON CONFLICT (source_record_id,source_line_no) DO NOTHING", (product_id, main_location, new_condition, product_uoms[product_id], existing_qty, sid))
                     counts["snapshots"] += cur.rowcount
                 if opening is not None and opening > 0 and opening_issue is None and getattr(args, "post_opening", False):
-                    audit(conn, "SEED_OPENING", "inventory_movement", after={"product_id": product_id, "quantity": opening}, source_batch=batch_id)
-                    cur.execute("INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,destination_location_id,source_record_id,posted_at,posted_by,source_uom_raw) SELECT movement_type_id,%s,%s,%s,%s,%s,%s,%s,%s,now(),'migration',%s FROM movement_type WHERE code='OPENING' ON CONFLICT (source_record_id,source_line_no) DO NOTHING", (posted_id, args.cutover_date, product_id, opening, product_uoms[product_id], new_condition, main_location, sid, source_unit(src)))
-                    counts["opening"] += cur.rowcount
+                    if already_posted_content(conn, product_row_hash):
+                        if record_quality_issue(conn, sid, "duplicate_movement", status_review, "期初数量与历史批次已过账内容重复，需人工确认", None, source_batch=batch_id):
+                            counts["quality_issues"] += 1
+                        counts["duplicates"] += 1
+                    else:
+                        audit(conn, "SEED_OPENING", "inventory_movement", after={"product_id": product_id, "quantity": opening}, source_batch=batch_id)
+                        cur.execute("INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,destination_location_id,source_record_id,posted_at,posted_by,source_uom_raw) SELECT movement_type_id,%s,%s,%s,%s,%s,%s,%s,%s,now(),'migration',%s FROM movement_type WHERE code='OPENING' ON CONFLICT (source_record_id,source_line_no) DO NOTHING", (posted_id, args.cutover_date, product_id, opening, product_uoms[product_id], new_condition, main_location, sid, source_unit(src)))
+                        counts["opening"] += cur.rowcount
                 elif opening is not None and opening > 0 and opening_issue is None:
                     counts["opening_deferred"] += 1
 
@@ -231,7 +251,7 @@ def load(args: argparse.Namespace) -> dict[str, Any]:
             # receipts/issues with a resolved product are replayed here.
             for candidate in report["movement_candidates"]:
                 block = candidate.get("block", candidate["sheet"])
-                sid = source_record(conn, batch_id, candidate.get("source", {}), candidate["sheet"], block, candidate["source_row_number"], status_observed)
+                sid, movement_row_hash = source_record(conn, batch_id, candidate.get("source", {}), candidate["sheet"], block, candidate["source_row_number"], status_observed)
                 source_ids[(candidate["sheet"], block, candidate["source_row_number"])] = sid
                 src = candidate.get("source", {})
                 name = candidate.get("name_raw")
@@ -241,20 +261,37 @@ def load(args: argparse.Namespace) -> dict[str, Any]:
                 movement_type = candidate.get("movement_type_candidate")
                 movement_type_id = one(conn, "SELECT movement_type_id FROM movement_type WHERE code=%s", (movement_type,))["movement_type_id"] if movement_type in {"OPENING", "RECEIPT", "ISSUE_OTHER", "ISSUE_SALE", "ISSUE_CONSUMPTION", "ISSUE_GIFT", "ISSUE_SCRAP", "TRANSFER", "RETURN", "ADJUSTMENT"} else None
                 raw_uom = source_unit(src)
-                candidate_uom = uom_id_for(conn, raw_uom, product_uoms.get(product_id, unknown_uom))
-                candidate_status = status_active if product_id and clean and movement_type else status_review
+                resolved_uom = resolve_uom(conn, raw_uom)
+                # 单位无法识别时按 UNKNOWN 暂存并进复核——回退产品默认单位等于隐式换算
+                uom_unresolved = resolved_uom is None and bool(raw_uom)
+                candidate_uom = resolved_uom if resolved_uom is not None else (product_uoms.get(product_id) if not uom_unresolved else None) or unknown_uom
+                candidate_status = status_active if product_id and clean and movement_type_id is not None and not uom_unresolved else status_review
                 cur.execute("""INSERT INTO movement_candidate(source_record_id,candidate_ordinal,candidate_kind,movement_type_id,product_id,movement_date_raw,movement_date,quantity_raw,quantity,uom_id,condition_id,resolution_status_id,classification_method,notes)
                              VALUES (%s,1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                              ON CONFLICT (source_record_id,candidate_ordinal) DO UPDATE SET candidate_kind=EXCLUDED.candidate_kind,movement_type_id=EXCLUDED.movement_type_id,product_id=EXCLUDED.product_id,movement_date_raw=EXCLUDED.movement_date_raw,movement_date=EXCLUDED.movement_date,quantity_raw=EXCLUDED.quantity_raw,quantity=EXCLUDED.quantity,uom_id=EXCLUDED.uom_id,condition_id=EXCLUDED.condition_id,resolution_status_id=EXCLUDED.resolution_status_id,classification_method=EXCLUDED.classification_method,notes=EXCLUDED.notes
-                             RETURNING movement_candidate_id""", (sid, "inventory" if clean and product_id else "review", movement_type_id, product_id, candidate.get("movement_date_raw"), candidate.get("movement_date"), candidate.get("quantity_raw"), candidate.get("quantity"), candidate_uom, new_condition, candidate_status, candidate.get("classification_method"), "; ".join(candidate.get("data_quality_issues", [])) or None))
+                             RETURNING movement_candidate_id""", (sid, "inventory" if clean and product_id and not uom_unresolved else "review", movement_type_id, product_id, candidate.get("movement_date_raw"), candidate.get("movement_date"), candidate.get("quantity_raw"), candidate.get("quantity"), candidate_uom, new_condition, candidate_status, candidate.get("classification_method"), "; ".join(candidate.get("data_quality_issues", [])) or None))
                 movement_candidate_id = int(cur.fetchone()[0])
                 counts["movement_candidates_loaded"] += 1
                 for issue_code in candidate.get("data_quality_issues", []):
                     if record_quality_issue(conn, sid, issue_code, status_review, "历史流水日期/数量需要仓管复核", str(candidate.get("quantity_raw") or candidate.get("movement_date_raw") or ""), movement_candidate_id=movement_candidate_id, source_batch=batch_id):
                         counts["quality_issues"] += 1
+                if uom_unresolved:
+                    if record_quality_issue(conn, sid, "unknown_uom", status_review, "来源单位无法识别，已按 UNKNOWN 暂存，需人工确认单位后再过账", raw_uom, movement_candidate_id=movement_candidate_id, source_batch=batch_id):
+                        counts["quality_issues"] += 1
+                    if open_case(conn, sid, "other", status_review, "来源单位无法识别，需仓管确认单位后重导或手工过账", batch_id):
+                        counts["movement_conflicts"] += 1
+                    continue
                 if not product_id or not clean or movement_type not in {"RECEIPT", "ISSUE_OTHER", "ISSUE_SALE", "ISSUE_CONSUMPTION", "ISSUE_GIFT", "ISSUE_SCRAP"}:
                     if open_case(conn, sid, "other", status_review, "历史流水未满足自动过账条件，需仓管复核", batch_id):
                         counts["movement_conflicts"] += 1
+                    continue
+                if already_posted_content(conn, movement_row_hash):
+                    # 同一逻辑数据换了文件（不同 SHA/批次）再来：不重复过账，转人工复核
+                    if record_quality_issue(conn, sid, "duplicate_movement", status_review, "与历史批次已过账内容重复，需人工确认是否为重复导出", None, movement_candidate_id=movement_candidate_id, source_batch=batch_id):
+                        counts["quality_issues"] += 1
+                    if open_case(conn, sid, "other", status_review, "历史流水内容与已过账数据重复，需人工确认", batch_id):
+                        counts["movement_conflicts"] += 1
+                    counts["duplicates"] += 1
                     continue
                 movement_id = one(conn, "SELECT movement_type_id FROM movement_type WHERE code=%s", (movement_type,))["movement_type_id"]
                 movement_uom = candidate_uom

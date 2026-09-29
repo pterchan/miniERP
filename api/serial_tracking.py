@@ -198,7 +198,11 @@ def apply_line_serials(conn: Any, user: dict[str, Any] | None, req_meta: dict[st
 
 def reverse_movement_serials(conn: Any, user: dict[str, Any] | None, req_meta: dict[str, Any],
                              orig_movement: dict[str, Any], rev_movement_id: int) -> None:
-    """红冲：原流水挂的资产写反向事件（IN↔issued、OUT↔received、TRANSFER 反向）。"""
+    """红冲：原流水挂的资产写反向事件（IN↔issued、OUT↔received、TRANSFER 反向）。
+
+    写反向事件前校验资产当前状态兼容：红冲是机械反演，若 SN 已被后续单据
+    改变在库状态，再反演会造成台账矛盾——拒绝并提示走人工冲销。
+    """
     links = fetch_all(conn, "SELECT asset_id FROM inventory_movement_asset WHERE inventory_movement_id=%s",
                       (orig_movement["inventory_movement_id"],))
     if not links:
@@ -207,11 +211,25 @@ def reverse_movement_serials(conn: Any, user: dict[str, Any] | None, req_meta: d
     d = orig_movement.get("destination_location_id")
     cond = _condition_id(conn, orig_movement.get("condition_id"))
     for link in links:
-        if d is not None and s is None:      # 原 IN → 反向出
+        asset = fetch_one(conn, "SELECT status_code FROM v_asset_current_state WHERE asset_id=%s", (link["asset_id"],))
+        state = asset["status_code"] if asset else None
+        if d is not None and s is None:      # 原 IN → 反向出：资产应仍在库
+            if state != "active":
+                raise HTTPException(status_code=422,
+                                    detail=f"红冲失败：SN 资产（id={link['asset_id']}）当前状态为 {state or '未建档'}，"
+                                           "反向出库会造成台账矛盾；请先冲销后续出库单或走人工冲销流程")
             _write_event(conn, user, req_meta, link["asset_id"], rev_movement_id, "issued", "retired", cond, d, None)
-        elif s is not None and d is None:    # 原 OUT → 反向入
+        elif s is not None and d is None:    # 原 OUT → 反向入：资产应不在库
+            if state == "active":
+                raise HTTPException(status_code=422,
+                                    detail=f"红冲失败：SN 资产（id={link['asset_id']}）已通过其它单据回到在库状态，"
+                                           "反向入库会重复计入；请先冲销后续入库单或走人工冲销流程")
             _write_event(conn, user, req_meta, link["asset_id"], rev_movement_id, "received", "active", cond, None, s)
-        else:                                # TRANSFER → 反向调拨
+        else:                                # TRANSFER → 反向调拨：资产应在库
+            if state != "active":
+                raise HTTPException(status_code=422,
+                                    detail=f"红冲失败：SN 资产（id={link['asset_id']}）当前状态为 {state or '未建档'}，"
+                                           "反向调拨会造成台账矛盾；请走人工冲销流程")
             _write_event(conn, user, req_meta, link["asset_id"], rev_movement_id, "transferred", "active", cond, d, s)
         _link(conn, user, req_meta, rev_movement_id, link["asset_id"])
 

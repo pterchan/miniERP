@@ -11,6 +11,31 @@ import io
 
 SERVER_MAX_EDGE = 1600                 # 兜底，略宽于端侧 1280
 SERVER_MAX_BYTES = 700 * 1024          # 端侧才是真正的限流点
+MAX_IMAGE_PIXELS = 20_000_000          # 与 OCR 服务一致：解码前像素上限（防解压炸弹）
+
+
+class ImageTooLargeError(ValueError):
+    """图片声明尺寸超过像素上限；调用方应 422 拒绝，而不是回退存原图。"""
+
+
+def _decode_image(data: bytes):
+    """统一解码入口：先读头部尺寸，超限直接拒绝，避免全幅解码吃内存。
+
+    Pillow 默认只对 ~1.79 亿像素报错、8950 万~1.79 亿之间仅告警并完整解码，
+    一张小体积 PNG 声明巨大尺寸即可打满内存——必须在 convert/load 之前拦截。
+    Pillow 自身在 >2×MAX_IMAGE_PIXELS 时抛 DecompressionBombError，统一转成
+    ImageTooLargeError，避免被「解码失败回退存原图」的分支吞掉。
+    """
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    try:
+        image = Image.open(io.BytesIO(data))
+    except Image.DecompressionBombError as exc:
+        raise ImageTooLargeError(str(exc)) from exc
+    if image.width * image.height > MAX_IMAGE_PIXELS:
+        raise ImageTooLargeError(f"图片像素数超过上限（{image.width}x{image.height} > {MAX_IMAGE_PIXELS}）")
+    return image
+
 
 _EXT_BY_TYPE = {
     "image/jpeg": "jpg",
@@ -47,13 +72,15 @@ def _make_thumbnail(data: bytes, max_size: int = 320) -> tuple[bytes, int] | Non
     前端在网格中回退到原图。"""
     try:
         from PIL import Image
-        image = Image.open(io.BytesIO(data))
+        image = _decode_image(data)
         image = image.convert("RGB")
         image.thumbnail((max_size, max_size), Image.LANCZOS)
         buf = io.BytesIO()
         image.save(buf, format="JPEG", quality=80)
         out = buf.getvalue()
         return out, len(out)
+    except ImageTooLargeError:
+        raise
     except Exception:
         return None
 
@@ -64,10 +91,11 @@ def _reencode_to_cap(data: bytes, content_type: str) -> tuple[bytes, str, int] |
 
     返回 (jpeg_bytes, "image/jpeg", len)；已达标 / 不可解码（HEIC 直传等）返回 None，
     调用方按原样存储。Pillow wheels 自带 WebP/PNG/GIF 解码。
+    像素超限抛 ImageTooLargeError，调用方必须 422 拒绝而不是存原图。
     """
     try:
         from PIL import Image, ImageOps
-        with Image.open(io.BytesIO(data)) as im:
+        with _decode_image(data) as im:
             if im.format not in ("JPEG", "PNG", "WEBP", "GIF"):
                 return None
             if im.width <= SERVER_MAX_EDGE and im.height <= SERVER_MAX_EDGE and len(data) <= SERVER_MAX_BYTES:
@@ -82,5 +110,7 @@ def _reencode_to_cap(data: bytes, content_type: str) -> tuple[bytes, str, int] |
                 if len(out) <= SERVER_MAX_BYTES or quality <= 55:
                     return out, "image/jpeg", len(out)
                 quality -= 5
+    except ImageTooLargeError:
+        raise
     except Exception:
         return None

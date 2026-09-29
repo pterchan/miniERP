@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse
 
 from .db import audit, connection, fetch_all, fetch_one
 from .helpers import _request_meta
-from .image_utils import _ext_for_type, _make_thumbnail, _reencode_to_cap, _sniff_image_type
+from .image_utils import ImageTooLargeError, _ext_for_type, _make_thumbnail, _reencode_to_cap, _sniff_image_type
 from .permissions import _csrf, require_roles, require_user
 from .schemas import ImageUpdateIn
 from .storage import bucket_name, get_client
@@ -104,7 +104,10 @@ def upload_product_images(
         if not content_type:
             raise HTTPException(status_code=422, detail=f"不支持的文件类型: {up.filename or '未知'}")
         # 服务端兜底：绕过端侧或极端尺寸时，把存储/下载体积拉回 ≤1600px/≤700KB。
-        re = _reencode_to_cap(data, content_type)
+        try:
+            re = _reencode_to_cap(data, content_type)
+        except ImageTooLargeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
         if re:
             data, content_type, _ = re
         object_key = f"products/{product_id}/{uuid.uuid4().hex}.{_ext_for_type(content_type)}"

@@ -27,6 +27,7 @@
 | `WEB_DOCKERFILE` | `Dockerfile` | Web 镜像构建方式；可选 `Dockerfile.remote` |
 | `ERP_COOKIE_PATH` | `/` | Cookie 路径；通过 `/erp/` 子路径访问时设为 `/erp` |
 | `ERP_SECURE_COOKIES` | `0` | 会话/CSRF Cookie 的 `Secure` 标志；部署到 TLS 网关后置 `1`（Compose 已透传） |
+| `ERP_FORBID_NEGATIVE_STOCK` | `0` | 置 `1` 后出库/调拨/红冲反向移动前校验库存余额，不足返回 422；默认维持允许负库存的设计 |
 | `CORS_ORIGINS` | `http://localhost` | 允许的来源，多个值用逗号分隔 |
 | `MINIO_BUCKET` | `erp-product-images` | 商品图片存储桶 |
 | `MINIO_CONSOLE_PORT` | `127.0.0.1:19001` | MinIO 控制台映射端口 |
