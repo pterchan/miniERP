@@ -1,5 +1,6 @@
 import React, { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { Empty } from './ui'
+import { withBasePath } from './app-path'
 
 const EMPTY_EXTRA = {} // 稳定引用，避免默认对象每次渲染都改变、触发拉取 effect 重置
 
@@ -188,7 +189,7 @@ export default function DataTable({
       return
     }
     const a = document.createElement('a')
-    a.href = url
+    a.href = withBasePath(url)
     document.body.appendChild(a)
     a.click()
     a.remove()

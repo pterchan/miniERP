@@ -7,3 +7,9 @@ web/dist/
 *.log
 inventory-dry-run/
 deploy/*.env
+
+.DS_Store
+.zcode/
+*.xlsx
+*.xls
+.mini-erp-import-*

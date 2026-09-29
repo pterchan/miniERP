@@ -43,6 +43,7 @@ from .security import hash_password, random_token, token_hash, utc_after, verify
 
 
 app = FastAPI(title="miniERP", version="0.1.0")
+COOKIE_PATH = os.environ.get("ERP_COOKIE_PATH", "/")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[x for x in os.environ.get("ERP_CORS_ORIGINS", "http://localhost:5173").split(",") if x],
@@ -178,8 +179,8 @@ def login(payload: LoginIn, response: Response, request: Request) -> dict[str, A
         with conn.cursor() as cur:
             cur.execute("INSERT INTO app_session(user_id,token_hash,csrf_token_hash,expires_at) VALUES (%s,%s,%s,%s)", (user_row["user_id"], token_hash(session_token), token_hash(csrf_token), utc_after()))
     secure = os.environ.get("ERP_SECURE_COOKIES", "0") == "1"
-    response.set_cookie(SESSION_COOKIE, session_token, httponly=True, secure=secure, samesite="lax", max_age=12 * 3600)
-    response.set_cookie(CSRF_COOKIE, csrf_token, httponly=False, secure=secure, samesite="lax", max_age=12 * 3600)
+    response.set_cookie(SESSION_COOKIE, session_token, path=COOKIE_PATH, httponly=True, secure=secure, samesite="lax", max_age=12 * 3600)
+    response.set_cookie(CSRF_COOKIE, csrf_token, path=COOKIE_PATH, httponly=False, secure=secure, samesite="lax", max_age=12 * 3600)
     return {"user_id": user_row["user_id"], "username": user_row["username"], "display_name": user_row["display_name"], "role": user_row["role"]}
 
 
@@ -192,8 +193,8 @@ def logout(request: Request, response: Response, user: dict[str, Any] = Depends(
         audit(conn, user, "LOGOUT", "app_session", request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
         with conn.cursor() as cur:
             cur.execute("UPDATE app_session SET revoked_at=now() WHERE token_hash=%s", (token_hash(raw),))
-    response.delete_cookie(SESSION_COOKIE)
-    response.delete_cookie(CSRF_COOKIE)
+    response.delete_cookie(SESSION_COOKIE, path=COOKIE_PATH)
+    response.delete_cookie(CSRF_COOKIE, path=COOKIE_PATH)
     return {"status": "ok"}
 
 

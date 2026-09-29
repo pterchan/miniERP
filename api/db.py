@@ -25,7 +25,10 @@ def _json_safe(value: Any) -> Any:
 
 
 def database_url() -> str:
-    return os.environ.get("DATABASE_URL", "postgresql://inventory:<password>@postgres:5432/inventory")
+    value = os.environ.get("DATABASE_URL")
+    if not value:
+        raise RuntimeError("DATABASE_URL 未配置")
+    return value
 
 
 _pool: Any = None

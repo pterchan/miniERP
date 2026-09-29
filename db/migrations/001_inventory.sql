@@ -1,6 +1,6 @@
 -- 001_inventory.sql
 --
--- Initial PostgreSQL model for the protected workbook.xlsx workbook.  The source
+-- Initial PostgreSQL model for mapped inventory imports. Source
 -- workbook's 编号 is deliberately stored as an identifier observation and is
 -- never used as the primary key for product.  Every business entity uses an
 -- internal BIGINT identity key; source identifiers and serial numbers remain
@@ -152,7 +152,7 @@ CREATE TABLE product_identifier (
     product_id          BIGINT NOT NULL REFERENCES product (product_id),
     identifier_type     TEXT NOT NULL DEFAULT 'source_number'
         CHECK (identifier_type IN ('source_number', 'internal_sku', 'manufacturer_code', 'barcode', 'legacy_number', 'other')),
-    namespace           TEXT NOT NULL DEFAULT 'workbook.xlsx',
+    namespace           TEXT NOT NULL DEFAULT 'mapped_xlsx',
     value_raw           TEXT NOT NULL,
     value_normalized    TEXT NOT NULL CHECK (length(btrim(value_normalized)) > 0),
     is_primary          BOOLEAN NOT NULL DEFAULT FALSE,

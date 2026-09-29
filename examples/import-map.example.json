@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "sheets": [
+    {
+      "name": "Inventory",
+      "role": "products",
+      "header_row": 1,
+      "columns": {
+        "identifier": "SKU",
+        "name": "Product",
+        "uom": "Unit",
+        "opening_quantity": "Opening quantity",
+        "existing_quantity": "On hand"
+      }
+    },
+    {
+      "name": "Receipts",
+      "role": "movement",
+      "header_row": 1,
+      "movement_type": "RECEIPT",
+      "columns": {
+        "identifier": "SKU",
+        "name": "Product",
+        "date": "Date",
+        "quantity": "Quantity",
+        "uom": "Unit",
+        "note": "Note",
+        "serial": "Serial"
+      }
+    },
+    {
+      "name": "Issues",
+      "role": "movement",
+      "header_row": 1,
+      "movement_type": "ISSUE_OTHER",
+      "columns": {
+        "identifier": "SKU",
+        "name": "Product",
+        "date": "Date",
+        "quantity": "Quantity",
+        "uom": "Unit",
+        "note": "Note",
+        "serial": "Serial"
+      }
+    },
+    {
+      "name": "Transfers",
+      "role": "movement",
+      "header_row": 1,
+      "movement_type": "TRANSFER",
+      "columns": {
+        "identifier": "SKU",
+        "name": "Product",
+        "date": "Date",
+        "quantity": "Quantity",
+        "uom": "Unit",
+        "note": "Note",
+        "destination": "Destination",
+        "serial": "Serial"
+      }
+    },
+    {
+      "name": "Assets",
+      "role": "assets",
+      "header_row": 1,
+      "columns": {
+        "name": "Asset",
+        "serial": "Serial",
+        "component_serial": "Component serial",
+        "notes": "Notes"
+      }
+    },
+    {
+      "name": "References",
+      "role": "stage_only",
+      "header_row": 1,
+      "columns": {
+        "reference": "Reference",
+        "notes": "Notes"
+      }
+    }
+  ]
+}

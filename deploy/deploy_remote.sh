@@ -6,21 +6,25 @@ REMOTE_USER="${DEPLOY_USER:-}"
 REMOTE_DIR="${DEPLOY_DIR:-}"
 ENV_FILE=""
 WORKBOOK=""
+MAPPING_FILE=""
 SEED=0
 
 usage() {
-  cat <<'EOF'
-Usage: deploy/deploy_remote.sh [options]
+  cat <<'USAGE'
+Usage: deploy/deploy_remote.sh --host HOST --user USER --remote-dir ABSOLUTE_PATH [options]
 
-  --host HOST             SSH host (required; set DEPLOY_HOST)
-  --user USER             SSH user (required; set DEPLOY_USER)
-  --remote-dir DIR        Remote checkout (required absolute path; set DEPLOY_DIR)
-  --env-file FILE         Upload a protected dotenv file
-  --seed-workbook FILE    Upload and import an encrypted workbook
+Required values may also be set with DEPLOY_HOST, DEPLOY_USER, and DEPLOY_DIR.
+
+  --host HOST             SSH host
+  --user USER             SSH user
+  --remote-dir DIR        Absolute remote checkout directory
+  --env-file FILE         Upload a dotenv file
+  --seed-workbook FILE    Upload and import a workbook
+  --mapping FILE          JSON column mapping; required with --seed-workbook
   -h, --help              Show this help
 
-For --seed-workbook, set IMPORT_WORKBOOK_PASSWORD or enter it at the prompt.
-EOF
+For workbook import, set IMPORT_WORKBOOK_PASSWORD or enter it at the prompt.
+USAGE
 }
 
 while (($#)); do
@@ -30,25 +34,39 @@ while (($#)); do
     --remote-dir) REMOTE_DIR="$2"; shift 2 ;;
     --env-file) ENV_FILE="$2"; shift 2 ;;
     --seed-workbook) WORKBOOK="$2"; SEED=1; shift 2 ;;
+    --mapping) MAPPING_FILE="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *) echo "未知选项：$1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
+[[ -n "$REMOTE_HOST" && -n "$REMOTE_USER" && -n "$REMOTE_DIR" ]] || {
+  echo "请通过参数或 DEPLOY_HOST、DEPLOY_USER、DEPLOY_DIR 设置远程目标" >&2
+  usage >&2
+  exit 2
+}
+[[ "$REMOTE_DIR" =~ ^/[A-Za-z0-9._/-]+$ && "$REMOTE_DIR" != *"/../"* && "$REMOTE_DIR" != */.. ]] || {
+  echo "远程目录必须是只含字母、数字、点、下划线、连字符和斜杠的绝对路径" >&2
+  exit 2
+}
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${REMOTE_USER}@${REMOTE_HOST}"
-[[ -f "$ROOT_DIR/docker-compose.yml" ]] || { echo "docker-compose.yml not found" >&2; exit 1; }
-command -v ssh >/dev/null || { echo "ssh is required" >&2; exit 1; }
-command -v scp >/dev/null || { echo "scp is required" >&2; exit 1; }
-command -v tar >/dev/null || { echo "tar is required" >&2; exit 1; }
-command -v npm >/dev/null || { echo "npm is required to build the web bundle" >&2; exit 1; }
+[[ -f "$ROOT_DIR/docker-compose.yml" ]] || { echo "找不到 docker-compose.yml" >&2; exit 1; }
+command -v ssh >/dev/null || { echo "需要 ssh" >&2; exit 1; }
+command -v scp >/dev/null || { echo "需要 scp" >&2; exit 1; }
+command -v tar >/dev/null || { echo "需要 tar" >&2; exit 1; }
+command -v npm >/dev/null || { echo "需要 npm 构建前端" >&2; exit 1; }
 if [[ -n "$ENV_FILE" && ! -f "$ENV_FILE" ]]; then
-  echo "dotenv file not found: $ENV_FILE" >&2
+  echo "找不到 dotenv 文件：$ENV_FILE" >&2
   exit 1
 fi
-if ((SEED)) && [[ ! -f "$WORKBOOK" ]]; then
-  echo "workbook not found: $WORKBOOK" >&2
-  exit 1
+if ((SEED)); then
+  [[ -f "$WORKBOOK" ]] || { echo "找不到工作簿：$WORKBOOK" >&2; exit 1; }
+  [[ -f "$MAPPING_FILE" ]] || { echo "--seed-workbook 需要同时提供 --mapping" >&2; exit 1; }
+elif [[ -n "$MAPPING_FILE" ]]; then
+  echo "--mapping 只能与 --seed-workbook 一起使用" >&2
+  exit 2
 fi
 
 SEED_PASSWORD_FILE=""
@@ -62,34 +80,39 @@ trap cleanup EXIT
 if ((SEED)); then
   SEED_PASSWORD="${IMPORT_WORKBOOK_PASSWORD:-}"
   if [[ -z "$SEED_PASSWORD" ]]; then
-    read -r -s -p "Workbook password: " SEED_PASSWORD
+    read -r -s -p "工作簿密码：" SEED_PASSWORD
     printf '\n' >&2
   fi
-  [[ -n "$SEED_PASSWORD" ]] || { echo "workbook password is empty" >&2; exit 1; }
+  [[ -n "$SEED_PASSWORD" ]] || { echo "工作簿密码不能为空" >&2; exit 1; }
   umask 077
-  SEED_PASSWORD_FILE="$(mktemp "${TMPDIR:-/tmp}/import-password.XXXXXX")"
+  SEED_PASSWORD_FILE="$(mktemp "${TMPDIR:-/tmp}/mini-erp-import-password.XXXXXX")"
   printf '%s' "$SEED_PASSWORD" > "$SEED_PASSWORD_FILE"
   unset SEED_PASSWORD
 fi
 
-echo "Building web bundle locally..."
-(cd "$ROOT_DIR/web" && npm ci --no-audit --no-fund && npm run build)
+echo "正在本地构建前端..."
+(cd "$ROOT_DIR/web" && npm ci --no-audit --no-fund && VITE_BASE_PATH="${VITE_BASE_PATH:-/erp/}" npm run build)
 
 ssh -o BatchMode=yes "$TARGET" "mkdir -p '$REMOTE_DIR' && chmod 700 '$REMOTE_DIR'"
 tar -czf - \
   --exclude='./.git' \
   --exclude='./.env' \
+  --exclude='./.DS_Store' \
+  --exclude='./.zcode' \
   --exclude='./web/node_modules' \
   --exclude='*/__pycache__' \
   --exclude='*.pyc' \
+  --exclude='*.xlsx' \
+  --exclude='*.xls' \
   -C "$ROOT_DIR" . | ssh -o BatchMode=yes "$TARGET" "tar -xzf - -C '$REMOTE_DIR'"
 
 if [[ -n "$ENV_FILE" ]]; then
   scp -q "$ENV_FILE" "$TARGET:$REMOTE_DIR/.env"
 fi
 if ((SEED)); then
-  scp -q "$WORKBOOK" "$TARGET:$REMOTE_DIR/.workbook.xlsx"
-  scp -q "$SEED_PASSWORD_FILE" "$TARGET:$REMOTE_DIR/.import-password"
+  scp -q "$WORKBOOK" "$TARGET:$REMOTE_DIR/.mini-erp-seed.xlsx"
+  scp -q "$MAPPING_FILE" "$TARGET:$REMOTE_DIR/.mini-erp-import-map.json"
+  scp -q "$SEED_PASSWORD_FILE" "$TARGET:$REMOTE_DIR/.mini-erp-import-password"
 fi
 
 ssh -o BatchMode=yes "$TARGET" "bash -s -- '$REMOTE_DIR' '$REMOTE_HOST' '$SEED'" <<'REMOTE_SCRIPT'
@@ -99,11 +122,18 @@ PUBLIC_HOST="$2"
 DO_SEED="$3"
 cd "$REMOTE_DIR"
 
+cleanup_seed() {
+  if [[ "$DO_SEED" == "1" ]]; then
+    rm -f .mini-erp-seed.xlsx .mini-erp-import-map.json .mini-erp-import-password
+  fi
+}
+trap cleanup_seed EXIT
+
 gen_secret() { openssl rand -hex 32; }
 
 if [[ ! -s .env ]]; then
   umask 077
-  cat > .env <<EOF
+  cat > .env <<EOF_ENV
 POSTGRES_DB=inventory
 POSTGRES_USER=inventory
 POSTGRES_PASSWORD=$(gen_secret)
@@ -117,75 +147,55 @@ OCR_PROXY_TIMEOUT_SECONDS=25
 MINIO_ACCESS_KEY=$(openssl rand -hex 8)
 MINIO_SECRET_KEY=$(openssl rand -hex 16)
 MINIO_BUCKET=erp-product-images
-WEB_PORT=80
+WEB_PORT=127.0.0.1:18080
+ERP_COOKIE_PATH=/erp
 API_PORT=127.0.0.1:18001
 POSTGRES_PORT=127.0.0.1:15432
-CORS_ORIGINS=http://$PUBLIC_HOST
-EOF
+CORS_ORIGINS=https://$PUBLIC_HOST
+WEB_DOCKERFILE=Dockerfile.remote
+EOF_ENV
 fi
 chmod 600 .env
-if ! grep -q '^WEB_DOCKERFILE=' .env; then
-  printf '\nWEB_DOCKERFILE=Dockerfile.remote\n' >> .env
-fi
-if grep -Eq '^(POSTGRES_PASSWORD|SESSION_SECRET|BOOTSTRAP_ADMIN_PASSWORD|BOOTSTRAP_REQUESTER_PASSWORD|OCR_INTERNAL_TOKEN)=(change-me|replace-with)' .env; then
-  echo "dotenv contains placeholder secrets; provide --env-file with real values" >&2
+if grep -Eq '^(POSTGRES_PASSWORD|SESSION_SECRET|BOOTSTRAP_ADMIN_PASSWORD|BOOTSTRAP_REQUESTER_PASSWORD|OCR_INTERNAL_TOKEN|MINIO_ACCESS_KEY|MINIO_SECRET_KEY)=(change-me|replace-with)' .env; then
+  echo "dotenv 含占位密码或令牌，请先配置随机值" >&2
   exit 1
-fi
-
-# The target host keeps a Python 3.12 base image under its configured mirror
-# name. Retag that cached image locally so Docker builds do not need Docker Hub.
-if ! docker image inspect python:3.12-slim >/dev/null 2>&1; then
-  CACHED_PYTHON="$(docker image ls --format '{{.ID}}' python | head -n 1)"
-  [[ -n "$CACHED_PYTHON" ]] || { echo "python:3.12-slim base image is unavailable" >&2; exit 1; }
-  docker tag "$CACHED_PYTHON" python:3.12-slim
-fi
-
-# The target host has no Docker Hub access; the MinIO image must come from the
-# mirror as well. Prefetch + retag so the compose service can start offline.
-if ! docker image inspect minio/minio:latest >/dev/null 2>&1; then
-  docker pull minio/minio:latest >/dev/null 2>&1 || true
-  docker tag minio/minio:latest minio/minio:latest 2>/dev/null || true
 fi
 
 docker compose --env-file .env config --quiet
 docker compose --env-file .env up -d --build --remove-orphans
 docker compose --env-file .env ps
 
-if command -v curl >/dev/null 2>&1; then
-  for attempt in $(seq 1 30); do
-    if curl --fail --silent --show-error "http://127.0.0.1/api/healthz" >/dev/null; then break; fi
-    [[ "$attempt" -eq 30 ]] && { docker compose --env-file .env logs --tail=120 api postgres ocr; exit 1; }
-    sleep 2
-  done
-else
-  docker compose --env-file .env exec -T api python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/healthz", timeout=5).read()'
-fi
+for attempt in $(seq 1 30); do
+  if curl --fail --silent --show-error "http://127.0.0.1:18080/api/healthz" >/dev/null; then break; fi
+  [[ "$attempt" -eq 30 ]] && { docker compose --env-file .env logs --tail=120 api postgres ocr; exit 1; }
+  sleep 2
+done
 
-# 全新库由 docker-entrypoint-initdb.d 自动执行 001..006；已有库在此幂等执行一次。
 DB_USER="$(grep -E '^POSTGRES_USER=' .env | cut -d= -f2-)"
 DB_NAME="$(grep -E '^POSTGRES_DB=' .env | cut -d= -f2-)"
-if [[ -n "$DB_USER" && -n "$DB_NAME" ]]; then
-  echo "Applying idempotent migration 005 to existing database..."
+for migration in 005_search_indexes.sql 006_serial_tracking.sql; do
   docker compose --env-file .env exec -T postgres psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" \
-    -f /docker-entrypoint-initdb.d/005_search_indexes.sql || { echo "migration 005 failed" >&2; exit 1; }
-  echo "Applying idempotent migration 006 to existing database..."
-  docker compose --env-file .env exec -T postgres psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" \
-    -f /docker-entrypoint-initdb.d/006_serial_tracking.sql || { echo "migration 006 failed" >&2; exit 1; }
-fi
+    -f "/docker-entrypoint-initdb.d/$migration"
+done
 
 if [[ "$DO_SEED" == "1" ]]; then
-  [[ -s .workbook.xlsx && -s .import-password ]] || { echo "seed inputs are missing" >&2; exit 1; }
-  chmod 600 .workbook.xlsx .import-password
-  IMPORT_WORKBOOK_PASSWORD="$(cat .import-password)"
+  [[ -s .mini-erp-seed.xlsx && -s .mini-erp-import-map.json && -s .mini-erp-import-password ]] || {
+    echo "导入文件不完整" >&2
+    exit 1
+  }
+  chmod 600 .mini-erp-seed.xlsx .mini-erp-import-map.json .mini-erp-import-password
+  IMPORT_WORKBOOK_PASSWORD="$(cat .mini-erp-import-password)"
   docker compose --env-file .env run --rm --no-deps \
-    -v "$PWD/.workbook.xlsx:/app/.workbook.xlsx:ro" \
+    -v "$PWD/.mini-erp-seed.xlsx:/app/.mini-erp-seed.xlsx:ro" \
+    -v "$PWD/.mini-erp-import-map.json:/app/.mini-erp-import-map.json:ro" \
     -e IMPORT_WORKBOOK_PASSWORD="$IMPORT_WORKBOOK_PASSWORD" \
     api python /app/scripts/seed_inventory.py \
-      --input /app/.workbook.xlsx --password-env IMPORT_WORKBOOK_PASSWORD --apply
+      --input /app/.mini-erp-seed.xlsx \
+      --mapping /app/.mini-erp-import-map.json \
+      --password-env IMPORT_WORKBOOK_PASSWORD --apply
   unset IMPORT_WORKBOOK_PASSWORD
-  rm -f .workbook.xlsx .import-password
 fi
 
-echo "Deployment complete: http://$PUBLIC_HOST"
-echo "Remote dotenv: $REMOTE_DIR/.env (mode 600)"
+echo "部署完成：远程目录 $REMOTE_DIR"
+echo "dotenv 权限为 600，请通过 HTTPS 网关公开 Web 服务。"
 REMOTE_SCRIPT

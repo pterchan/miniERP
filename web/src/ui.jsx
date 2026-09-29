@@ -1,12 +1,13 @@
 import React, { createContext, useContext, useEffect, useRef, useState } from 'react'
 import { isNavigationItemActive } from './navigation-utils'
+import { withBasePath } from './app-path'
 
 export const RouterContext = createContext({ navigate: () => {}, currentPath: '/' })
 export const useRouter = () => useContext(RouterContext)
 
 export function Link({ to, children, className = '', onClick, ...props }) {
   const { navigate } = useRouter()
-  return <a className={className} href={to} onClick={e => { if (onClick) onClick(e); if (!e.defaultPrevented) { e.preventDefault(); navigate(to) } }} {...props}>{children}</a>
+  return <a className={className} href={withBasePath(to)} onClick={e => { if (onClick) onClick(e); if (!e.defaultPrevented) { e.preventDefault(); navigate(to) } }} {...props}>{children}</a>
 }
 
 export function NavLink({ to, children, className = '', onClick }) {

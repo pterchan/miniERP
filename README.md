@@ -1,96 +1,48 @@
-# ERP 数据模型
+# miniERP
 
-这是受密码保护的库存工作簿的首版迁移骨架。`编号`只作为可冲突的来源标识，正式主键是数据库生成的 `product_id`；序列号同样保留为 `TEXT`，在审核后关联设备资产。
+miniERP 是面向小团队的进销存与 OA 审批系统，支持采购、销售、库存单据与过账、应收应付、货品主数据、冲突处理、SN/UUID 序列号追踪、图片、OCR 扫描、导出和审计。
 
-## 文件
+本项目由一个私有项目派生而来，原项目的组织与部署标识已去除。欢迎使用，也欢迎提出 Issue、反馈问题和建议。
 
-- `db/migrations/001_inventory.sql`：PostgreSQL DDL、暂存审计层、货品/库位、库存流水、序列资产及四个查询视图。
-- `db/migrations/002_erp_oa.sql`：用户/会话、仓管审批、申请单、不可变审计和单位字典扩展；不做隐式单位换算。
-- `db/migrations/003_full_erp.sql`：RBAC 角色、商品分类、客户/供应商、通用业务单据、应收应付与 BYTEA 附件。
-- `db/migrations/004_product_images.sql`：货品附图元数据表（字节存 MinIO，`product_image` 带审计触发器）。
-- `api/`：FastAPI API；HttpOnly 会话 Cookie + CSRF、仓管/申请人角色、产品搜索、申请审批/放行、冲突和审计接口。
-- `ocr_service/`：独立离线 RapidOCR 产品标签识别服务；不访问商品库、不写数据库，ERP 只通过 `/api/ocr/extract` 薄代理调用。
-- `web/`：Vite/React 响应式桌面/手机界面。
-- `scripts/import_inventory.py`：只读解密、列白名单抽取、规范化、日期/数量质量检查、调货语义候选和安全干运行器。
-- `scripts/seed_inventory.py`：幂等导入到暂存、冲突、快照及可安全重放的历史流水；默认只 dry-run，`--apply` 才写库。
-- `tests/`：不依赖外部数据库的解析/安全测试，以及 DDL 静态验收。
+## 快速开始
 
-## 运行
+    cp .env.example .env
+    # 编辑 .env，为所有密码和令牌设置随机值
+    docker compose up --build
 
-先设置密码环境变量（不会写入文件、日志或报告），再运行干运行器：
+打开 <http://127.0.0.1:18080/erp/>。PostgreSQL 首次启动时会按顺序运行数据库迁移。配置说明见[配置参考](docs/configuration.md)。
 
-```sh
-IMPORT_WORKBOOK_PASSWORD='在此输入密码' \
-python3 scripts/import_inventory.py \
-  --input /path/to/workbook.xlsx \
-  --output /tmp/inventory-dry-run \
-  --password-env IMPORT_WORKBOOK_PASSWORD
-```
+## 功能与架构
 
-输出包括 `report.json` 和四个 JSONL 暂存文件。脚本不会把任何行直接标记为已过账；缺失/非法日期、超范围日期、缺失或非数值数量、零/负数量，以及未能安全判断的调货都保留为质量问题或 `REVIEW` 候选。未映射工作表只在摘要中报告名称和非空行数；stage_only 工作表只导出映射列并按规则脱敏。
+- FastAPI、PostgreSQL 和原生参数化 SQL；React 与 Vite 前端。
+- 采购、销售和库存单据；过账后库存流水不可变，纠错使用红冲。
+- OA 申请审批、角色权限、冲突处理、应收应付和全量审计。
+- MinIO 货品图片与独立离线 RapidOCR 服务。
+- XLSX 导入支持 JSON 列映射；默认干运行，数据经人工审核后才进入正式账。
+- Docker Compose 本地部署；可选 Nginx 子路径部署。
 
-解密副本只存在于操作系统临时目录，并在读取完成后删除。脚本只抽取映射字段，并对凭据、联系方式、财务字段和备注中的敏感内容脱敏。
+## 目录
 
-## 建库
+    api/            FastAPI 后端
+    web/            React + Vite 前端
+    ocr_service/    离线 OCR 服务
+    db/migrations/  PostgreSQL SQL 迁移
+    scripts/        XLSX 干运行与审核导入工具
+    deploy/         Compose 远程部署与 Nginx 示例
+    docs/           架构、配置、开发、导入和部署文档
+    tests/          后端及跨层契约测试
 
-```sh
-psql "$DATABASE_URL" -f db/migrations/001_inventory.sql
-psql "$DATABASE_URL" -f db/migrations/002_erp_oa.sql
-psql "$DATABASE_URL" -f db/migrations/003_full_erp.sql
-psql "$DATABASE_URL" -f db/migrations/004_product_images.sql
-psql "$DATABASE_URL" -f db/migrations/005_search_indexes.sql
-psql "$DATABASE_URL" -f db/migrations/006_serial_tracking.sql
-```
+更多说明：
 
-迁移只创建结构和参考数据，不会凭空生成可信期初余额。审核产品解析、库位、切账日期和期初量后，才可把候选流水转为 `status_id = posted`。余额视图只计算已过账流水；`inventory_snapshot` 仅用于与工作簿现有库存对账。
+- [架构](docs/architecture.md)
+- [API](docs/api.md)
+- [数据模型与迁移](docs/data-model.md)
+- [配置参考](docs/configuration.md)
+- [部署](docs/deployment.md)
+- [开发指南](docs/development.md)
+- [XLSX 数据导入](docs/data-import.md)
+- [OCR 服务](ocr_service/README.md)
 
-## 验证
+## 许可证
 
-```sh
-python3 -m unittest discover -s tests -v
-python3 -m py_compile scripts/import_inventory.py
-```
-
-部分测试需要本地具备 `cryptography`、`openpyxl`、`fastapi`、`minio` 等运行依赖（容器内已内置）；建议在 `api/requirements.txt` 的虚拟环境或容器中运行。前端单测在 `web/` 下执行 `npm test`。
-
-## Docker POC
-
-复制 `.env.example` 为 `.env`，设置数据库、会话、两个初始账号密码以及 `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY`（MinIO 根凭据：access key 3–20 字符、secret key 8–40 字符）后启动：
-
-```sh
-docker compose up --build
-```
-
-浏览器打开 `http://localhost`。数据库容器首次初始化会按文件名顺序执行全部迁移（001–006）；后续使用同一持久化卷不会重复执行。**已有卷（本地或 UAT）升级时需手动补跑一次新增迁移（005/006，幂等可重复）**：`docker compose exec postgres psql -U inventory -d inventory -f /docker-entrypoint-initdb.d/005_search_indexes.sql`、`docker compose exec postgres psql -U inventory -d inventory -f /docker-entrypoint-initdb.d/006_serial_tracking.sql`（004 同理）。`minio` 服务随栈启动，货品附图经 API 上传/展示，MinIO 仅内网。需要导入工作簿时，在能访问数据库的环境执行：
-
-```sh
-IMPORT_WORKBOOK_PASSWORD='在此输入密码' \
-DATABASE_URL='postgresql://inventory:密码@localhost:5432/inventory' \
-python3 scripts/seed_inventory.py --input /path/to/workbook.xlsx --apply
-```
-
-`--apply` 会把产品观察、流水候选、资产观察、质量问题、可安全解析的产品、快照和历史流水写入，并将冲突行保留在 `resolution_case`；同一文件按 SHA-256 和来源行幂等。正期初量默认只计入待切账统计，不会虚构日期；审核切账日后使用：
-
-```sh
-IMPORT_WORKBOOK_PASSWORD='在此输入密码' \
-DATABASE_URL='postgresql://inventory:密码@localhost:5432/inventory' \
-python3 scripts/seed_inventory.py --input /path/to/workbook.xlsx \
-  --apply --post-opening --cutover-date 2026-08-01
-```
-
-正式切账前请先审核冲突与期初余额。产品、申请行和流水均保存字典 `uom_id` 与 `source_uom_raw`；盒、套、米等单位不会自动换算成“个”。
-
-使用仓库附带的 Python 运行时可对真实工作簿做完整干运行；测试不包含密码、电话、客户资料或工作簿内容。
-
-## 远程部署（示例配置）
-
-`deploy/deploy_remote.sh` 使用 SSH 将当前代码上传到 `${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_DIR}`，在本地构建前端静态资源，再启动 PostgreSQL、MinIO、OCR、API 和 Web 五个服务。目标机不需要从 Docker Hub 拉取 Node/Nginx 镜像；Web 使用已缓存的 Python 基础镜像提供静态文件并反代 `/api`，MinIO 使用 Compose 中配置的镜像版本。远端 `.env` 会自动生成 MinIO 根凭据。
-
-首次部署并导入加密工作簿：
-
-```sh
-IMPORT_WORKBOOK_PASSWORD='在此输入密码' \
-deploy/deploy_remote.sh --seed-workbook /path/to/workbook.xlsx
-```
-
-脚本没有 `--env-file` 时会在远端生成随机数据库、会话、OCR 和初始账号密码，保存为权限 `600` 的 `${DEPLOY_DIR}/.env`；也可先复制 `deploy/remote.env.example`，填入长随机值后用 `--env-file` 上传。工作簿和密码只读挂载给一次性导入容器，导入完成即从远端删除。默认访问地址为 `https://erp.example.invalid`，API 仅绑定目标机回环地址 `18001`，PostgreSQL 仅绑定 `15432`。
+本项目采用 MIT 许可证，第三方组件与 OCR 模型的归属信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

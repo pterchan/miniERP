@@ -14,8 +14,8 @@ class OCRContractTests(unittest.TestCase):
         for field in ("schema_version", "raw_text", "lines", "labels", "fields", "key_values", "search_terms", "diagnostics"):
             self.assertIn(field, CONTRACTS)
 
-    def test_generic_pipeline_does_not_bind_to_sample_brand(self) -> None:
-        self.assertNotIn("sample vendor", PIPELINE)
+    def test_generic_pipeline_uses_layout_independent_detection(self) -> None:
+        self.assertNotIn("manufacturer-specific", PIPELINE)
         self.assertIn("cluster_lines", PIPELINE)
         self.assertIn("rotate_variant", PIPELINE)
 

@@ -23,7 +23,7 @@ Design notes
 ------------
 
 - The detector clusters independent text regions, so the parser does not
-  assume the sample vendor sample layout.  Alias definitions live in
+  assume a vendor-specific label layout. Alias definitions live in
   `field_aliases.json`; unknown colon key/value pairs and every OCR line are
   retained as evidence.
 - Numbers stay strings (including leading zeroes).  Dates are normalized only

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Idempotently load the protected workbook into the ERP staging/seed model.
+"""Idempotently load mapped workbook records into the ERP staging model.
 
 The command deliberately posts only unambiguous, valid historical receipts and
 issues.  Transfer rows without a reviewed destination and all invalid source
@@ -25,7 +25,10 @@ from import_inventory import build_report, normalize_identifier, normalize_text,
 
 
 def db_url() -> str:
-    return os.environ.get("DATABASE_URL", "postgresql://inventory:<password>@localhost:5432/inventory")
+    value = os.environ.get("DATABASE_URL")
+    if not value:
+        raise RuntimeError("DATABASE_URL 未配置；使用 --apply 时必须配置数据库连接")
+    return value
 
 
 def norm(value: Any) -> str | None:
@@ -34,10 +37,8 @@ def norm(value: Any) -> str | None:
 
 def source_unit(source: dict[str, Any]) -> str | None:
     """Return a whitelisted source unit cell without exposing unrelated fields."""
-    for key, value in source.items():
-        if value is not None and ("单位" in str(key) or str(key).lower() in {"uom", "unit"}):
-            return str(value)
-    return None
+    value = source.get("uom")
+    return str(value) if value is not None else None
 
 
 def uom_id_for(conn: Any, raw: str | None, fallback: int) -> int:
@@ -112,7 +113,7 @@ def key_from_product(row: dict[str, Any]) -> tuple[str | None, str | None]:
 
 
 def load(args: argparse.Namespace) -> dict[str, Any]:
-    report = build_report(Path(args.input), args.password)
+    report = build_report(Path(args.input), args.password, Path(args.mapping))
     if not args.apply:
         return {"mode": "dry-run", **report["summary"]}
     conn = psycopg2.connect(db_url())
@@ -132,7 +133,7 @@ def load(args: argparse.Namespace) -> dict[str, Any]:
             cur.execute("""INSERT INTO import_batch(source_file_name,source_sha256,source_file_size,password_protected,status_id,importer_version)
                            VALUES (%s,%s,%s,%s,%s,%s)
                            ON CONFLICT (source_sha256) DO UPDATE SET source_file_name=EXCLUDED.source_file_name
-                           RETURNING import_batch_id""", (report["summary"]["source_file_name"], report["summary"]["source_sha256"], Path(args.input).stat().st_size, True, status_imported, "erp-poc-0.1"))
+                           RETURNING import_batch_id""", (report["summary"]["source_file_name"], report["summary"]["source_sha256"], Path(args.input).stat().st_size, report["summary"]["encrypted_source"], status_imported, "mini-erp-1"))
             batch_id = int(cur.fetchone()[0])
 
             # Main warehouse is the only implicit formal location.
@@ -170,16 +171,16 @@ def load(args: argparse.Namespace) -> dict[str, Any]:
                 key = key_from_product(obs)
                 src = obs.get("source", {})
                 raw_uom = source_unit(src)
-                opening, opening_issue = parse_quantity(src.get("期初库存"))
-                existing_qty, existing_issue = parse_quantity(src.get("现有库存"))
+                opening, opening_issue = parse_quantity(src["opening_quantity"]) if "opening_quantity" in src else (None, None)
+                existing_qty, existing_issue = parse_quantity(src["existing_quantity"]) if "existing_quantity" in src else (None, None)
                 observation_status = status_active if obs.get("resolution_status") == "candidate_exact" else status_review
                 cur.execute("""INSERT INTO product_observation(source_record_id,observation_ordinal,source_identifier_raw,source_identifier_normalized,source_name_raw,source_name_normalized,uom_raw,opening_quantity_raw,opening_quantity,existing_quantity_raw,existing_quantity,resolution_status_id,match_method)
                              VALUES (%s,1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                              ON CONFLICT (source_record_id,observation_ordinal) DO UPDATE SET source_identifier_raw=EXCLUDED.source_identifier_raw,source_identifier_normalized=EXCLUDED.source_identifier_normalized,source_name_raw=EXCLUDED.source_name_raw,source_name_normalized=EXCLUDED.source_name_normalized,uom_raw=EXCLUDED.uom_raw,opening_quantity_raw=EXCLUDED.opening_quantity_raw,opening_quantity=EXCLUDED.opening_quantity,existing_quantity_raw=EXCLUDED.existing_quantity_raw,existing_quantity=EXCLUDED.existing_quantity,resolution_status_id=EXCLUDED.resolution_status_id,match_method=EXCLUDED.match_method
-                             RETURNING product_observation_id""", (sid, str(obs.get("identifier_raw")) if obs.get("identifier_raw") is not None else None, obs.get("identifier_normalized"), str(obs.get("name_raw")) if obs.get("name_raw") is not None else None, obs.get("name_normalized"), raw_uom, str(src.get("期初库存")) if src.get("期初库存") is not None else None, opening, str(src.get("现有库存")) if src.get("现有库存") is not None else None, existing_qty, observation_status, obs.get("match_method")))
+                             RETURNING product_observation_id""", (sid, str(obs.get("identifier_raw")) if obs.get("identifier_raw") is not None else None, obs.get("identifier_normalized"), str(obs.get("name_raw")) if obs.get("name_raw") is not None else None, obs.get("name_normalized"), raw_uom, str(src.get("opening_quantity")) if src.get("opening_quantity") is not None else None, opening, str(src.get("existing_quantity")) if src.get("existing_quantity") is not None else None, existing_qty, observation_status, obs.get("match_method")))
                 product_observation_id = int(cur.fetchone()[0])
                 counts["product_observations_loaded"] += 1
-                for issue_code, raw in ((opening_issue, src.get("期初库存")), (existing_issue, src.get("现有库存"))):
+                for issue_code, raw in ((opening_issue, src.get("opening_quantity")), (existing_issue, src.get("existing_quantity"))):
                     if issue_code and record_quality_issue(conn, sid, issue_code, status_review, "库存汇总数量需要仓管复核", str(raw) if raw is not None else None, product_observation_id=product_observation_id, source_batch=batch_id):
                         counts["quality_issues"] += 1
                 if obs.get("resolution_status") != "candidate_exact":
@@ -192,7 +193,7 @@ def load(args: argparse.Namespace) -> dict[str, Any]:
                 if obs.get("identifier_normalized"):
                     existing = one(conn, """SELECT p.product_id FROM product p
                                       JOIN product_identifier pi ON pi.product_id=p.product_id
-                                      WHERE p.display_name=%s AND pi.namespace='workbook.xlsx'
+                                      WHERE p.display_name=%s AND pi.namespace='mapped_xlsx'
                                         AND pi.identifier_type='source_number' AND pi.value_normalized=%s""",
                                    (str(display_name), obs["identifier_normalized"]))
                 else:
@@ -209,10 +210,10 @@ def load(args: argparse.Namespace) -> dict[str, Any]:
                 product_uoms[product_id] = int(one(conn, "SELECT COALESCE(default_uom_id,%s) AS uom_id FROM product WHERE product_id=%s", (unknown_uom, product_id))["uom_id"])
                 identifier = obs.get("identifier_raw")
                 if identifier is not None:
-                    exists = one(conn, "SELECT product_identifier_id FROM product_identifier WHERE product_id=%s AND identifier_type='source_number' AND namespace='workbook.xlsx' AND value_normalized=%s", (product_id, obs["identifier_normalized"]))
+                    exists = one(conn, "SELECT product_identifier_id FROM product_identifier WHERE product_id=%s AND identifier_type='source_number' AND namespace='mapped_xlsx' AND value_normalized=%s", (product_id, obs["identifier_normalized"]))
                     if not exists:
                         audit(conn, "SEED_PRODUCT_IDENTIFIER", "product_identifier", after={"product_id": product_id, "value": str(identifier)}, source_batch=batch_id)
-                        cur.execute("INSERT INTO product_identifier(product_id,identifier_type,namespace,value_raw,value_normalized,is_primary,source_record_id) VALUES (%s,'source_number','workbook.xlsx',%s,%s,true,%s)", (product_id, str(identifier), obs["identifier_normalized"], sid))
+                        cur.execute("INSERT INTO product_identifier(product_id,identifier_type,namespace,value_raw,value_normalized,is_primary,source_record_id) VALUES (%s,'source_number','mapped_xlsx',%s,%s,true,%s)", (product_id, str(identifier), obs["identifier_normalized"], sid))
 
                 cur.execute("UPDATE product_observation SET resolved_product_id=%s,resolution_status_id=%s WHERE source_record_id=%s AND observation_ordinal=1", (product_id, status_active, sid))
                 if existing_qty is not None and existing_issue in (None, "zero_quantity", "negative_quantity"):
@@ -233,7 +234,7 @@ def load(args: argparse.Namespace) -> dict[str, Any]:
                 sid = source_record(conn, batch_id, candidate.get("source", {}), candidate["sheet"], block, candidate["source_row_number"], status_observed)
                 source_ids[(candidate["sheet"], block, candidate["source_row_number"])] = sid
                 src = candidate.get("source", {})
-                name = next((v for k, v in src.items() if "名称" in str(k) or str(k) == "品名"), None)
+                name = candidate.get("name_raw")
                 product_key = (candidate.get("identifier_normalized"), norm(name))
                 product_id = product_ids.get(product_key)
                 clean = candidate.get("movement_date") and candidate.get("quantity") is not None and candidate.get("quantity") > 0 and not candidate.get("data_quality_issues")
@@ -274,6 +275,7 @@ def load(args: argparse.Namespace) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, type=Path)
+    parser.add_argument("--mapping", required=True, type=Path)
     parser.add_argument("--password-env", default="IMPORT_WORKBOOK_PASSWORD")
     parser.add_argument("--apply", action="store_true", help="write to DATABASE_URL; default is dry-run")
     parser.add_argument("--post-opening", action="store_true", help="post reviewed positive opening quantities; requires --cutover-date")
@@ -284,7 +286,7 @@ def main() -> int:
     password = os.environ.get(args.password_env)
     if not password:
         parser.error(f"environment variable {args.password_env} is empty")
-    print(json.dumps(load(argparse.Namespace(input=args.input, password=password, apply=args.apply, post_opening=args.post_opening, cutover_date=args.cutover_date)), ensure_ascii=False, sort_keys=True))
+    print(json.dumps(load(argparse.Namespace(input=args.input, mapping=args.mapping, password=password, apply=args.apply, post_opening=args.post_opening, cutover_date=args.cutover_date)), ensure_ascii=False, sort_keys=True))
     return 0
 
 

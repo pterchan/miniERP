@@ -13,6 +13,7 @@ import { DOC_GROUP_TYPES, documentRoute } from './documents'
 import { masterRoute } from './master-data'
 import { reportRoute } from './reports'
 import { prepareImage } from './image-utils'
+import { stripBasePath, withBasePath } from './app-path'
 import { SerialDetail, SerialEntry, SerialLedger } from './serial'
 
 import {
@@ -410,9 +411,10 @@ function Profile({ user }) {
 }
 
 function AppRouter({ user, onLogout }) {
-  const [path, setPath] = useState(window.location.pathname + window.location.search)
-  useEffect(() => { const fn = () => setPath(window.location.pathname + window.location.search); window.addEventListener('popstate', fn); return () => window.removeEventListener('popstate', fn) }, [])
-  const navigate = to => { window.history.pushState({}, '', to); setPath(to) }
+  const currentLocation = () => stripBasePath(window.location.pathname) + window.location.search
+  const [path, setPath] = useState(currentLocation)
+  useEffect(() => { const fn = () => setPath(currentLocation()); window.addEventListener('popstate', fn); return () => window.removeEventListener('popstate', fn) }, [])
+  const navigate = to => { window.history.pushState({}, '', withBasePath(to)); setPath(currentLocation()) }
   const clean = normalizePath(path.split('?')[0])
   return <RouterContext.Provider value={{ navigate, currentPath: clean }}><Layout user={user} onLogout={onLogout}>{routeView(clean, user, new URLSearchParams(path.split('?')[1] || ''))}</Layout></RouterContext.Provider>
 }

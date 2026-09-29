@@ -1,3 +1,5 @@
+import { withBasePath } from './app-path'
+
 class ApiError extends Error {
   constructor(message, status, retryAfter) { super(message); this.status = status; this.retryAfter = retryAfter }
 }
@@ -36,7 +38,7 @@ const api = {
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
     let response
     try {
-      response = await fetch(`/api${path}`, { credentials: 'include', ...rest, headers, signal: controller.signal })
+      response = await fetch(withBasePath(`/api${path}`), { credentials: 'include', ...rest, headers, signal: controller.signal })
     } catch (err) {
       if (err.name === 'AbortError' && !signal?.aborted) {
         throw new ApiError(`请求超时（${Math.round(timeoutMs / 1000)}s 无响应），请重试`, 408)
@@ -59,7 +61,7 @@ const api = {
   requestUpload(path, formData, { onProgress, timeoutMs = 120000, signal } = {}) {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest()
-      xhr.open('POST', `/api${path}`)
+      xhr.open('POST', withBasePath(`/api${path}`))
       xhr.responseType = 'json'
       xhr.withCredentials = true
       const csrf = csrfToken()
@@ -154,7 +156,7 @@ const api = {
   postDocument: async (id, payload) => { const r = await api.request(`/documents/${id}/post`, { method: 'POST', body: JSON.stringify(payload) }); invalidateInventory(); return r },
   reverseDocument: async (id) => { const r = await api.request(`/documents/${id}/reverse`, { method: 'POST', body: '{}' }); invalidateInventory(); return r },
   addAttachment: (id, file, options = {}) => { const form = new FormData(); form.append('file', file); return api.requestUpload(`/documents/${id}/attachments`, form, options) },
-  attachmentUrl: (attachmentId) => `/api/attachments/${attachmentId}`,
+  attachmentUrl: (attachmentId) => withBasePath(`/api/attachments/${attachmentId}`),
   // 货品附图（MinIO）
   productImages: (productId) => api.request(`/products/${productId}/images`),
   uploadProductImages: (productId, files, options = {}) => {
@@ -162,7 +164,7 @@ const api = {
     files.forEach(file => form.append('files', file))
     return api.requestUpload(`/products/${productId}/images`, form, options)
   },
-  productImageContent: (imageId, size = '') => size ? `/api/product-images/${imageId}/content?size=${size}` : `/api/product-images/${imageId}/content`,
+  productImageContent: (imageId, size = '') => size ? withBasePath(`/api/product-images/${imageId}/content?size=${size}`) : withBasePath(`/api/product-images/${imageId}/content`),
   updateProductImage: (imageId, payload) => api.request(`/product-images/${imageId}`, { method: 'PUT', body: JSON.stringify(payload) }),
   deleteProductImage: (imageId) => api.request(`/product-images/${imageId}`, { method: 'DELETE' }),
   // 主数据

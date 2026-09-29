@@ -6,4 +6,5 @@ web/node_modules
 web/dist
 outputs
 .env
-workbook.xlsx
+*.xlsx
+*.xls

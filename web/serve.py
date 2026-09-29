@@ -31,8 +31,24 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(DIST), **kwargs)
 
+    def _app_path(self) -> str:
+        """Strip the public /erp prefix for direct high-port inspection.
+
+        The host Nginx normally strips this prefix before the request reaches
+        the container, but keeping the fallback here makes the published
+        18080 endpoint self-contained and easier to diagnose.
+        """
+        clean = self.path.split("?", 1)[0]
+        suffix = self.path[len(clean):]
+        if clean == "/erp":
+            return "/" + suffix
+        if clean.startswith("/erp/"):
+            return clean[4:] + suffix
+        return self.path
+
     def _is_api(self) -> bool:
-        return self.path == "/api" or self.path.startswith("/api/")
+        path = self._app_path()
+        return path == "/api" or path.startswith("/api/")
 
     def _proxy(self) -> None:
         body = None
@@ -47,7 +63,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             for key, value in self.headers.items()
             if key.lower() not in {"host", "content-length", *HOP_BY_HOP}
         }
-        upstream_path = "/healthz" if self.path == "/api/healthz" else self.path
+        app_path = self._app_path()
+        upstream_path = "/healthz" if app_path == "/api/healthz" else app_path
         request = urllib.request.Request(
             f"{API_ORIGIN}{upstream_path}", data=body, headers=headers, method=self.command
         )
@@ -112,6 +129,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return io.BytesIO(data)
 
     def _serve_static(self) -> None:
+        self.path = self._app_path()
         candidate = DIST / self.path.split("?", 1)[0].lstrip("/")
         if not candidate.is_file():
             self.path = "/index.html"
@@ -137,5 +155,5 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("WEB_PORT_INTERNAL", "80"))
+    port = int(os.getenv("WEB_PORT_INTERNAL", "8080"))
     http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
