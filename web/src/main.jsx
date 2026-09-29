@@ -9,6 +9,7 @@ import ProductGallery from './product-gallery'
 import { formatInventorySummary, formatMoney, formatQuantity } from './list-utils'
 import { isInventoryDocumentPath, isNavigationItemActive, normalizePath } from './navigation-utils'
 import { ROLE_LABELS, can, canEdit, canView } from './roles'
+import { confirmDirtyLeave } from './ui'
 import { DOC_GROUP_TYPES, documentRoute } from './documents'
 import { masterRoute } from './master-data'
 import { reportRoute } from './reports'
@@ -81,7 +82,7 @@ function Dashboard() {
     { key: 'product_name', label: '货品名称', filterType: 'search', searchKeys: ['identifier', 'product_name', 'manufacturer', 'specification', 'location_name', 'condition_code', 'uom_code'] },
     { key: 'location_name', label: '库位', filterType: 'text', value: r => r.location_name || '—' },
     { key: 'condition_code', label: '成色', filterType: 'select', filterOptions: conditionOptions, value: r => r.condition_code || '—' },
-    { key: 'on_hand_quantity', label: '现库存', align: 'end', value: r => formatQuantity(r.on_hand_quantity) },
+    { key: 'on_hand_quantity', label: '现库存', align: 'end', value: r => formatQuantity(r.on_hand_quantity), sortValue: r => Number(r.on_hand_quantity || 0) },
     { key: 'uom_code', label: '单位', value: r => r.uom_code || '—' },
   ], [conditionOptions])
   const inventoryKey = r => `${r.product_id}:${r.location_id}:${r.condition_id}:${r.uom_id}`
@@ -414,7 +415,7 @@ function AppRouter({ user, onLogout }) {
   const currentLocation = () => stripBasePath(window.location.pathname) + window.location.search
   const [path, setPath] = useState(currentLocation)
   useEffect(() => { const fn = () => setPath(currentLocation()); window.addEventListener('popstate', fn); return () => window.removeEventListener('popstate', fn) }, [])
-  const navigate = to => { window.history.pushState({}, '', withBasePath(to)); setPath(currentLocation()) }
+  const navigate = to => { if (!confirmDirtyLeave()) return; window.history.pushState({}, '', withBasePath(to)); setPath(currentLocation()) }
   const clean = normalizePath(path.split('?')[0])
   return <RouterContext.Provider value={{ navigate, currentPath: clean }}><Layout user={user} onLogout={onLogout}>{routeView(clean, user, new URLSearchParams(path.split('?')[1] || ''))}</Layout></RouterContext.Provider>
 }

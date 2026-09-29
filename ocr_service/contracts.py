@@ -16,7 +16,7 @@ class ExtractRequest(BaseModel):
     # Keep this as a string at the transport boundary so the service can map
     # an unsupported MIME to HTTP 415 instead of Pydantic's generic 422.
     media_type: str = Field(min_length=1, max_length=100)
-    image_base64: str = Field(min_length=16)
+    image_base64: str = Field(min_length=16, max_length=19_000_000)  # 14MB 原图的 base64 上限
 
     @field_validator("image_base64")
     @classmethod

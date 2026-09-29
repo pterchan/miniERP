@@ -160,6 +160,8 @@ const api = {
   submitDocument: (id) => api.request(`/documents/${id}/submit`, { method: 'POST', body: '{}' }),
   postDocument: async (id, payload) => { const r = await api.request(`/documents/${id}/post`, { method: 'POST', body: JSON.stringify(payload) }); invalidateInventory(); return r },
   reverseDocument: async (id) => { const r = await api.request(`/documents/${id}/reverse`, { method: 'POST', body: '{}' }); invalidateInventory(); return r },
+  withdrawDocument: (id) => api.request(`/documents/${id}/withdraw`, { method: 'POST', body: '{}' }),
+  rejectDocument: (id, reason) => api.request(`/documents/${id}/reject`, { method: 'POST', body: JSON.stringify({ reason }) }),
   addAttachment: (id, file, options = {}) => { const form = new FormData(); form.append('file', file); return api.requestUpload(`/documents/${id}/attachments`, form, options) },
   attachmentUrl: (attachmentId) => withBasePath(`/api/attachments/${attachmentId}`),
   // 货品附图（MinIO）
@@ -171,6 +173,7 @@ const api = {
   },
   productImageContent: (imageId, size = '') => size ? withBasePath(`/api/product-images/${imageId}/content?size=${size}`) : withBasePath(`/api/product-images/${imageId}/content`),
   updateProductImage: (imageId, payload) => api.request(`/product-images/${imageId}`, { method: 'PUT', body: JSON.stringify(payload) }),
+  reorderProductImages: (productId, order) => api.request(`/products/${productId}/images/reorder`, { method: 'POST', body: JSON.stringify({ order }) }),
   deleteProductImage: (imageId) => api.request(`/product-images/${imageId}`, { method: 'DELETE' }),
   // 主数据
   categories: () => api.request('/categories'),

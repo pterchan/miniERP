@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 ROLE_VALUES = ("ADMIN", "WAREHOUSE", "SALES", "FINANCE", "COLLEAGUE")
 
@@ -269,7 +269,7 @@ class DocCreateIn(BaseModel):
 
 
 class DocUpdateIn(BaseModel):
-    """All fields optional + optimistic-lock version, like StockRequestPatch."""
+    """All fields are optional + optimistic-lock version, like StockRequestPatch."""
     version: int = Field(gt=0)
     party_id: int | None = None
     doc_date: date | None = None
@@ -281,6 +281,14 @@ class DocUpdateIn(BaseModel):
 
     _d = field_validator("deposit_amount")(_money_scale)
 
+    @model_validator(mode="after")
+    def _reject_explicit_nulls(self) -> "DocUpdateIn":
+        # 显式传 null 会击穿 NOT NULL/CHECK 约束变成 500；未传（缺省）不受影响
+        for field in ("party_id", "doc_date", "deposit_amount"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} 不允许显式置空；如需修改请提供有效值")
+        return self
+
 
 class DocSubmitIn(BaseModel):
     override_review: bool = False
@@ -290,6 +298,11 @@ class SerialParseIn(BaseModel):
     """解析一段 SN 文本并标注登记状态，供出库前预检。纯读取不写库。"""
     product_id: int
     text: str = Field(min_length=1, max_length=20000)
+
+
+class ImageReorderIn(BaseModel):
+    """按目标顺序提交货品全部图片的 image_id 列表，服务端一次性原子重排。"""
+    order: list[int] = Field(min_length=1, max_length=500)
 
 
 class AttachmentIn(BaseModel):

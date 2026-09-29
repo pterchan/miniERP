@@ -5,12 +5,27 @@ import { withBasePath } from './app-path'
 export const RouterContext = createContext({ navigate: () => {}, currentPath: '/' })
 export const useRouter = () => useContext(RouterContext)
 
+// SPA 站内导航的脏表单守卫：beforeunload 只覆盖刷新/关闭，navigate() 走这里。
+let _dirtyLeaveHandler = null
+
+/** 注册脏离开判定（返回 false 拦截导航）；返回反注册函数。 */
+export function registerDirtyLeave(handler) {
+  _dirtyLeaveHandler = handler
+  return () => { if (_dirtyLeaveHandler === handler) _dirtyLeaveHandler = null }
+}
+
+export function confirmDirtyLeave() {
+  return !_dirtyLeaveHandler || _dirtyLeaveHandler() !== false
+}
+
 export function Link({ to, children, className = '', onClick, ...props }) {
   const { navigate } = useRouter()
   return <a className={className} href={withBasePath(to)} onClick={e => {
     if (onClick) onClick(e)
     // 修饰键/非左键点击（新标签、下载等）交给浏览器原生行为
     if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return
+    // 脏表单守卫在共享层拦截（AppRouter.navigate 亦同），未确认不离开当前页
+    if (!confirmDirtyLeave()) return
     e.preventDefault()
     navigate(to)
   }} {...props}>{children}</a>
@@ -53,12 +68,14 @@ export class ErrorBoundary extends React.Component {
 }
 
 export function useDirtyLeaveGuard(dirty) {
+  // 浏览器刷新/关闭 + SPA 站内导航（navigate/Link）双通道拦截
   useEffect(() => {
     if (!dirty) return undefined
     const handler = event => { event.preventDefault(); event.returnValue = '' }
     window.addEventListener('beforeunload', handler)
     return () => window.removeEventListener('beforeunload', handler)
   }, [dirty])
+  useEffect(() => registerDirtyLeave(() => (dirty ? window.confirm('有未保存的修改，确定离开？') : true)), [dirty])
 }
 
 export function useIsMobile(query = '(max-width: 760px)') {

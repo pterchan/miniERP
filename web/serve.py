@@ -23,6 +23,14 @@ _GZIP_TYPES = {
     "image/svg+xml", "text/html", "text/plain",
 }
 _ASSET_CACHE = "public, max-age=31536000, immutable"
+# 统一安全响应头：与两份 nginx 配置保持一致（网关契约）
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "same-origin",
+    "Content-Security-Policy": "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'",
+}
+_PROXY_TIMEOUT = int(os.getenv("WEB_PROXY_TIMEOUT_SECONDS", "60"))
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -69,7 +77,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             f"{API_ORIGIN}{upstream_path}", data=body, headers=headers, method=self.command
         )
         try:
-            response = urllib.request.urlopen(request, timeout=35)
+            response = urllib.request.urlopen(request, timeout=_PROXY_TIMEOUT)
             status, response_headers, payload = response.status, response.headers, response.read()
         except urllib.error.HTTPError as exc:
             status, response_headers, payload = exc.code, exc.headers, exc.read()
@@ -99,6 +107,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Encoding", "gzip")
             self.send_header("Vary", "Accept-Encoding")
         self.send_header("Cache-Control", "no-cache")
+        for key, value in _SECURITY_HEADERS.items():
+            self.send_header(key, value)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(payload)
@@ -109,7 +119,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         clean = self.path.split("?", 1)[0]
         path = self.translate_path(clean)
         if not os.path.isfile(path):
-            return super().send_head()
+            # 非文件路径（含目录）不落入父类的目录列表，按 SPA 回退；
+            # index.html 自身缺失则交父类返回 404，避免无限递归
+            if clean == "/index.html":
+                return super().send_head()
+            return self._fallback_index()
+
+    def _fallback_index(self):
+        self.path = "/index.html"
+        return self.send_head()
         ctype = self.guess_type(path)
         with open(path, "rb") as fh:
             data = fh.read()
@@ -122,6 +140,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Content-type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", cache)
+        for key, value in _SECURITY_HEADERS.items():
+            self.send_header(key, value)
         if compressible:
             self.send_header("Content-Encoding", "gzip")
             self.send_header("Vary", "Accept-Encoding")

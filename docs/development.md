@@ -78,7 +78,7 @@ docker compose -f docker-compose.test.yml down -v        # 测试完销毁
 
 **新增前端页面**：`web/src/` 新建组件 → `main.jsx` 的 `routeView()` 加路径映射 → `roles.js` 的 `PAGE_ACCESS` 声明可见角色（记得这只是 UX，后端权限才是强制层）→ 补 vitest。
 
-**新增迁移**：见[数据模型·迁移约定](data-model.md#迁移约定新增迁移时)（幂等、补跑路径、同步 `test_schema_static.py`/相关静态测试）。
+**新增迁移**：见[数据模型·迁移约定](data-model.md#迁移约定新增迁移时)（幂等、补跑路径、同步 `test_schema_static.py`/相关静态测试）；新增幂等迁移需同步加入 `deploy/deploy_remote.sh` 的补跑清单，并把重放验证交给 `tests/test_migrations_idempotent.py`。
 
 **新增单据类型**：`api/permissions.py` 的 `DOC_TYPE_META`（前缀/角色/库存与往来效果）→ 003 迁移的字典/约束 → `test_erp_static.py` → 前端 `documents.jsx`。
 

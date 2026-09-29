@@ -18,3 +18,16 @@ describe('write-permission map', () => {
     expect(canView({ role: 'COLLEAGUE' }, 'system')).toBe(false)
   })
 })
+
+describe('master-data write access aligns with backend', () => {
+  it('customers: only SALES/ADMIN may create (FINANCE gets 403 from backend)', () => {
+    expect(canEdit({ role: 'SALES' }, 'customers')).toBe(true)
+    expect(canEdit({ role: 'ADMIN' }, 'customers')).toBe(true)
+    expect(canEdit({ role: 'FINANCE' }, 'customers')).toBe(false)
+  })
+
+  it('suppliers: only WAREHOUSE/ADMIN may create', () => {
+    expect(canEdit({ role: 'WAREHOUSE' }, 'suppliers')).toBe(true)
+    expect(canEdit({ role: 'FINANCE' }, 'suppliers')).toBe(false)
+  })
+})

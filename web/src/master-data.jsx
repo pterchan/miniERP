@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import api from './api'
 import DataTable from './data-table'
 import { formatMoney, formatQuantity } from './list-utils'
-import { canView } from './roles'
+import { canEdit, canView } from './roles'
 import {
   Back, Badge, Button, Empty, ErrorBox, Field, Forbidden, Link, Loading,
   PageHeading, useDirtyLeaveGuard, useRouter,
@@ -38,7 +38,7 @@ function CustomerList({ user }) {
     { key: 'receivable_balance', label: '应收', align: 'end', value: r => `¥ ${formatMoney(r.receivable_balance)}` },
     { key: 'is_active', label: '状态', filterType: 'select', filterOptions: [{ value: 'true', label: '启用' }, { value: 'false', label: '停用' }], value: r => r.is_active, render: r => r.is_active ? '启用' : '停用' },
   ], [])
-  return <section><PageHeading eyebrow="销售" title="客户档案" description="客户名称、联系人、结算方式、等级、欠款上限与应收余额。">{canView(user, 'customers') && <Button className="primary" onClick={() => navigate('/master/customers/new')}>＋ 新增客户</Button>}</PageHeading><div className="panel"><ErrorBox error={error} /><DataTable mode="client" columns={columns} rows={rows} rowKey={c => String(c.customer_id)} rowHref={c => `/master/customers/${c.customer_id}`} exportConfig={{ endpoint: '/api/customers/export', filename: '客户', allScope: 'ids' }} /></div></section>
+  return <section><PageHeading eyebrow="销售" title="客户档案" description="客户名称、联系人、结算方式、等级、欠款上限与应收余额。">{canEdit(user, 'customers') && <Button className="primary" onClick={() => navigate('/master/customers/new')}>＋ 新增客户</Button>}</PageHeading><div className="panel"><ErrorBox error={error} /><DataTable mode="client" columns={columns} rows={rows} rowKey={c => String(c.customer_id)} rowHref={c => `/master/customers/${c.customer_id}`} exportConfig={{ endpoint: '/api/customers/export', filename: '客户', allScope: 'ids' }} /></div></section>
 }
 
 function CustomerForm({ id, user }) {
@@ -76,7 +76,7 @@ function SupplierList({ user }) {
     { key: 'payable_balance', label: '应付', align: 'end', value: r => `¥ ${formatMoney(r.payable_balance)}` },
     { key: 'is_active', label: '状态', filterType: 'select', filterOptions: [{ value: 'true', label: '启用' }, { value: 'false', label: '停用' }], value: r => r.is_active, render: r => r.is_active ? '启用' : '停用' },
   ], [])
-  return <section><PageHeading eyebrow="采购" title="供应商档案" description="供应商联系方式、账期、采购均价与应付余额。">{canView(user, 'suppliers') && <Button className="primary" onClick={() => navigate('/master/suppliers/new')}>＋ 新增供应商</Button>}</PageHeading><div className="panel"><ErrorBox error={error} /><DataTable mode="client" columns={columns} rows={rows} rowKey={s => String(s.supplier_id)} rowHref={s => `/master/suppliers/${s.supplier_id}`} exportConfig={{ endpoint: '/api/suppliers/export', filename: '供应商', allScope: 'ids' }} /></div></section>
+  return <section><PageHeading eyebrow="采购" title="供应商档案" description="供应商联系方式、账期、采购均价与应付余额。">{canEdit(user, 'suppliers') && <Button className="primary" onClick={() => navigate('/master/suppliers/new')}>＋ 新增供应商</Button>}</PageHeading><div className="panel"><ErrorBox error={error} /><DataTable mode="client" columns={columns} rows={rows} rowKey={s => String(s.supplier_id)} rowHref={s => `/master/suppliers/${s.supplier_id}`} exportConfig={{ endpoint: '/api/suppliers/export', filename: '供应商', allScope: 'ids' }} /></div></section>
 }
 
 function SupplierForm({ id, user }) {
@@ -108,15 +108,15 @@ export function masterRoute(first, parts, query, user) {
   if (kind === 'categories') return canView(user, 'categories') ? <CategoryTree user={user} /> : <Forbidden />
   if (kind === 'customers') {
     if (!canView(user, 'customers')) return <Forbidden />
-    if (id === 'new') return <CustomerForm user={user} />
-    if (sub === 'edit') return <CustomerForm id={id} user={user} />
+    if (id === 'new') return canEdit(user, 'customers') ? <CustomerForm user={user} /> : <Forbidden />
+    if (sub === 'edit') return canEdit(user, 'customers') ? <CustomerForm id={id} user={user} /> : <Forbidden />
     if (id) return <CustomerDetail id={id} user={user} />
     return <CustomerList user={user} />
   }
   if (kind === 'suppliers') {
     if (!canView(user, 'suppliers')) return <Forbidden />
-    if (id === 'new') return <SupplierForm user={user} />
-    if (sub === 'edit') return <SupplierForm id={id} user={user} />
+    if (id === 'new') return canEdit(user, 'suppliers') ? <SupplierForm user={user} /> : <Forbidden />
+    if (sub === 'edit') return canEdit(user, 'suppliers') ? <SupplierForm id={id} user={user} /> : <Forbidden />
     if (id) return <SupplierDetail id={id} user={user} />
     return <SupplierList user={user} />
   }

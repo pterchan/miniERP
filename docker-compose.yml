@@ -13,6 +13,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    restart: unless-stopped
     ports:
       - "${POSTGRES_PORT:-127.0.0.1:5432}:5432"
 
@@ -34,6 +35,7 @@ services:
       OCR_PROXY_TIMEOUT_SECONDS: ${OCR_PROXY_TIMEOUT_SECONDS:-25}
       ERP_COOKIE_PATH: ${ERP_COOKIE_PATH:-/}
       ERP_SECURE_COOKIES: ${ERP_SECURE_COOKIES:-0}
+      ERP_DISABLE_DOCS: ${ERP_DISABLE_DOCS:-1}
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?set MINIO_ACCESS_KEY}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY}
@@ -48,11 +50,13 @@ services:
         condition: service_healthy
     # 图片解码/导出等内存放大路径的兜底上限，与 ocr 服务一致
     mem_limit: 1g
+    restart: unless-stopped
     ports:
       - "${API_PORT:-127.0.0.1:8000}:8000"
 
   minio:
     image: ${MINIO_IMAGE:-minio/minio:latest}
+    restart: unless-stopped
     command: server /data --console-address :9001
     environment:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?set MINIO_ACCESS_KEY}
@@ -86,6 +90,7 @@ services:
       timeout: 5s
       retries: 12
     mem_limit: 1g
+    restart: unless-stopped
 
   web:
     build:
@@ -93,6 +98,7 @@ services:
       dockerfile: ${WEB_DOCKERFILE:-Dockerfile}
     depends_on:
       - api
+    restart: unless-stopped
     ports:
       - "${WEB_PORT:-127.0.0.1:18080}:8080"
 

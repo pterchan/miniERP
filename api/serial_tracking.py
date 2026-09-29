@@ -20,9 +20,9 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Res
 from openpyxl import load_workbook
 
 from .db import audit, connection, fetch_all, fetch_one
-from .export import export_response
+from .export import MAX_EXPORT_ROWS, export_response
 from .helpers import _condition_id, _normalize_identifier, _status_id
-from .list_params import clamp_page, clamp_page_size, parse_filters, parse_sort
+from .list_params import clamp_page, clamp_page_size, like_escape, parse_filters, parse_sort
 from .permissions import _csrf, require_user
 from .schemas import SerialParseIn
 
@@ -297,7 +297,7 @@ def _serial_where(q: str, f: list[str]) -> tuple[str, list[Any]]:
     params: list[Any] = []
     if q.strip():
         clauses.append("cs.serial_number ILIKE %s")
-        params.append(f"%{normalize_sn(q)}%")
+        params.append("%" + like_escape(normalize_sn(q)) + "%")
     try:
         fw, fp = parse_filters(f, _SERIAL_FILTERS)
     except ValueError as exc:
@@ -327,7 +327,7 @@ def serial_ledger_export(q: str = "", sort: str = "", order: str = "asc", f: lis
     where, params = _serial_where(q, f)
     order_by = parse_sort(sort, order, _SERIAL_SORT, "serial_number")
     with connection() as conn:
-        rows = fetch_all(conn, f"SELECT * FROM v_serial_ledger cs WHERE {where} ORDER BY {order_by}", tuple(params))
+        rows = fetch_all(conn, f"SELECT * FROM v_serial_ledger cs WHERE {where} ORDER BY {order_by} LIMIT %s", tuple(params + [MAX_EXPORT_ROWS + 1]))
     return export_response(rows, _SERIAL_COLUMNS, "序列台账", fmt)
 
 

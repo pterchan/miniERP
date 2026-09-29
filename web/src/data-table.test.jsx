@@ -147,3 +147,16 @@ describe('DataTable row links', () => {
     expect(navigate).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('DataTable numeric sorting', () => {
+  it('sorts formatted numeric columns by their raw value via sortValue', () => {
+    const cols = [{ key: 'qty', label: '数量', align: 'end', value: r => `¥ ${r.qty}`, sortValue: r => Number(r.qty) }]
+    render(<DataTable columns={cols} rows={rows} rowKey={r => String(r.id)} />)
+    const sortButton = screen.getByRole('button', { name: /数量/ })
+    const values = () => screen.getAllByRole('cell').map(c => c.textContent).filter(Boolean)
+    fireEvent.click(sortButton) // 升序：3 → 5 → 9（字典序会得到 9 > 5 > 3 的错误顺序）
+    expect(values()).toEqual(['¥ 3', '¥ 5', '¥ 9'])
+    fireEvent.click(sortButton) // 降序
+    expect(values()).toEqual(['¥ 9', '¥ 5', '¥ 3'])
+  })
+})

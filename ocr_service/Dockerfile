@@ -19,5 +19,9 @@ COPY ocr_service /app/ocr_service
 # while building the image makes a missing model fail before deployment.
 RUN python -c "from ocr_service.engines.rapidocr import RapidOCRBackend; RapidOCRBackend()"
 
+# 非 root 运行：图像解码栈（OpenCV/Pillow/onnxruntime）历史漏洞频繁，限制爆炸半径
+RUN useradd --system --no-create-home --uid 10001 appuser && chown -R appuser /app
+USER appuser
+
 EXPOSE 8010
 CMD ["uvicorn", "ocr_service.app:app", "--host", "0.0.0.0", "--port", "8010", "--workers", "1"]

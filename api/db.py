@@ -34,18 +34,31 @@ def database_url() -> str:
 _pool: Any = None
 
 
+class PoolExhaustedError(RuntimeError):
+    """连接池耗尽：映射为 503 让客户端退避重试，而不是 500/挂死。"""
+
+
 def _get_pool() -> Any:
-    """惰性创建连接池：minconn=0 避免启动即连库，maxconn 耗尽时 getconn() 排队阻塞。"""
+    """惰性创建连接池：minconn=0 避免启动即连库。
+
+    connect_timeout 限制建连等待；statement_timeout 兜底慢查询（30s），
+    防止个别慢语句长期占用池内连接。
+    """
     global _pool
     if _pool is None:
-        _pool = _pg_pool.ThreadedConnectionPool(0, 30, database_url())
+        _pool = _pg_pool.ThreadedConnectionPool(
+            0, 30, database_url(), connect_timeout=5, options="-c statement_timeout=30000",
+        )
     return _pool
 
 
 @contextmanager
 def connection() -> Iterator[Any]:
     pool = _get_pool()
-    conn = pool.getconn()
+    try:
+        conn = pool.getconn()
+    except _pg_pool.PoolError as exc:
+        raise PoolExhaustedError("数据库连接池已耗尽，请稍后重试") from exc
     conn.autocommit = False
     try:
         yield conn

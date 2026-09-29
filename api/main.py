@@ -12,9 +12,9 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, s
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import documents, images, master, reports, serial_tracking
-from .db import audit, connection, ensure_bootstrap_users, fetch_all, fetch_one
+from .db import PoolExhaustedError, audit, connection, ensure_bootstrap_users, fetch_all, fetch_one
 from .export import export_response, export_rows_by_ids
-from .list_params import clamp_page, clamp_page_size, parse_composite_ids, parse_filters, parse_ids, parse_sort
+from .list_params import clamp_page, clamp_page_size, like_escape, parse_composite_ids, parse_filters, parse_ids, parse_sort
 from .helpers import _condition_id, _line_uom_id, _movement_id, _normalize_identifier, _normalize_query, _request_meta, _status_id, lock_products
 from .ocr_client import OCRProxyError, forward_ocr
 from .permissions import CSRF_COOKIE, SESSION_COOKIE, _csrf, require_roles, require_user
@@ -44,7 +44,18 @@ from .schemas import (
 from .security import hash_password, random_token, token_hash, utc_after, verify_password
 
 
-app = FastAPI(title="miniERP", version="0.1.0")
+# 生产（Compose）默认关闭交互式文档；本地裸跑保持开启便于调试
+_disable_docs = os.environ.get("ERP_DISABLE_DOCS", "0") == "1"
+app = FastAPI(title="miniERP", version="0.1.0",
+              docs_url=None if _disable_docs else "/docs",
+              redoc_url=None if _disable_docs else "/redoc",
+              openapi_url=None if _disable_docs else "/openapi.json")
+
+
+@app.exception_handler(PoolExhaustedError)
+def _pool_exhausted_handler(_request: Request, _exc: PoolExhaustedError) -> Response:
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=503, content={"detail": "数据库连接池已耗尽，请稍后重试"}, headers={"Retry-After": "5"})
 COOKIE_PATH = os.environ.get("ERP_COOKIE_PATH", "/")
 app.add_middleware(
     CORSMiddleware,
@@ -324,9 +335,7 @@ _PRODUCT_COLUMNS = [
 ]
 
 
-def _like_escape(value: str) -> str:
-    """转义 LIKE 通配符，使 '%'/_'/'\\' 作为字面量参与子串匹配。"""
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+_like_escape = like_escape  # 共享实现：list_params.like_escape（列表筛选与搜索同一转义）
 
 
 def _product_where(q: str, filters: list[str]) -> tuple[str, list]:
@@ -727,11 +736,11 @@ def adjust_inventory(payload: InventoryAdjustIn, request: Request, user: dict[st
                   request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
             movement_id = None
             with conn.cursor() as cur:
-                cur.execute("""INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,source_uom_raw,notes,posted_at,posted_by)
-                             VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s) RETURNING inventory_movement_id""",
+                cur.execute("""INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,source_uom_raw,notes,posted_at,posted_by,posted_by_user_id)
+                             VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s,%s) RETURNING inventory_movement_id""",
                             (_movement_id(conn, "ADJUSTMENT"), _status_id(conn, "posted"), payload.product_id,
                              quantity, payload.uom_id, condition_id, source_location, destination_location,
-                             payload.source_uom_raw, payload.notes, user["username"]))
+                             payload.source_uom_raw, payload.notes, user["username"], user["user_id"]))
                 movement_id = cur.fetchone()[0]
             if payload.serial_numbers:
                 apply_adjustment_serials(conn, user, meta, movement_id, product,

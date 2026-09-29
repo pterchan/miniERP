@@ -1,0 +1,7 @@
+# web 构建上下文专用忽略（Docker 只读取上下文根的 .dockerignore，
+# 仓库根的忽略规则对 ./web 上下文不生效）。
+# 注意：dist 不能忽略——Dockerfile.remote 直接 COPY 构建产物。
+node_modules
+coverage
+*.log
+.DS_Store

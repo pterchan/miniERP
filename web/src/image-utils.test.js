@@ -60,11 +60,14 @@ describe('prepareUploadFile', () => {
     expect(out.type).toBe('image/jpeg')
   })
 
-  it('honours a custom maxBytes cap', async () => {
-    const file = new File(['x'], 'photo.jpeg', { type: 'image/jpeg' })
+  it('honours a custom maxBytes cap by re-encoding oversized images', async () => {
+    stubCanvasPipeline()  // canvas 可用 → 超限图走压缩分支而不是原样返回
+    const file = new File([new Uint8Array(2048).fill(7)], 'photo.jpeg', { type: 'image/jpeg' })
     const out = await prepareUploadFile(file, { maxBytes: 1 })
-    // 1 字节文件仍 ≤1 字节，原样返回；cap 不影响小文件
-    expect(out).toBe(file)
+    // cap=1 迫使重编码路径执行：输出是压缩产物而非原文件
+    expect(out).toBeInstanceOf(File)
+    expect(out).not.toBe(file)
+    expect(out.size).toBeLessThan(file.size)
   })
 
   it('re-encodes an over-limit jpeg to WebP when WebP encode is available', async () => {

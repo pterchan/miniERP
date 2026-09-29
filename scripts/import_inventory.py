@@ -111,10 +111,24 @@ def parse_date(value: Any) -> tuple[str | None, str | None]:
                 break
             except ValueError:
                 continue
+        else:
+            parsed = None
     if parsed is None:
         return None, "invalid_date"
     if not (date(1900, 1, 1) <= parsed <= date(2200, 1, 1)):
         return parsed.isoformat(), "out_of_range_date"
+    # 美式/欧式斜杠日期两解且结果不同：无法确定真实日期，必须转人工复核
+    for fmt_us, fmt_eu in (("%m/%d/%Y", "%d/%m/%Y"),):
+        try:
+            us = datetime.strptime(text, fmt_us).date()
+        except ValueError:
+            continue
+        try:
+            eu = datetime.strptime(text, fmt_eu).date()
+        except ValueError:
+            continue
+        if us != eu:
+            return parsed.isoformat(), "ambiguous_date"
     return parsed.isoformat(), None
 
 
@@ -463,6 +477,12 @@ def _extract_mapped(wb: Any, mapping: dict[str, Any]) -> tuple[list[dict[str, An
                 name = safe.get("name")
                 if normalize_text(identifier) is None and normalize_text(name) is None:
                     continue
+                issues: list[str] = []
+                for qty_field in ("opening_quantity", "existing_quantity"):
+                    if qty_field in raw and raw[qty_field] is not None:
+                        _, issue = parse_quantity(raw[qty_field])
+                        if issue:
+                            issues.append(issue)
                 observations.append({
                     "sheet": entry["name"],
                     "source_row_number": row_number,
@@ -470,6 +490,7 @@ def _extract_mapped(wb: Any, mapping: dict[str, Any]) -> tuple[list[dict[str, An
                     "identifier_normalized": normalize_identifier(identifier),
                     "name_raw": json_value(name),
                     "name_normalized": normalize_identifier(name),
+                    "data_quality_issues": issues,
                     "source": safe,
                 })
                 counts["products"] += 1

@@ -21,7 +21,7 @@ from .db import audit, connection, fetch_all, fetch_one
 from .helpers import _request_meta
 from .image_utils import ImageTooLargeError, _ext_for_type, _make_thumbnail, _reencode_to_cap, _sniff_image_type
 from .permissions import _csrf, require_roles, require_user
-from .schemas import ImageUpdateIn
+from .schemas import ImageReorderIn, ImageUpdateIn
 from .storage import bucket_name, get_client
 
 router = APIRouter(prefix="/api", tags=["images"])
@@ -156,6 +156,35 @@ def upload_product_images(
     except Exception:
         _cleanup_objects(uploaded_keys)
         raise
+
+
+@router.post("/products/{product_id}/images/reorder")
+def reorder_product_images(
+    product_id: int,
+    payload: ImageReorderIn,
+    request: Request,
+    user: dict[str, Any] = Depends(require_roles("ADMIN", "WAREHOUSE")),
+) -> list[dict[str, Any]]:
+    """一次性原子重排：单事务内锁定并重写全部 sort_order。
+
+    替代前端两次 PUT 的交换——那次第中间失败会留下重复 sort_order 且无回滚。
+    """
+    _csrf(request)
+    meta = _request_meta(request)
+    with connection() as conn:
+        if not fetch_one(conn, "SELECT product_id FROM product WHERE product_id=%s", (product_id,)):
+            raise HTTPException(status_code=404, detail="货品不存在")
+        rows = fetch_all(conn, "SELECT image_id FROM product_image WHERE product_id=%s ORDER BY sort_order, image_id FOR UPDATE", (product_id,))
+        existing = [int(r["image_id"]) for r in rows]
+        if sorted(payload.order) != sorted(existing):
+            raise HTTPException(status_code=422, detail="排序清单必须恰好包含该货品的全部图片")
+        audit(conn, user, "EDIT", "product_image", after={"product_id": product_id, "order": payload.order},
+              request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
+        with conn.cursor() as cur:
+            for sort_order, image_id in enumerate(payload.order, start=1):
+                cur.execute("UPDATE product_image SET sort_order=%s WHERE image_id=%s", (sort_order, image_id))
+        return fetch_all(conn, """SELECT image_id, product_id, filename, content_type, size, sort_order, uploaded_by, created_at
+                                    FROM product_image WHERE product_id=%s ORDER BY sort_order, image_id""", (product_id,))
 
 
 @router.get("/product-images/{image_id}/content")

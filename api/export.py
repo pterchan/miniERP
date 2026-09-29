@@ -124,5 +124,9 @@ def export_rows_by_ids(
         params: list[Any] = id_list
     else:
         where, params, order_by = "TRUE", [], default_order
+        # 全量导出在 SQL 层限行（上限+1），超限由 export_response 统一 422，避免先物化
+        limit_clause = f" LIMIT {MAX_EXPORT_ROWS + 1}"
+        rows = fetch_all(conn, base_query.format(where=where, order_by=order_by) + limit_clause, tuple(params))
+        return export_response(rows, columns, filename, fmt)
     rows = fetch_all(conn, base_query.format(where=where, order_by=order_by), tuple(params))
     return export_response(rows, columns, filename, fmt)

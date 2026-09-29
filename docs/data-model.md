@@ -4,7 +4,7 @@
 
 ## 迁移的两种执行方式
 
-- **全新卷**：postgres 容器首次初始化时，`docker-compose.yml` 把 `db/migrations` 只读挂载到 `/docker-entrypoint-initdb.d`，由官方镜像入口按文件名顺序自动执行 001→006。
+- **全新卷**：postgres 容器首次初始化时，`docker-compose.yml` 把 `db/migrations` 只读挂载到 `/docker-entrypoint-initdb.d`，由官方镜像入口按文件名顺序自动执行 001→008。
 - **已有卷**（本地升级或测试环境）：`docker-entrypoint-initdb.d` 不会重跑，需要手动或由 `deploy/deploy_remote.sh` 幂等补跑新增迁移，例如：
 
   ```sh
@@ -25,6 +25,8 @@
 | `003_full_erp.sql` | 进销存一体扩展：RBAC 扩为五角色（ADMIN/WAREHOUSE/SALES/FINANCE/COLLEAGUE）、`department`、`product_category`、`product_price_tier`、`customer`、`supplier`、通用业务单据（`business_document` + `business_document_line`，覆盖采购/销售/库存 11 种 doc_type）、应收应付台账 `ar_ap_entry`、客户/供应商余额视图、BYTEA 附件 `document_attachment`。 |
 | `004_product_images.sql` | `product_image` 表：图片字节存 MinIO（`object_key` 形如 `products/{pid}/{uuid}.{ext}`，永不下发客户端），库内只存元数据，带审计触发器；单图 ≤20MB。 |
 | `005_search_indexes.sql` | 搜索性能：`pg_trgm` 扩展 + 与 `api/main.py` `_product_where` 的 LIKE 左值**逐字节一致**的表达式 trgm 索引（名称/厂家/型号）、缩略图列。幂等，可在已有库安全重跑。 |
+| `007_login_throttle.sql` | 登录防爆破：`login_attempt`（用户名哈希+IP+结果）与查询索引。幂等。 |
+| `008_hardening.sql` | 加固：audit_event 的 TRUNCATE 防护触发器；多态 party 的存在性触发器（business_document/ar_ap_entry）；外键列索引；`posted_by_user_id`/`reversed_by_user_id` 用户外键；`uom.decimal_scale` 收敛 0-3。幂等。 |
 | `006_serial_tracking.sql` | SN/UUID 流向追踪：激活 001 的资产域。`product.serialized` 是货品级软开关（登记可选，不填 SN 仍可过账）；单件以 `asset` + `asset_identifier(product_serial)` 建档，流向记 `asset_event`，经 `inventory_movement_asset` 关联流水；SN 按货品唯一（复用 001 的部分唯一索引）。重定义 `v_asset_current_state`、新增 `v_serial_ledger` 视图——注意 `CREATE OR REPLACE VIEW` 只能追加列，不能改变既有列顺序。 |
 
 ## 核心对象速览

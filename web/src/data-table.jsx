@@ -85,9 +85,11 @@ export default function DataTable({
     if (sortKey) {
       const dir = sortDir === 'asc' ? 1 : -1
       const col = columns.find(c => c.key === sortKey)
+      // 格式化列（如「¥ 1,200」）必须按 sortValue 原始值比较，否则退化为字典序
+      const sortValue = row => (col.sortValue ? col.sortValue(row) : cellValue(row, col))
       list = [...list].sort((a, b) => {
-        const av = cellValue(a, col)
-        const bv = cellValue(b, col)
+        const av = sortValue(a)
+        const bv = sortValue(b)
         if (av == null && bv == null) return 0
         if (av == null) return -dir
         if (bv == null) return dir

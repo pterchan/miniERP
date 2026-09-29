@@ -50,11 +50,12 @@ export default function ProductGallery({ productId, canEdit }) {
     const index = sorted.findIndex(x => x.image_id === image.image_id)
     const target = index + dir
     if (index < 0 || target < 0 || target >= sorted.length) return
-    const a = sorted[index]; const b = sorted[target]
+    // 原子重排：两次单独 PUT 中途失败会留下重复 sort_order 且无回滚
+    const next = [...sorted]
+    const a = next[index]; next[index] = next[target]; next[target] = a
     setError(null)
     try {
-      await api.updateProductImage(a.image_id, { sort_order: b.sort_order })
-      await api.updateProductImage(b.image_id, { sort_order: a.sort_order })
+      await api.reorderProductImages(next[0].product_id, next.map(x => x.image_id))
       await load()
     } catch (err) { setError(err) }
   }

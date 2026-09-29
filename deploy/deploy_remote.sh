@@ -49,6 +49,11 @@ done
   echo "远程目录必须是只含字母、数字、点、下划线、连字符和斜杠的绝对路径" >&2
   exit 2
 }
+# REMOTE_HOST 会嵌入远端 shell 单引号串，仅放行安全字符集，防止命令注入
+[[ "$REMOTE_HOST" =~ ^[A-Za-z0-9._:-]+$ ]] || {
+  echo "远程主机只能包含字母、数字、点、下划线、连字符和冒号（非法值：$REMOTE_HOST）" >&2
+  exit 2
+}
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${REMOTE_USER}@${REMOTE_HOST}"
@@ -167,15 +172,19 @@ docker compose --env-file .env config --quiet
 docker compose --env-file .env up -d --build --remove-orphans
 docker compose --env-file .env ps
 
+# 健康检查端口跟随 .env 的 WEB_PORT（形如 127.0.0.1:18080 或 18080）
+WEB_PORT_VALUE="$(grep -E '^WEB_PORT=' .env | cut -d= -f2- || true)"
+HEALTH_PORT="${WEB_PORT_VALUE##*:}"
+[[ "$HEALTH_PORT" =~ ^[0-9]+$ ]] || HEALTH_PORT=18080
 for attempt in $(seq 1 30); do
-  if curl --fail --silent --show-error "http://127.0.0.1:18080/api/healthz" >/dev/null; then break; fi
+  if curl --fail --silent --show-error "http://127.0.0.1:${HEALTH_PORT}/api/healthz" >/dev/null; then break; fi
   [[ "$attempt" -eq 30 ]] && { docker compose --env-file .env logs --tail=120 api postgres ocr; exit 1; }
   sleep 2
 done
 
 DB_USER="$(grep -E '^POSTGRES_USER=' .env | cut -d= -f2-)"
 DB_NAME="$(grep -E '^POSTGRES_DB=' .env | cut -d= -f2-)"
-for migration in 005_search_indexes.sql 006_serial_tracking.sql; do
+for migration in 005_search_indexes.sql 006_serial_tracking.sql 007_login_throttle.sql 008_hardening.sql; do
   docker compose --env-file .env exec -T postgres psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" \
     -f "/docker-entrypoint-initdb.d/$migration"
 done

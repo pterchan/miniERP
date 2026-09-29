@@ -16,13 +16,13 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Res
 from psycopg2 import Binary
 
 from .db import audit, connection, fetch_all, fetch_one
-from .export import attachment_disposition, export_response
+from .export import MAX_EXPORT_ROWS, attachment_disposition, export_response
 from .image_utils import ImageTooLargeError, _reencode_to_cap, _sniff_image_type
 from .list_params import clamp_page, clamp_page_size, parse_filters, parse_ids, parse_sort
 from .helpers import _condition_id, _line_uom_id, _movement_id, _request_meta, _status_id, lock_products
 from .permissions import DOC_TYPE_META, GROUP_META, _can_post, _csrf, require_user
 from .schemas import DocCreateIn, DocSubmitIn, DocUpdateIn
-from .serial_tracking import apply_line_serials, reverse_movement_serials
+from .serial_tracking import apply_adjustment_serials, apply_line_serials, reverse_movement_serials
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 attachments_router = APIRouter(prefix="/api/attachments", tags=["documents"])
@@ -200,11 +200,11 @@ def _insert_movement(conn: Any, user: dict[str, Any], req_meta: dict[str, Any], 
                  "movement_type": movement_code, "reversal_of": reversal_of},
           request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
     with conn.cursor() as cur:
-        cur.execute("""INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,document_id,reversal_of_movement_id,notes,posted_at,posted_by)
-                     VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s) RETURNING inventory_movement_id""",
+        cur.execute("""INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,document_id,reversal_of_movement_id,notes,posted_at,posted_by,posted_by_user_id)
+                     VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s,%s) RETURNING inventory_movement_id""",
                     (_movement_id(conn, movement_code), _status_id(conn, "posted"), line["product_id"], quantity,
                      line["uom_id"], _condition_id(conn, line["condition_id"]), source, dest,
-                     document_id or doc["document_id"], reversal_of, doc["notes"], user["username"]))
+                     document_id or doc["document_id"], reversal_of, doc["notes"], user["username"], user["user_id"]))
         return int(cur.fetchone()[0])
 
 
@@ -241,8 +241,12 @@ def _post_line(conn: Any, user: dict[str, Any], req_meta: dict[str, Any], doc: d
         if delta != 0:
             if delta < 0:
                 _require_sufficient_stock(conn, line, source, abs(delta))
-            _insert_movement(conn, user, req_meta, "ADJUSTMENT", doc, line, abs(delta),
-                             source if delta < 0 else None, source if delta > 0 else None)
+            adjustment_id = _insert_movement(conn, user, req_meta, "ADJUSTMENT", doc, line, abs(delta),
+                                             source if delta < 0 else None, source if delta > 0 else None)
+            # 盘点登记的 SN 与数量台账同步（schemas 注释承诺的语义）
+            product_row = fetch_one(conn, "SELECT product_id, display_name, serialized FROM product WHERE product_id=%s", (line["product_id"],))
+            apply_adjustment_serials(conn, user, req_meta, adjustment_id, product_row,
+                                     line.get("serial_numbers"), delta, condition_id, source)
         return
     if stock in ("IN", "OUT", "TRANSFER"):
         movement_code = MOVEMENT_FOR_DOC[doc["doc_type"]]
@@ -289,7 +293,7 @@ def _post_document(conn: Any, document_id: int, user: dict[str, Any], req_meta: 
           before={"status": doc["status"]}, after={"status": "POSTED"},
           request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
     with conn.cursor() as cur:
-        cur.execute("UPDATE business_document SET status='POSTED',posted_by=%s,posted_at=now(),updated_at=now() WHERE document_id=%s", (user["username"], document_id))
+        cur.execute("UPDATE business_document SET status='POSTED',posted_by=%s,posted_by_user_id=%s,posted_at=now(),updated_at=now() WHERE document_id=%s", (user["username"], user["user_id"], document_id))
     for line in lines:
         source, dest = locations[line["document_line_id"]]
         _post_line(conn, user, req_meta, doc, meta, line, source, dest)
@@ -321,18 +325,18 @@ def _reverse_document(conn: Any, document_id: int, user: dict[str, Any], req_met
           before={"status": "POSTED"}, after={"status": "REVERSED"},
           request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
     with conn.cursor() as cur:
-        cur.execute("UPDATE business_document SET status='REVERSED',reversed_by=%s,reversed_at=now(),updated_at=now() WHERE document_id=%s", (user["username"], document_id))
+        cur.execute("UPDATE business_document SET status='REVERSED',reversed_by=%s,reversed_by_user_id=%s,reversed_at=now(),updated_at=now() WHERE document_id=%s", (user["username"], user["user_id"], document_id))
     # 反向单据（直接 POSTED）
     rev_no = _next_doc_no(conn, doc["doc_type"])
     audit(conn, user, "CREATE", "business_document",
           after={"doc_type": doc["doc_type"], "doc_no": rev_no, "reversal_of": document_id},
           request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
     with conn.cursor() as cur:
-        cur.execute("""INSERT INTO business_document(doc_type,doc_no,status,doc_date,party_type,party_id,source_location_id,destination_location_id,deposit_amount,total_amount,notes,created_by,posted_by,posted_at,reversal_of_document_id)
-                     VALUES (%s,%s,'POSTED',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s) RETURNING document_id""",
+        cur.execute("""INSERT INTO business_document(doc_type,doc_no,status,doc_date,party_type,party_id,source_location_id,destination_location_id,deposit_amount,total_amount,notes,created_by,posted_by,posted_by_user_id,posted_at,reversal_of_document_id)
+                     VALUES (%s,%s,'POSTED',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s) RETURNING document_id""",
                     (doc["doc_type"], rev_no, doc["doc_date"], doc["party_type"], doc["party_id"],
                      doc["source_location_id"], doc["destination_location_id"], doc["deposit_amount"],
-                     doc["total_amount"], doc["notes"], user["user_id"], user["username"], document_id))
+                     doc["total_amount"], doc["notes"], user["user_id"], user["username"], user["user_id"], document_id))
         rev_doc_id = cur.fetchone()[0]
         # 反向单据复制原单明细，便于追溯
         original_lines = fetch_all(conn, "SELECT * FROM business_document_line WHERE document_id=%s ORDER BY line_no", (document_id,))
@@ -472,7 +476,7 @@ def documents_export(doc_type: str = "", group: str = "", sort: str = "", order:
         params.extend(id_list)
     order_by = parse_sort(sort, order, _DOC_SORT, "created_at")
     with connection() as conn:
-        rows = fetch_all(conn, _DOC_QUERY.format(where=where, order_by=order_by), tuple(params))
+        rows = fetch_all(conn, _DOC_QUERY.format(where=where, order_by=order_by) + " LIMIT %s", tuple(params + [MAX_EXPORT_ROWS + 1]))
     for row in rows:
         row["doc_type_label"] = DOC_TYPE_META[row["doc_type"]]["label"]
     return export_response(rows, _DOC_COLUMNS, "单据", fmt)
@@ -572,6 +576,10 @@ def update_document(document_id: int, payload: DocUpdateIn, request: Request, us
                 total += amount
                 line_rows.append((i, line, product, uom_id, price, amount))
         values = payload.model_dump(exclude_unset=True, exclude={"lines", "version"})
+        new_source = values.get("source_location_id", doc["source_location_id"])
+        new_dest = values.get("destination_location_id", doc["destination_location_id"])
+        if new_source is not None and new_dest is not None and new_source == new_dest:
+            raise HTTPException(status_code=422, detail="来源和目的库位不能相同")
         audit(conn, user, "EDIT", "business_document", target_id=document_id,
               before={"version": doc["version"]}, after={"version": doc["version"] + 1},
               request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])

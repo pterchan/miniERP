@@ -51,6 +51,23 @@ class GatewayContractTests(unittest.TestCase):
         self.assertIn("ERP_SECURE_COOKIES: ${ERP_SECURE_COOKIES:-0}", COMPOSE)
         self.assertIn("ERP_SECURE_COOKIES", ENV_EXAMPLE)
 
+    def test_static_servers_send_security_headers(self):
+        """三套静态/代理层统一安全响应头，且不暴露服务器版本。"""
+        for conf in (WEB_NGINX, GATEWAY, SERVE):
+            self.assertIn("X-Content-Type-Options", conf)
+            self.assertIn("X-Frame-Options", conf)
+            self.assertIn("Referrer-Policy", conf)
+            self.assertIn("Content-Security-Policy", conf)
+        self.assertIn("server_tokens off;", WEB_NGINX)
+        self.assertIn("server_tokens off;", GATEWAY)
+        self.assertIn("_SECURITY_HEADERS", SERVE)
+
+    def test_interactive_docs_disabled_in_compose(self):
+        """生产（Compose）默认关闭 /docs 与 openapi.json，避免未认证暴露完整 API 面。"""
+        self.assertIn("ERP_DISABLE_DOCS: ${ERP_DISABLE_DOCS:-1}", COMPOSE)
+        self.assertIn('os.environ.get("ERP_DISABLE_DOCS", "0") == "1"', API)
+        self.assertIn("docs_url=None if _disable_docs else \"/docs\"", API)
+
     def test_uvicorn_trusts_proxy_headers_for_audit_ip(self):
         """经 web 容器/网关代理时 uvicorn 必须解析 X-Forwarded-*，否则审计 IP 恒为代理地址。"""
         self.assertIn("--proxy-headers", API_DOCKERFILE)
@@ -82,12 +99,16 @@ class GatewayContractTests(unittest.TestCase):
         self.assertIn("path=COOKIE_PATH", API)
         self.assertIn("ERP_COOKIE_PATH=/erp", DEPLOY)
         self.assertIn("WEB_PORT=127.0.0.1:18080", DEPLOY)
-        self.assertIn("127.0.0.1:18080/api/healthz", DEPLOY)
+        # 健康检查端口跟随 .env 的 WEB_PORT 解析（自定义端口不再部署失败）
+        self.assertIn('HEALTH_PORT="${WEB_PORT_VALUE##*:}"', DEPLOY)
+        self.assertIn('127.0.0.1:${HEALTH_PORT}/api/healthz', DEPLOY)
 
     def test_remote_deployment_requires_explicit_target_and_import_mapping(self):
         self.assertIn('REMOTE_HOST="${DEPLOY_HOST:-}"', DEPLOY)
         self.assertIn('REMOTE_USER="${DEPLOY_USER:-}"', DEPLOY)
         self.assertIn('REMOTE_DIR="${DEPLOY_DIR:-}"', DEPLOY)
+        # REMOTE_HOST 嵌入远端 shell 串，必须有字符集白名单
+        self.assertIn('[[ "$REMOTE_HOST" =~ ^[A-Za-z0-9._:-]+$ ]]', DEPLOY)
         self.assertIn("--host HOST --user USER --remote-dir ABSOLUTE_PATH", DEPLOY)
         self.assertIn('--mapping FILE', DEPLOY)
         self.assertIn('[[ -f "$MAPPING_FILE" ]] || { echo "--seed-workbook 需要同时提供 --mapping"', DEPLOY)

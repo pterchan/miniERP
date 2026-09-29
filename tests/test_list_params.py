@@ -69,10 +69,10 @@ class FilterTests(unittest.TestCase):
         self.assertEqual(where, ["d.status IN (%s, %s)"])
         self.assertEqual(params, ["OPEN", "CLOSED"])
 
-    def test_empty_value_skips_filter(self):
-        where, params = parse_filters(["name:contains:"], self.ALLOW)
-        self.assertEqual(where, [])
-        self.assertEqual(params, [])
+    def test_empty_value_rejected_not_silently_dropped(self):
+        # 空筛选值若静默跳过，等于放行无过滤全量数据——必须显式 422
+        with self.assertRaises(ValueError):
+            parse_filters(["name:contains:"], self.ALLOW)
 
     def test_unknown_operator_rejected(self):
         with self.assertRaises(ValueError):

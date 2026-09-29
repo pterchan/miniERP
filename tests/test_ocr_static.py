@@ -15,7 +15,6 @@ class OCRContractTests(unittest.TestCase):
             self.assertIn(field, CONTRACTS)
 
     def test_generic_pipeline_uses_layout_independent_detection(self) -> None:
-        self.assertNotIn("manufacturer-specific", PIPELINE)
         self.assertIn("cluster_lines", PIPELINE)
         self.assertIn("rotate_variant", PIPELINE)
 

@@ -10,9 +10,16 @@ from typing import Any
 
 _ALLOWED_OPS = ("contains", "eq", "ne", "gt", "gte", "lt", "lte", "in")
 
+MAX_PAGE = 100_000  # 巨大页码会生成巨大 OFFSET 的慢查询
+
+
+def like_escape(value: str) -> str:
+    """转义 LIKE/ILIKE 通配符，使 '%'/_'/'\\' 作为字面量参与子串匹配（列表筛选与搜索共用）。"""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
 
 def clamp_page(page: int) -> int:
-    return max(1, int(page))
+    return max(1, min(int(page), MAX_PAGE))
 
 
 def clamp_page_size(page_size: int, cap: int = 500) -> int:
@@ -45,10 +52,10 @@ def parse_filters(filters: list[str], allow: dict[str, tuple[str, tuple[str, ...
         if op not in allowed_ops:
             raise ValueError(f"列 {col} 不支持操作: {op}")
         if value == "":
-            continue
+            raise ValueError(f"筛选值不能为空 → {item}")
         if op == "contains":
             where.append(f"{expr} ILIKE %s")
-            params.append(f"%{value}%")
+            params.append("%" + like_escape(value) + "%")
         elif op == "eq":
             where.append(f"{expr} = %s")
             params.append(value)
@@ -61,10 +68,11 @@ def parse_filters(filters: list[str], allow: dict[str, tuple[str, tuple[str, ...
             params.append(value)
         elif op == "in":
             values = [v.strip() for v in value.split(",") if v.strip()]
-            if values:
-                placeholders = ", ".join(["%s"] * len(values))
-                where.append(f"{expr} IN ({placeholders})")
-                params.extend(values)
+            if not values:
+                raise ValueError(f"in 筛选至少需要一个值 → {item}")
+            placeholders = ", ".join(["%s"] * len(values))
+            where.append(f"{expr} IN ({placeholders})")
+            params.extend(values)
     return where, params
 
 

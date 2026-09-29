@@ -202,47 +202,48 @@ def load(args: argparse.Namespace) -> dict[str, Any]:
                     if open_case(conn, sid, "identifier_collision", status_review, "货品编号对应多个规范名称，需仓管拆分/确认", batch_id):
                         counts["product_conflicts"] += 1
                     continue
-                if key in product_ids:
-                    continue
-                display_name = obs.get("name_raw") or "未命名货品"
-                if obs.get("identifier_normalized"):
-                    existing = one(conn, """SELECT p.product_id FROM product p
-                                      JOIN product_identifier pi ON pi.product_id=p.product_id
-                                      WHERE p.display_name=%s AND pi.namespace='mapped_xlsx'
-                                        AND pi.identifier_type='source_number' AND pi.value_normalized=%s""",
-                                   (str(display_name), obs["identifier_normalized"]))
-                else:
-                    existing = one(conn, "SELECT product_id FROM product WHERE display_name=%s", (str(display_name),))
-                if existing:
-                    product_id = int(existing["product_id"])
-                else:
-                    audit(conn, "SEED_PRODUCT", "product", after={"display_name": display_name, "source_record_id": sid}, source_batch=batch_id)
-                    raw_uom = source_unit(src)
-                    resolved_uom = resolve_uom(conn, raw_uom) or unknown_uom
-                    cur.execute("INSERT INTO product(display_name,default_uom_id,default_condition_id,status_id,source_uom_raw) VALUES (%s,%s,%s,%s,%s) RETURNING product_id", (str(display_name), resolved_uom, new_condition, status_active, raw_uom))
-                    product_id = int(cur.fetchone()[0]); counts["products"] += 1
-                product_ids[key] = product_id
-                product_uoms[product_id] = int(one(conn, "SELECT COALESCE(default_uom_id,%s) AS uom_id FROM product WHERE product_id=%s", (unknown_uom, product_id))["uom_id"])
-                identifier = obs.get("identifier_raw")
-                if identifier is not None:
-                    exists = one(conn, "SELECT product_identifier_id FROM product_identifier WHERE product_id=%s AND identifier_type='source_number' AND namespace='mapped_xlsx' AND value_normalized=%s", (product_id, obs["identifier_normalized"]))
-                    if not exists:
-                        audit(conn, "SEED_PRODUCT_IDENTIFIER", "product_identifier", after={"product_id": product_id, "value": str(identifier)}, source_batch=batch_id)
-                        cur.execute("INSERT INTO product_identifier(product_id,identifier_type,namespace,value_raw,value_normalized,is_primary,source_record_id) VALUES (%s,'source_number','mapped_xlsx',%s,%s,true,%s)", (product_id, str(identifier), obs["identifier_normalized"], sid))
+                if key not in product_ids:
+                    display_name = obs.get("name_raw") or "未命名货品"
+                    if obs.get("identifier_normalized"):
+                        existing = one(conn, """SELECT p.product_id FROM product p
+                                          JOIN product_identifier pi ON pi.product_id=p.product_id
+                                          WHERE p.display_name=%s AND pi.namespace='mapped_xlsx'
+                                            AND pi.identifier_type='source_number' AND pi.value_normalized=%s""",
+                                       (str(display_name), obs["identifier_normalized"]))
+                    else:
+                        existing = one(conn, "SELECT product_id FROM product WHERE display_name=%s", (str(display_name),))
+                    if existing:
+                        product_id = int(existing["product_id"])
+                    else:
+                        audit(conn, "SEED_PRODUCT", "product", after={"display_name": display_name, "source_record_id": sid}, source_batch=batch_id)
+                        raw_uom = source_unit(src)
+                        resolved_uom = resolve_uom(conn, raw_uom) or unknown_uom
+                        cur.execute("INSERT INTO product(display_name,default_uom_id,default_condition_id,status_id,source_uom_raw) VALUES (%s,%s,%s,%s,%s) RETURNING product_id", (str(display_name), resolved_uom, new_condition, status_active, raw_uom))
+                        product_id = int(cur.fetchone()[0]); counts["products"] += 1
+                    product_ids[key] = product_id
+                    product_uoms[product_id] = int(one(conn, "SELECT COALESCE(default_uom_id,%s) AS uom_id FROM product WHERE product_id=%s", (unknown_uom, product_id))["uom_id"])
+                    identifier = obs.get("identifier_raw")
+                    if identifier is not None:
+                        exists = one(conn, "SELECT product_identifier_id FROM product_identifier WHERE product_id=%s AND identifier_type='source_number' AND namespace='mapped_xlsx' AND value_normalized=%s", (product_id, obs["identifier_normalized"]))
+                        if not exists:
+                            audit(conn, "SEED_PRODUCT_IDENTIFIER", "product_identifier", after={"product_id": product_id, "value": str(identifier)}, source_batch=batch_id)
+                            cur.execute("INSERT INTO product_identifier(product_id,identifier_type,namespace,value_raw,value_normalized,is_primary,source_record_id) VALUES (%s,'source_number','mapped_xlsx',%s,%s,true,%s)", (product_id, str(identifier), obs["identifier_normalized"], sid))
 
-                cur.execute("UPDATE product_observation SET resolved_product_id=%s,resolution_status_id=%s WHERE source_record_id=%s AND observation_ordinal=1", (product_id, status_active, sid))
-                if existing_qty is not None and existing_issue in (None, "zero_quantity", "negative_quantity"):
-                    audit(conn, "SEED_SNAPSHOT", "inventory_snapshot", after={"product_id": product_id, "quantity": existing_qty}, source_batch=batch_id)
-                    cur.execute("INSERT INTO inventory_snapshot(snapshot_date,product_id,location_id,condition_id,uom_id,reported_quantity,source_record_id) VALUES (NULL,%s,%s,%s,%s,%s,%s) ON CONFLICT (source_record_id,source_line_no) DO NOTHING", (product_id, main_location, new_condition, product_uoms[product_id], existing_qty, sid))
+                # 同键多行（分批表达同一货品）：每行都回写 observation 与快照
+                cur.execute("UPDATE product_observation SET resolved_product_id=%s,resolution_status_id=%s WHERE source_record_id=%s AND observation_ordinal=1", (product_ids[key], status_active, sid))
+                if existing_qty is not None and existing_issue in (None, "zero_quantity", "negative_quantity") \
+                        and not one(conn, "SELECT 1 FROM inventory_snapshot WHERE source_record_id=%s AND source_line_no=1", (sid,)):
+                    audit(conn, "SEED_SNAPSHOT", "inventory_snapshot", after={"product_id": product_ids[key], "quantity": existing_qty}, source_batch=batch_id)
+                    cur.execute("INSERT INTO inventory_snapshot(snapshot_date,product_id,location_id,condition_id,uom_id,reported_quantity,source_record_id) VALUES (NULL,%s,%s,%s,%s,%s,%s) ON CONFLICT (source_record_id,source_line_no) DO NOTHING", (product_ids[key], main_location, new_condition, product_uoms[product_ids[key]], existing_qty, sid))
                     counts["snapshots"] += cur.rowcount
                 if opening is not None and opening > 0 and opening_issue is None and getattr(args, "post_opening", False):
                     if already_posted_content(conn, product_row_hash):
                         if record_quality_issue(conn, sid, "duplicate_movement", status_review, "期初数量与历史批次已过账内容重复，需人工确认", None, source_batch=batch_id):
                             counts["quality_issues"] += 1
                         counts["duplicates"] += 1
-                    else:
-                        audit(conn, "SEED_OPENING", "inventory_movement", after={"product_id": product_id, "quantity": opening}, source_batch=batch_id)
-                        cur.execute("INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,destination_location_id,source_record_id,posted_at,posted_by,source_uom_raw) SELECT movement_type_id,%s,%s,%s,%s,%s,%s,%s,%s,now(),'migration',%s FROM movement_type WHERE code='OPENING' ON CONFLICT (source_record_id,source_line_no) DO NOTHING", (posted_id, args.cutover_date, product_id, opening, product_uoms[product_id], new_condition, main_location, sid, source_unit(src)))
+                    elif not one(conn, "SELECT 1 FROM inventory_movement WHERE source_record_id=%s AND source_line_no=1", (sid,)):
+                        audit(conn, "SEED_OPENING", "inventory_movement", after={"product_id": product_ids[key], "quantity": opening}, source_batch=batch_id)
+                        cur.execute("INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,destination_location_id,source_record_id,posted_at,posted_by,source_uom_raw) SELECT movement_type_id,%s,%s,%s,%s,%s,%s,%s,%s,now(),'migration',%s FROM movement_type WHERE code='OPENING' ON CONFLICT (source_record_id,source_line_no) DO NOTHING", (posted_id, args.cutover_date, product_ids[key], opening, product_uoms[product_ids[key]], new_condition, main_location, sid, source_unit(src)))
                         counts["opening"] += cur.rowcount
                 elif opening is not None and opening > 0 and opening_issue is None:
                     counts["opening_deferred"] += 1
@@ -297,9 +298,10 @@ def load(args: argparse.Namespace) -> dict[str, Any]:
                 movement_uom = candidate_uom
                 source_location = main_location if movement_type.startswith("ISSUE_") else None
                 destination_location = main_location if movement_type == "RECEIPT" else None
-                audit(conn, "SEED_MOVEMENT", "inventory_movement", after={"product_id": product_id, "quantity": candidate["quantity"], "source_record_id": sid}, source_batch=batch_id)
-                cur.execute("INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,source_record_id,posted_at,posted_by,source_uom_raw) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),'migration',%s) ON CONFLICT (source_record_id,source_line_no) DO NOTHING", (movement_id, posted_id, candidate["movement_date"], product_id, candidate["quantity"], movement_uom, new_condition, source_location, destination_location, sid, raw_uom))
-                counts["movements"] += cur.rowcount
+                if not one(conn, "SELECT 1 FROM inventory_movement WHERE source_record_id=%s AND source_line_no=1", (sid,)):
+                    audit(conn, "SEED_MOVEMENT", "inventory_movement", after={"product_id": product_id, "quantity": candidate["quantity"], "source_record_id": sid}, source_batch=batch_id)
+                    cur.execute("INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,source_record_id,posted_at,posted_by,source_uom_raw) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),'migration',%s) ON CONFLICT (source_record_id,source_line_no) DO NOTHING", (movement_id, posted_id, candidate["movement_date"], product_id, candidate["quantity"], movement_uom, new_condition, source_location, destination_location, sid, raw_uom))
+                    counts["movements"] += cur.rowcount
         conn.commit()
         return {"mode": "applied", "source_sha256": report["summary"]["source_sha256"], "counts": dict(counts), "source_counts": report["summary"]["counts"]}
     except Exception:

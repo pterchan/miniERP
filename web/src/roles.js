@@ -29,7 +29,9 @@ export const can = (user, ...roles) => !!user && roles.includes(user.role)
 /** 写操作权限：角色 → 可执行写操作的资源（与后端 require_roles 对齐）。
  * 页面可见（PAGE_ACCESS）不等于可写；新增写入口时在此登记，避免前端放行后端 403。 */
 export const EDIT_ACCESS = {
-  uom: ['ADMIN'], // POST /api/uoms 仅 ADMIN
+  uom: ['ADMIN'],                                  // POST /api/uoms 仅 ADMIN
+  customers: ['SALES', 'ADMIN'],                   // POST /api/customers
+  suppliers: ['WAREHOUSE', 'ADMIN'],               // POST /api/suppliers
 }
 
 export const canEdit = (user, resource) => !!user && (EDIT_ACCESS[resource] || []).includes(user.role)
