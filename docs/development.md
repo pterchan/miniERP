@@ -28,11 +28,30 @@ cd web && npm ci && npm run dev              # :5173，/api 代理到 localhost:
 
 | 套件 | 命令 | 说明 |
 |---|---|---|
-| 后端 | `python3 -m unittest discover -s tests -v` | 13 个文件；不依赖外部数据库 |
+| 后端 | `python3 -m unittest discover -s tests -v` | 静态契约 + 纯函数测试；不依赖外部数据库 |
+| 后端（行为测试） | 见下方「行为测试与一次性测试库」 | TestClient + 真实 PostgreSQL，复现后端缺陷 |
 | 前端 | `cd web && npm test` | Vitest + Testing Library，测试与源码同目录 |
 | OCR 服务 | `python3 -m unittest discover -s ocr_service/tests -t .` | 契约/字段/几何/图像 IO/模型金标 |
 
 导入器测试使用运行时生成的合成 XLSX 与 JSON 映射，不需要真实业务数据；运行该模块需要 `cryptography` 与 `openpyxl`（已在 `api/requirements.txt`）。
+
+### 行为测试与一次性测试库
+
+后端行为测试（登录/CSRF/过账/红冲/SN 状态机等）需要真实 PostgreSQL，走独立的
+一次性测试库，与主栈数据完全隔离：
+
+```sh
+docker compose -f docker-compose.test.yml up -d --wait   # 起 127.0.0.1:15433 的一次性库
+python3 -m unittest discover -s tests -v                 # 行为测试自动启用
+docker compose -f docker-compose.test.yml down -v        # 测试完销毁
+```
+
+- 连接串由 `TEST_DATABASE_URL` 控制，默认 `postgresql://erp_test:erp_test@127.0.0.1:15433/erp_test`。
+- 测试库不可达时行为测试整类跳过（`tests/support/testdb.py`），静态/纯函数测试不受影响。
+- 每个测试类重建一次库：DROP SCHEMA 后按序重放 `db/migrations/*.sql`——
+  这本身就是迁移幂等性的持续回归验证（`tests/test_migrations_idempotent.py`）。
+- 公共基建：`tests/support/testdb.py`（建库/建用户/连接池切换）、`tests/support/api_client.py`
+  （TestClient 封装：登录、CSRF 双提交头、多角色身份）。
 
 ## 静态契约测试（本项目特有的防线）
 

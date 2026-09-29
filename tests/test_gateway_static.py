@@ -4,6 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 COMPOSE = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+TEST_COMPOSE = (ROOT / "docker-compose.test.yml").read_text(encoding="utf-8")
 API = (ROOT / "api/main.py").read_text(encoding="utf-8")
 VITE = (ROOT / "web/vite.config.js").read_text(encoding="utf-8")
 APP_PATH = (ROOT / "web/src/app-path.js").read_text(encoding="utf-8")
@@ -29,6 +30,13 @@ class GatewayContractTests(unittest.TestCase):
         self.assertIn('EXPOSE 8080', (ROOT / "web/Dockerfile").read_text(encoding="utf-8"))
         self.assertIn('EXPOSE 8080', (ROOT / "web/Dockerfile.remote").read_text(encoding="utf-8"))
         self.assertIn('os.getenv("WEB_PORT_INTERNAL", "8080")', SERVE)
+
+    def test_behavior_test_db_is_isolated_ephemeral_and_loopback(self):
+        """一次性行为测试库：数据在 tmpfs、端口仅绑回环，与主栈隔离。"""
+        self.assertIn('"127.0.0.1:15433:5432"', TEST_COMPOSE)
+        self.assertIn("- /var/lib/postgresql/data", TEST_COMPOSE)
+        self.assertNotIn("${POSTGRES_PORT", TEST_COMPOSE)
+        self.assertIn("TEST_DATABASE_URL", (ROOT / "tests/support/testdb.py").read_text(encoding="utf-8"))
 
     def test_gateway_owns_port_80_and_routes_erp(self):
         self.assertIn("listen 80 default_server;", GATEWAY)
