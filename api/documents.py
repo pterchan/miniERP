@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Res
 from psycopg2 import Binary
 
 from .db import audit, connection, fetch_all, fetch_one
-from .export import export_response
+from .export import attachment_disposition, export_response
 from .image_utils import _reencode_to_cap, _sniff_image_type
 from .list_params import clamp_page, clamp_page_size, parse_filters, parse_ids, parse_sort
 from .helpers import _condition_id, _line_uom_id, _movement_id, _request_meta, _status_id
@@ -28,6 +28,7 @@ attachments_router = APIRouter(prefix="/api/attachments", tags=["documents"])
 
 # 价格来源：销售单用销售价（可命中批发档）、采购单用采购成本价
 _MAX_ATTACHMENT = 10 * 1024 * 1024  # 附件 ≤10MB（与前端校验一致）
+_MAX_ATTACHMENTS_PER_DOC = 20       # 单个单据附件数量上限（防存储滥用）
 
 PRICE_SOURCE = {
     "PURCHASE_ORDER": "cost", "PURCHASE_RECEIPT": "cost", "PURCHASE_RETURN": "cost",
@@ -91,13 +92,19 @@ def _resolve_price(conn: Any, doc_type: str, line: Any, product: dict[str, Any])
     return Decimal(0)
 
 
-def _doc_detail(conn: Any, document_id: int, user: dict[str, Any]) -> dict[str, Any]:
+def _require_doc_view(conn: Any, document_id: int, user: dict[str, Any]) -> dict[str, Any]:
+    """取单据并校验当前角色的查看权——详情、附件上传/下载共用同一授权口径。"""
     row = fetch_one(conn, "SELECT * FROM business_document WHERE document_id=%s", (document_id,))
     if not row:
         raise HTTPException(status_code=404, detail="单据不存在")
-    meta = DOC_TYPE_META[row["doc_type"]]
-    if user["role"] not in meta["view_roles"]:
+    if user["role"] not in DOC_TYPE_META[row["doc_type"]]["view_roles"]:
         raise HTTPException(status_code=403, detail="无权查看此单据")
+    return row
+
+
+def _doc_detail(conn: Any, document_id: int, user: dict[str, Any]) -> dict[str, Any]:
+    row = _require_doc_view(conn, document_id, user)
+    meta = DOC_TYPE_META[row["doc_type"]]
     if row["party_type"] == "CUSTOMER":
         party = fetch_one(conn, "SELECT name FROM customer WHERE customer_id=%s", (row["party_id"],))
         row["party_name"] = party["name"] if party else None
@@ -615,8 +622,12 @@ def add_attachment(document_id: int, file: UploadFile = File(...), request: Requ
         if re:
             data, content_type, _ = re
     with connection() as conn:
-        if not fetch_one(conn, "SELECT document_id FROM business_document WHERE document_id=%s", (document_id,)):
-            raise HTTPException(status_code=404, detail="单据不存在")
+        doc = _require_doc_view(conn, document_id, user)
+        if doc["status"] not in ("DRAFT", "SUBMITTED"):
+            raise HTTPException(status_code=409, detail="仅草稿或已提交单据可添加附件")
+        count = fetch_one(conn, "SELECT count(*) AS n FROM document_attachment WHERE document_id=%s", (document_id,))
+        if int(count["n"]) >= _MAX_ATTACHMENTS_PER_DOC:
+            raise HTTPException(status_code=422, detail=f"单个单据附件数量已达上限 {_MAX_ATTACHMENTS_PER_DOC}")
         audit(conn, user, "UPLOAD", "document_attachment",
               after={"document_id": document_id, "filename": filename, "size": len(data)},
               request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
@@ -630,8 +641,14 @@ def add_attachment(document_id: int, file: UploadFile = File(...), request: Requ
 @attachments_router.get("/{attachment_id}")
 def download_attachment(attachment_id: int, user: dict[str, Any] = Depends(require_user)) -> Response:
     with connection() as conn:
-        row = fetch_one(conn, "SELECT * FROM document_attachment WHERE attachment_id=%s", (attachment_id,))
-    if not row:
-        raise HTTPException(status_code=404, detail="附件不存在")
-    headers = {"Content-Disposition": f'attachment; filename="{row["filename"]}"'}
-    return Response(content=bytes(row["data"]), media_type=row["content_type"], headers=headers)
+        row = fetch_one(conn, """SELECT a.*, d.doc_type
+                                   FROM document_attachment a
+                                   JOIN business_document d ON d.document_id=a.document_id
+                                  WHERE a.attachment_id=%s""", (attachment_id,))
+        if not row:
+            raise HTTPException(status_code=404, detail="附件不存在")
+        # 附件归属单据的查看权是唯一授权口径，防止跨角色按 ID 枚举下载
+        _require_doc_view(conn, row["document_id"], user)
+        headers = {"Content-Disposition": attachment_disposition(row["filename"]),
+                   "X-Content-Type-Options": "nosniff"}
+        return Response(content=bytes(row["data"]), media_type=row["content_type"], headers=headers)

@@ -8,7 +8,7 @@ miniERP 是面向小团队的进销存与 OA 审批系统，支持采购、销�
 
     cp .env.example .env
     # 编辑 .env，为所有密码和令牌设置随机值
-    docker compose up --build
+    scripts/dev_up.sh --build    # 校验占位密码后启动（等价于 docker compose up --build）
 
 打开 <http://127.0.0.1:18080/erp/>。PostgreSQL 首次启动时会按顺序运行数据库迁移。配置说明见[配置参考](docs/configuration.md)。
 

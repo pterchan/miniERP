@@ -7,7 +7,13 @@ export const useRouter = () => useContext(RouterContext)
 
 export function Link({ to, children, className = '', onClick, ...props }) {
   const { navigate } = useRouter()
-  return <a className={className} href={withBasePath(to)} onClick={e => { if (onClick) onClick(e); if (!e.defaultPrevented) { e.preventDefault(); navigate(to) } }} {...props}>{children}</a>
+  return <a className={className} href={withBasePath(to)} onClick={e => {
+    if (onClick) onClick(e)
+    // 修饰键/非左键点击（新标签、下载等）交给浏览器原生行为
+    if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return
+    e.preventDefault()
+    navigate(to)
+  }} {...props}>{children}</a>
 }
 
 export function NavLink({ to, children, className = '', onClick }) {

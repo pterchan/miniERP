@@ -22,12 +22,18 @@ MAX_EXPORT_ROWS = 50_000
 
 Column = tuple[str, Callable[[dict[str, Any]], Any]]
 
+# Excel/CSV 公式注入：以这些字符开头的字符串单元格在 Excel 打开时会被当公式执行
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
 
 def _cell(value: Any) -> Any:
     if value is None:
         return ""
     if hasattr(value, "isoformat"):  # date/datetime → 字符串
         return value.isoformat(sep=" ") if value.__class__.__name__ == "datetime" else value.isoformat()
+    if isinstance(value, str) and value[:1] in _FORMULA_PREFIXES:
+        # 前置单引号：CSV 里是 Excel 的文本标记（不显示），XLSX 里以普通字符串落库
+        return "'" + value
     return value
 
 
@@ -56,6 +62,18 @@ def xlsx_bytes(rows: list[dict[str, Any]], columns: list[Column]) -> bytes:
     return buffer.getvalue()
 
 
+def attachment_disposition(filename: str) -> str:
+    """构造安全 Content-Disposition：ASCII filename + RFC5987 filename*。
+
+    响应头按 latin-1 编码，原始用户文件名（中文/引号/CR/LF）不能直接进
+    filename=——统一在这里兜底，导出与附件下载共用。
+    """
+    filename_enc = quote(filename or "attachment", safe="")
+    ascii_name = (filename or "attachment").encode("ascii", "replace").decode("ascii").replace("?", "_")
+    ascii_name = ascii_name.replace('"', "_").replace("\r", "").replace("\n", "") or "attachment"
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{filename_enc}'
+
+
 def export_response(
     rows: list[dict[str, Any]],
     columns: list[Column],
@@ -75,14 +93,8 @@ def export_response(
         ext = "csv"
     else:
         raise HTTPException(status_code=422, detail="fmt 仅支持 csv 或 xlsx")
-    file_name = f"{filename}.{ext}"
-    filename_enc = quote(file_name, safe="")
-    # 普通 filename= 必须 ASCII（响应头按 latin-1 编码）；中文经 filename*=UTF-8'' 传递
-    ascii_name = file_name.encode("ascii", "replace").decode("ascii").replace("?", "_")
-    if not ascii_name:
-        ascii_name = f"export.{ext}"
-    disposition = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{filename_enc}'
-    return Response(content=content, media_type=media_type, headers={"Content-Disposition": disposition})
+    return Response(content=content, media_type=media_type,
+                    headers={"Content-Disposition": attachment_disposition(f"{filename}.{ext}")})
 
 
 def export_rows_by_ids(

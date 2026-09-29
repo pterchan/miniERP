@@ -14,7 +14,7 @@ services:
       timeout: 5s
       retries: 20
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${POSTGRES_PORT:-127.0.0.1:5432}:5432"
 
   api:
     build:
@@ -33,6 +33,7 @@ services:
       OCR_INTERNAL_TOKEN: ${OCR_INTERNAL_TOKEN:?set OCR_INTERNAL_TOKEN}
       OCR_PROXY_TIMEOUT_SECONDS: ${OCR_PROXY_TIMEOUT_SECONDS:-25}
       ERP_COOKIE_PATH: ${ERP_COOKIE_PATH:-/}
+      ERP_SECURE_COOKIES: ${ERP_SECURE_COOKIES:-0}
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?set MINIO_ACCESS_KEY}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY}
@@ -46,7 +47,7 @@ services:
       minio:
         condition: service_healthy
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "${API_PORT:-127.0.0.1:8000}:8000"
 
   minio:
     image: ${MINIO_IMAGE:-minio/minio:latest}

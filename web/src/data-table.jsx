@@ -1,5 +1,5 @@
 import React, { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
-import { Empty } from './ui'
+import { Empty, Link } from './ui'
 import { withBasePath } from './app-path'
 
 const EMPTY_EXTRA = {} // 稳定引用，避免默认对象每次渲染都改变、触发拉取 effect 重置
@@ -241,7 +241,7 @@ export default function DataTable({
                   return <tr key={key} className={selected.has(key) ? 'selected' : ''} aria-label={rowAriaLabel ? rowAriaLabel(row) : undefined}>
                     <td className="dt-checkbox-cell"><input type="checkbox" checked={selected.has(key)} onChange={() => toggleRow(key)} aria-label="选择行" /></td>
                     {columns.map(col => <td key={col.key} className={col.className || ''} data-label={col.label}>
-                      {link ? <a className="dt-cell-link" href={link}>{col.render ? col.render(row, col) : cellValue(row, col)}</a> : (col.render ? col.render(row, col) : cellValue(row, col))}
+                      {link ? <Link className="dt-cell-link" to={link}>{col.render ? col.render(row, col) : cellValue(row, col)}</Link> : (col.render ? col.render(row, col) : cellValue(row, col))}
                     </td>)}
                   </tr>
                 })}

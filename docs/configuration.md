@@ -21,17 +21,18 @@
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `POSTGRES_DB` / `POSTGRES_USER` | `inventory` | 数据库与数据库用户 |
-| `POSTGRES_PORT` | `5432` | PostgreSQL 宿主机映射端口 |
-| `API_PORT` | `8000` | API 宿主机映射端口 |
+| `POSTGRES_PORT` | `127.0.0.1:5432` | PostgreSQL 宿主机映射端口（缺省仅绑回环） |
+| `API_PORT` | `127.0.0.1:8000` | API 宿主机映射端口（缺省仅绑回环；对外请走网关） |
 | `WEB_PORT` | `127.0.0.1:18080` | Web 容器宿主机映射；推荐由前置 HTTPS 网关访问 |
 | `WEB_DOCKERFILE` | `Dockerfile` | Web 镜像构建方式；可选 `Dockerfile.remote` |
 | `ERP_COOKIE_PATH` | `/` | Cookie 路径；通过 `/erp/` 子路径访问时设为 `/erp` |
+| `ERP_SECURE_COOKIES` | `0` | 会话/CSRF Cookie 的 `Secure` 标志；部署到 TLS 网关后置 `1`（Compose 已透传） |
 | `CORS_ORIGINS` | `http://localhost` | 允许的来源，多个值用逗号分隔 |
 | `MINIO_BUCKET` | `erp-product-images` | 商品图片存储桶 |
 | `MINIO_CONSOLE_PORT` | `127.0.0.1:19001` | MinIO 控制台映射端口 |
 | `OCR_PROXY_TIMEOUT_SECONDS` | `25` | API 到 OCR 服务的超时 |
 
-`ERP_COOKIE_PATH`、`CORS_ORIGINS` 和 `WEB_PORT` 应与实际公开 URL、HTTPS 网关配置匹配。容器内部服务地址由 Compose 网络提供。
+`ERP_COOKIE_PATH`、`ERP_SECURE_COOKIES`、`CORS_ORIGINS` 和 `WEB_PORT` 应与实际公开 URL、HTTPS 网关配置匹配。容器内部服务地址由 Compose 网络提供。
 
 ## 前端构建
 

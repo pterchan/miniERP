@@ -20,10 +20,19 @@ class ExportContractTests(unittest.TestCase):
         self.assertIn("openpyxl", EXPORT)
 
     def test_disposition_header_is_ascii_safe(self):
-        # 响应头按 latin-1 编码，中文必须走 filename*=UTF-8''，普通 filename= 只能含 ASCII
-        self.assertIn("filename*=UTF-8''", EXPORT)
+        # 响应头按 latin-1 编码，中文必须走 filename*=UTF-8''，普通 filename= 只能含 ASCII；
+        # 导出与附件下载共用 attachment_disposition，禁止各处手拼 Content-Disposition
+        self.assertIn("def attachment_disposition", EXPORT)
         self.assertIn('.encode("ascii", "replace")', EXPORT)
-        self.assertIn('quote(file_name, safe="")', EXPORT)
+        self.assertIn('quote(filename or "attachment", safe="")', EXPORT)
+        self.assertIn("attachment_disposition(row[\"filename\"])", DOCS)
+        self.assertNotIn('f\'attachment; filename="{row["filename"]}"\'', DOCS)
+
+    def test_export_cells_neutralize_formula_injection(self):
+        # CSV/XLSX 单元格以 = + - @ 等开头时会被 Excel 当公式执行，统一在 _cell 清洗
+        self.assertIn("_FORMULA_PREFIXES", EXPORT)
+        self.assertIn('"\'" + value', EXPORT)
+        self.assertIn("_cell(extractor(row))", EXPORT)
 
     def test_list_params_injection_safety(self):
         self.assertIn("def parse_sort", LIST_PARAMS)

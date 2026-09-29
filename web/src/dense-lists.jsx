@@ -1,9 +1,10 @@
 import React from 'react'
 import { formatInventorySummary, formatQuantity } from './list-utils'
+import { withBasePath } from './app-path'
 
 function RowLink({ LinkComponent, to, children, ...props }) {
   if (LinkComponent) return <LinkComponent to={to} {...props}>{children}</LinkComponent>
-  return <a href={to} {...props}>{children}</a>
+  return <a href={withBasePath(to)} {...props}>{children}</a>
 }
 
 export function BalanceList({ rows, LinkComponent }) {

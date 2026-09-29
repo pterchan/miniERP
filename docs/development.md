@@ -7,8 +7,8 @@
 **A. 全栈容器**（最省事，改后端/前端代码需 rebuild）：
 
 ```sh
-cp .env.example .env   # 填必填项
-docker compose up --build
+cp .env.example .env   # 填必填项（随机密码/令牌）
+scripts/dev_up.sh --build   # 校验占位密码后启动
 # 入口 http://127.0.0.1:18080/erp/
 ```
 

@@ -76,17 +76,31 @@ def _extract_serials_from_file(data: bytes, filename: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _asset_by_sn(conn: Any, product_id: int, sn: str) -> dict[str, Any] | None:
-    """按 (product, SN) 查已建档资产；未建档返回 None。"""
+    """按 (product, SN) 查已建档资产及其**当前状态**；未建档返回 None。
+
+    当前状态必须取自 v_asset_current_state（最新事件推导）：asset.status_id 只是
+    建档初值，出库/回库只追加 asset_event，不改 asset 行——直接读列会把已出库
+    的 SN 永远当成在库（重复出库放行、退货回库被拒）。
+    """
     return fetch_one(
         conn,
-        """SELECT a.asset_id, a.status_id, a.condition_id, rs.code AS status_code
-             FROM asset a
-             JOIN asset_identifier ai ON ai.asset_id = a.asset_id
-             JOIN record_status rs ON rs.status_id = a.status_id
+        """SELECT s.asset_id, s.status_id, s.condition_id, s.status_code,
+                  s.current_location_id, s.latest_event_type
+             FROM v_asset_current_state s
+             JOIN asset_identifier ai ON ai.asset_id = s.asset_id
             WHERE ai.namespace=%s AND ai.identifier_type=%s AND ai.value_normalized=%s
               AND ai.is_verified AND ai.is_exclusive""",
         (f"{SN_IDENT_TYPE}.{product_id}", SN_IDENT_TYPE, normalize_sn(sn)),
     )
+
+
+def _require_in_stock(asset: dict[str, Any] | None, sn: str, action: str) -> int:
+    """出库/调拨/清点出库共用的在库校验；返回 asset_id。"""
+    if not asset:
+        raise HTTPException(status_code=422, detail=f"SN {sn} 未在库中登记，无法{action}")
+    if asset["status_code"] != "active":
+        raise HTTPException(status_code=422, detail=f"SN {sn} 当前状态为 {asset['status_code']}（不在库），无法{action}")
+    return int(asset["asset_id"])
 
 
 def _create_asset(conn: Any, user: dict[str, Any] | None, req_meta: dict[str, Any],
@@ -170,15 +184,11 @@ def apply_line_serials(conn: Any, user: dict[str, Any] | None, req_meta: dict[st
             asset_id = asset["asset_id"] if asset else _create_asset(conn, user, req_meta, product_id, sn, cond_id)
             _write_event(conn, user, req_meta, asset_id, movement_id, "received", "active", cond_id, None, dest)
         elif stock_effect == "OUT":
-            if not asset:
-                raise HTTPException(status_code=422, detail=f"SN {sn} 未在库中登记，无法出库")
-            asset_id = asset["asset_id"]
+            asset_id = _require_in_stock(asset, sn, "出库")
             _write_event(conn, user, req_meta, asset_id, movement_id, "issued", "retired",
                          cond_id, source, None)
         elif stock_effect == "TRANSFER":
-            if not asset:
-                raise HTTPException(status_code=422, detail=f"SN {sn} 未在库中登记，无法调拨")
-            asset_id = asset["asset_id"]
+            asset_id = _require_in_stock(asset, sn, "调拨")
             _write_event(conn, user, req_meta, asset_id, movement_id, "transferred", "active",
                          cond_id, source, dest)
         else:
@@ -229,9 +239,7 @@ def apply_adjustment_serials(conn: Any, user: dict[str, Any] | None, req_meta: d
             asset_id = asset["asset_id"] if asset else _create_asset(conn, user, req_meta, product["product_id"], sn, cond_id)
             _write_event(conn, user, req_meta, asset_id, movement_id, "received", "active", cond_id, None, location_id)
         else:
-            if not asset:
-                raise HTTPException(status_code=422, detail=f"SN {sn} 未在库中登记，无法出库")
-            asset_id = asset["asset_id"]
+            asset_id = _require_in_stock(asset, sn, "清点出库")
             _write_event(conn, user, req_meta, asset_id, movement_id, "issued", "retired", cond_id, location_id, None)
         _link(conn, user, req_meta, movement_id, asset_id)
 

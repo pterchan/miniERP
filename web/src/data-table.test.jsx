@@ -2,6 +2,7 @@ import React from 'react'
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import DataTable from './data-table'
+import { RouterContext } from './ui'
 
 afterEach(cleanup)
 
@@ -91,8 +92,7 @@ describe('DataTable client mode', () => {
   })
 })
 
-describe('DataTable server mode', () => {
-  it('fetches pages through fetchData and renders them', async () => {
+describe('DataTable server mode', () => {  it('fetches pages through fetchData and renders them', async () => {
     const fetchData = vi.fn(async (params, signal) => ({ items: rows, total: rows.length }))
     render(<DataTable mode="server" columns={columns} rows={[]} fetchData={fetchData} rowKey={r => String(r.id)} />)
     // 等待组件内部 200ms 防抖拉取
@@ -114,5 +114,36 @@ describe('DataTable server mode', () => {
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 300)) })
     expect(fetchData).toHaveBeenCalledTimes(2)
     expect(firstSignal.aborted).toBe(true)
+  })
+})
+
+describe('DataTable row links', () => {
+  const linkColumns = [{ key: 'name', label: '名称' }]
+
+  function renderTable(extra = {}) {
+    return render(
+      <RouterContext.Provider value={{ navigate: vi.fn(), currentPath: '/' }}>
+        <DataTable columns={linkColumns} rows={rows} rowKey={r => String(r.id)} rowHref={r => `/products/${r.id}`} {...extra} />
+      </RouterContext.Provider>,
+    )
+  }
+
+  it('anchors rows under the app base path so gateway deployments stay inside /erp/', () => {
+    renderTable()
+    expect(screen.getByText('苹果').closest('a')).toHaveAttribute('href', '/erp/products/1')
+  })
+
+  it('navigates via the router on plain click and leaves modified clicks to the browser', () => {
+    const navigate = vi.fn()
+    render(
+      <RouterContext.Provider value={{ navigate, currentPath: '/' }}>
+        <DataTable columns={linkColumns} rows={rows} rowKey={r => String(r.id)} rowHref={r => `/products/${r.id}`} />
+      </RouterContext.Provider>,
+    )
+    const anchor = screen.getByText('苹果').closest('a')
+    fireEvent.click(anchor)
+    expect(navigate).toHaveBeenCalledWith('/products/1')
+    fireEvent.click(anchor, { ctrlKey: true })
+    expect(navigate).toHaveBeenCalledTimes(1)
   })
 })

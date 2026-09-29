@@ -8,4 +8,4 @@
     sudo nginx -t
     sudo systemctl reload nginx
 
-Nginx 将 /erp/ 转发到本机 127.0.0.1:18080，并移除转发路径前缀。Compose Web 服务默认只绑定回环地址。部署到 TLS 终止代理后，将 ERP_SECURE_COOKIES=1 打开。
+Nginx 将 /erp/ 转发到本机 127.0.0.1:18080，并移除转发路径前缀。Compose Web 服务默认只绑定回环地址。部署到 TLS 终止代理后，将 ERP_SECURE_COOKIES=1 打开（Compose 与 `deploy/deploy_remote.sh` 生成的环境文件均已透传该变量）。

@@ -32,7 +32,7 @@ describe('dense business lists', () => {
     const list = screen.getByLabelText('货品列表')
     expect(within(list).getByText('规格 / 型号')).toBeInTheDocument()
     expect(within(list).getByText('3 BOX · 12 EA')).toBeInTheDocument()
-    expect(within(list).getByRole('link')).toHaveAttribute('href', '/products/7')
+    expect(within(list).getByRole('link')).toHaveAttribute('href', '/erp/products/7')
   })
 
   it('uses a placeholder while supplementary inventory is unavailable', () => {
