@@ -27,7 +27,9 @@
 | `WEB_DOCKERFILE` | `Dockerfile` | Web 镜像构建方式；可选 `Dockerfile.remote` |
 | `ERP_COOKIE_PATH` | `/` | Cookie 路径；通过 `/erp/` 子路径访问时设为 `/erp` |
 | `ERP_SECURE_COOKIES` | `0` | 会话/CSRF Cookie 的 `Secure` 标志；部署到 TLS 网关后置 `1`（Compose 已透传） |
-| `ERP_FORBID_NEGATIVE_STOCK` | `0` | 置 `1` 后出库/调拨/红冲反向移动前校验库存余额，不足返回 422；默认维持允许负库存的设计 |
+| `ERP_DB_POOL_MIN` | `1` | 每个 API worker 建池时创建并在归还后保留的连接数；`0` 表示不保留闲置连接，归还即关闭 |
+| `ERP_DB_POOL_MAX` | `30` | 每个 API worker 同时使用的连接上限；默认两个 worker 合计最多 60 条连接 |
+| `ERP_FORBID_NEGATIVE_STOCK` | `0` | 置 `1` 后业务单据、OA 放行、清点减少及红冲的来源侧移动均逐行校验库存余额，不足整单回滚并返回 422；默认维持允许负库存的设计 |
 | `ERP_DISABLE_DOCS` | Compose 为 `1` | 关闭 `/docs`、`/redoc`、`/openapi.json`；本地裸跑默认开启便于调试 |
 | `ERP_BOOTSTRAP_STRICT` | Compose 固定为 `1`，裸跑默认为 `0` | 置 `1` 时初始账号创建失败会中止 API 启动；Compose 中需修改服务配置才能改变该值 |
 | `CORS_ORIGINS` | `http://localhost` | 允许的来源，多个值用逗号分隔 |
@@ -37,6 +39,8 @@
 
 `ERP_COOKIE_PATH`、`ERP_SECURE_COOKIES`、`CORS_ORIGINS` 和 `WEB_PORT` 应与实际公开 URL、HTTPS 网关配置匹配。容器内部服务地址由 Compose 网络提供。
 
+连接池配置必须为整数，满足 `0 ≤ ERP_DB_POOL_MIN ≤ ERP_DB_POOL_MAX` 且最大值至少为 `1`；非法配置会在 API 启动时以中文报错，`ERP_BOOTSTRAP_STRICT=0` 也不会忽略配置错误。默认保留一条闲置连接用于复用；显式设为 `0` 会放弃复用。配置修改后需重启 API，连接预算应给其他客户端预留空间。
+
 ## API 固定运行参数
 
 以下参数由 `api/Dockerfile` 和 `api/db.py` 定义，当前没有对应的 `.env` 配置项：
@@ -44,11 +48,10 @@
 | 参数 | 当前值 | 说明 |
 |---|---|---|
 | uvicorn worker 数 | 容器为 `2` | 裸跑示例未指定 `--workers`，使用单进程 |
-| 每进程连接池 | 最小 `0`、最大 `30` | 两个 worker 合计最多 60 个连接；调整时须为其他客户端预留数据库连接预算 |
 | 建连超时 | `5` 秒 | 限制单次连接建立的等待 |
 | 查询超时 | `30` 秒 | PostgreSQL `statement_timeout=30000`，防止慢语句长期占用连接 |
 
-借出连接前探活，建连或探活中断最多尝试三次；池耗尽或尝试后仍不可用返回 `503` 与 `Retry-After: 5`。
+借出连接前探活，扩容建连或探活中断最多尝试三次；池构造时首次建连失败、池耗尽或探活最终失败，运行期均返回 `503` 与 `Retry-After: 5`。严格 bootstrap 模式下启动阶段建连失败会中止 API 启动。
 
 ## 前端构建
 

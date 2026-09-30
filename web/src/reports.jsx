@@ -37,7 +37,7 @@ function PurchaseReconciliation({ user }) {
     { key: 'doc_date', label: '单据日期', className: 'nowrap' }, moneyColumn('total_amount', '金额'),
     { key: 'posted_by', label: '过账人', filterType: 'text' },
   ], [])
-  return <section><PageHeading eyebrow="财务" title="采购对账" description="按供应商查询已过账采购入库，合计覆盖当前筛选的全部记录。" /><div className="panel"><ErrorBox error={error} /><DataTable tableId="reports.purchase" mode="server" columns={columns} fetchData={fetchData} rowKey={row => String(row.document_id)} rowHref={row => documentHref(row, user)} queryKeys={PURCHASE_QUERY}
+  return <section><PageHeading eyebrow="财务" title="采购对账" description="按供应商查看有效采购净额：入库增加、退货抵减，已红冲原单及反向单不计入。" /><div className="panel"><ErrorBox error={error} /><DataTable tableId="reports.purchase" mode="server" columns={columns} fetchData={fetchData} rowKey={row => String(row.document_id)} rowHref={row => documentHref(row, user)} queryKeys={PURCHASE_QUERY}
     toolbar={({ query, setQuery }) => <div className="actions"><Field label="供应商"><select value={query.supplier_id || ''} onChange={event => setQuery('supplier_id', event.target.value)}><option value="">全部</option>{suppliers.map(supplier => <option key={supplier.supplier_id} value={supplier.supplier_id}>{supplier.name}</option>)}</select></Field><DateFilters query={query} setQuery={setQuery} /></div>}
     exportConfig={{ endpoint: '/api/reports/purchase-reconciliation', allScope: 'server' }} footer={data => <Summary data={data} fields={[[ 'total_amount', '采购金额' ]]} />} /></div></section>
 }

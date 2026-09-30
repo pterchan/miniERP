@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import http.server
 import importlib
-import os
 import tempfile
 import threading
 import unittest
 import urllib.request
 from datetime import date, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 
 class ServeStaticTests(unittest.TestCase):
@@ -18,14 +18,18 @@ class ServeStaticTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.dist = tempfile.mkdtemp(prefix="serve-test-dist-")
+        cls.dist_dir = tempfile.TemporaryDirectory(prefix="serve-test-dist-")
+        cls.addClassCleanup(cls.dist_dir.cleanup)
+        cls.dist = cls.dist_dir.name
         (Path(cls.dist) / "index.html").write_text("<html>miniERP 测试首页</html>", encoding="utf-8")
         assets = Path(cls.dist) / "assets"
         assets.mkdir()
         (assets / "app.js").write_text("console.log('ok')", encoding="utf-8")
-        os.environ["WEB_DIST"] = cls.dist  # serve 模块在导入期读取
-
         serve = importlib.import_module("web.serve")
+        # 代理测试也会导入该模块；显式隔离静态目录，避免依赖测试导入顺序。
+        cls.dist_patch = patch.object(serve, "DIST", Path(cls.dist))
+        cls.dist_patch.start()
+        cls.addClassCleanup(cls.dist_patch.stop)
         cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), serve.Handler)
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -35,6 +39,7 @@ class ServeStaticTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
         cls.server.server_close()
+        cls.thread.join(timeout=5)
 
     def _get(self, path: str) -> tuple[int, str]:
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=5) as response:

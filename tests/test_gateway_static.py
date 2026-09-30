@@ -51,6 +51,20 @@ class GatewayContractTests(unittest.TestCase):
         self.assertIn("ERP_SECURE_COOKIES: ${ERP_SECURE_COOKIES:-0}", COMPOSE)
         self.assertIn("ERP_SECURE_COOKIES", ENV_EXAMPLE)
 
+    def test_pool_and_negative_stock_options_reach_api(self):
+        """池配置与负库存开关必须透传，默认保持每进程上限 30 和允许负库存。"""
+        remote_example = (ROOT / "deploy/remote.env.example").read_text(encoding="utf-8")
+        for name, default in (("ERP_DB_POOL_MIN", "1"), ("ERP_DB_POOL_MAX", "30"), ("ERP_FORBID_NEGATIVE_STOCK", "0")):
+            self.assertIn(f"{name}: ${{{name}:-{default}}}", COMPOSE)
+            self.assertIn(f"{name}={default}", ENV_EXAMPLE)
+            self.assertIn(f"{name}={default}", remote_example)
+
+    def test_nginx_preserves_public_host_including_port(self):
+        """同源判断需要完整公开 Host，两层反代均不得丢弃端口。"""
+        for conf in (WEB_NGINX, GATEWAY):
+            self.assertIn("proxy_set_header Host $http_host;", conf)
+            self.assertNotIn("proxy_set_header Host $host;", conf)
+
     def test_static_servers_send_security_headers(self):
         """三套静态/代理层统一安全响应头，且不暴露服务器版本。"""
         for conf in (WEB_NGINX, GATEWAY, SERVE):
@@ -101,9 +115,11 @@ class GatewayContractTests(unittest.TestCase):
         self.assertIn("path=COOKIE_PATH", API)
         self.assertIn("ERP_COOKIE_PATH=/erp", DEPLOY)
         self.assertIn("WEB_PORT=127.0.0.1:18080", DEPLOY)
-        # 健康检查端口跟随 .env 的 WEB_PORT 解析（自定义端口不再部署失败）
-        self.assertIn('HEALTH_PORT="${WEB_PORT_VALUE##*:}"', DEPLOY)
+        # 从实际容器映射读取端口，合法 dotenv 引号/注释不得影响健康检查。
+        self.assertIn('port web 8080', DEPLOY)
+        self.assertIn('HEALTH_PORT="${WEB_ADDRESS##*:}"', DEPLOY)
         self.assertIn('127.0.0.1:${HEALTH_PORT}/api/healthz', DEPLOY)
+        self.assertIn('--max-time 5', DEPLOY)
 
     def test_remote_deployment_requires_explicit_target_and_import_mapping(self):
         self.assertIn('REMOTE_HOST="${DEPLOY_HOST:-}"', DEPLOY)
@@ -117,6 +133,18 @@ class GatewayContractTests(unittest.TestCase):
         self.assertIn('--mapping FILE', DEPLOY)
         self.assertIn('[[ -f "$MAPPING_FILE" ]] || { echo "--seed-workbook 需要同时提供 --mapping"', DEPLOY)
         self.assertNotRegex(DEPLOY, r"192\.168\.\d+\.\d+")
+
+    def test_remote_migration_precedes_new_api_start(self):
+        """补跑迁移不能依赖新版 API 已经启动或其数据库探活已通过。"""
+        build = DEPLOY.index("build api ocr web")
+        pause = DEPLOY.index("API_WEB_PAUSED=1")
+        migration = DEPLOY.index("for f in /docker-entrypoint-initdb.d/*.sql")
+        start = DEPLOY.index("up -d --no-build --remove-orphans")
+        self.assertLess(build, pause)
+        self.assertLess(pause, migration)
+        self.assertLess(migration, start)
+        self.assertIn("pg_isready -h 127.0.0.1", DEPLOY)
+        self.assertIn("ERP_BOOTSTRAP_STRICT: \"1\"", COMPOSE)
 
 
 if __name__ == "__main__":

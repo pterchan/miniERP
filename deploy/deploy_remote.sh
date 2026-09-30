@@ -126,13 +126,34 @@ REMOTE_DIR="$1"
 PUBLIC_HOST="$2"
 DO_SEED="$3"
 cd "$REMOTE_DIR"
+API_WEB_PAUSED=0
 
 cleanup_seed() {
   if [[ "$DO_SEED" == "1" ]]; then
     rm -f .mini-erp-seed.xlsx .mini-erp-import-map.json .mini-erp-import-password
   fi
 }
-trap cleanup_seed EXIT
+finish_deployment() {
+  local status="$?"
+  trap - EXIT
+  if ! cleanup_seed; then
+    echo "清理导入临时文件失败，请检查远端目录权限" >&2
+    [[ "$status" != "0" ]] || status=1
+  fi
+  if [[ "$status" != "0" ]]; then
+    if [[ "$API_WEB_PAUSED" == "1" ]]; then
+      if docker compose --env-file .env stop web api; then
+        echo "部署失败：API/Web 已保持停止，修复后请重新运行部署脚本" >&2
+      else
+        echo "部署失败且停止 API/Web 失败，请手动停止并检查 Docker 状态" >&2
+      fi
+    else
+      echo "部署失败：尚未进入 API/Web 停机阶段" >&2
+    fi
+  fi
+  exit "$status"
+}
+trap finish_deployment EXIT
 
 gen_secret() { openssl rand -hex 32; }
 
@@ -143,6 +164,9 @@ POSTGRES_DB=inventory
 POSTGRES_USER=inventory
 POSTGRES_PASSWORD=$(gen_secret)
 SESSION_SECRET=$(gen_secret)
+ERP_DB_POOL_MIN=1
+ERP_DB_POOL_MAX=30
+ERP_FORBID_NEGATIVE_STOCK=0
 BOOTSTRAP_ADMIN_USERNAME=admin
 BOOTSTRAP_ADMIN_PASSWORD=$(gen_secret)
 BOOTSTRAP_REQUESTER_USERNAME=colleague
@@ -169,26 +193,61 @@ if grep -Eq '^(POSTGRES_PASSWORD|SESSION_SECRET|BOOTSTRAP_ADMIN_PASSWORD|BOOTSTR
 fi
 
 docker compose --env-file .env config --quiet
-docker compose --env-file .env up -d --build --remove-orphans
-docker compose --env-file .env ps
+echo "正在远端构建应用镜像..."
+docker compose --env-file .env build api ocr web
 
-# 健康检查端口跟随 .env 的 WEB_PORT（形如 127.0.0.1:18080 或 18080）
-WEB_PORT_VALUE="$(grep -E '^WEB_PORT=' .env | cut -d= -f2- || true)"
-HEALTH_PORT="${WEB_PORT_VALUE##*:}"
-[[ "$HEALTH_PORT" =~ ^[0-9]+$ ]] || HEALTH_PORT=18080
-for attempt in $(seq 1 30); do
-  if curl --fail --silent --show-error "http://127.0.0.1:${HEALTH_PORT}/api/healthz" >/dev/null; then break; fi
-  [[ "$attempt" -eq 30 ]] && { docker compose --env-file .env logs --tail=120 api postgres ocr; exit 1; }
+# 构建成功后才进入短暂停机，避免构建故障影响仍在运行的旧服务。
+API_WEB_PAUSED=1
+docker compose --env-file .env stop web api
+docker compose --env-file .env up -d postgres
+
+# 初始化临时实例只监听 Unix socket；必须等待最终 TCP 实例，避免并发重放迁移。
+DATABASE_READY=0
+for attempt in $(seq 1 60); do
+  if docker compose --env-file .env exec -T postgres sh -c \
+    'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>&1; then
+    DATABASE_READY=1
+    break
+  fi
   sleep 2
 done
+if [[ "$DATABASE_READY" != "1" ]]; then
+  echo "数据库在 120 秒内未就绪，API/Web 将保持停止" >&2
+  docker compose --env-file .env logs --tail=120 postgres >&2 || true
+  exit 1
+fi
 
-# 全部迁移按文件名序幂等重放（全部迁移均已幂等；重放正确性由
-# tests/test_migrations_idempotent.py 持续保证），新增迁移无需改本清单。
-DB_USER="$(grep -E '^POSTGRES_USER=' .env | cut -d= -f2-)"
-DB_NAME="$(grep -E '^POSTGRES_DB=' .env | cut -d= -f2-)"
-docker compose --env-file .env exec -T postgres sh -c \
-  'for f in /docker-entrypoint-initdb.d/*.sql; do echo "== 重放 $f"; psql -v ON_ERROR_STOP=1 -U "$1" -d "$2" -f "$f" || exit 1; done' \
-  sh "$DB_USER" "$DB_NAME"
+# 全部迁移按文件名序幂等重放；迁移失败时绝不启动新版 API。
+# 容器环境使用 Compose 解析后的用户名与库名，避免直接解析 dotenv 的引号和默认值。
+docker compose --env-file .env exec -T postgres sh -eu -c \
+  'for f in /docker-entrypoint-initdb.d/*.sql; do echo "正在重放迁移 $f"; psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f "$f"; done'
+
+docker compose --env-file .env up -d --no-build --remove-orphans
+docker compose --env-file .env ps
+
+# 使用 Compose 实际公布的端口，避免自行解析 dotenv 的引号、注释和动态端口。
+if ! WEB_ADDRESS="$(docker compose --env-file .env port web 8080)"; then
+  echo "无法获取 Web 的实际公布端口，API/Web 将保持停止" >&2
+  exit 1
+fi
+HEALTH_PORT="${WEB_ADDRESS##*:}"
+if [[ ! "$HEALTH_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || [[ "$HEALTH_PORT" -gt 65535 ]]; then
+  echo "Web 公布端口无效，API/Web 将保持停止" >&2
+  exit 1
+fi
+APPLICATION_READY=0
+for attempt in $(seq 1 30); do
+  if curl --fail --silent --show-error --connect-timeout 2 --max-time 5 "http://127.0.0.1:${HEALTH_PORT}/api/healthz" >/dev/null; then
+    APPLICATION_READY=1
+    break
+  fi
+  sleep 2
+done
+if [[ "$APPLICATION_READY" != "1" ]]; then
+  echo "应用健康检查失败，API/Web 将保持停止" >&2
+  docker compose --env-file .env logs --tail=120 api postgres ocr minio web >&2 || true
+  exit 1
+fi
 
 if [[ "$DO_SEED" == "1" ]]; then
   [[ -s .mini-erp-seed.xlsx && -s .mini-erp-import-map.json && -s .mini-erp-import-password ]] || {
@@ -208,6 +267,7 @@ if [[ "$DO_SEED" == "1" ]]; then
   unset IMPORT_WORKBOOK_PASSWORD
 fi
 
+cleanup_seed
 echo "部署完成：远程目录 $REMOTE_DIR"
 echo "dotenv 权限为 600，请通过 HTTPS 网关公开 Web 服务。"
 REMOTE_SCRIPT

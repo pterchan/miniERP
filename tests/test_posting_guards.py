@@ -127,6 +127,7 @@ class ReverseSerialGuardTests(DbTestCase):
         cls.warehouse = api_for("warehouse")
         cls.sales = api_for("sales")
         cls.loc1 = cls.admin.post("/api/locations", json={"code": "RSGLOC", "name": "红冲SN库位"}).json()["location_id"]
+        cls.loc2 = cls.admin.post("/api/locations", json={"code": "RSGLOC2", "name": "红冲SN库位2"}).json()["location_id"]
         ea = next(u for u in cls.admin.get("/api/uoms").json() if u["code"] == "EA")
         cls.product_id = cls.admin.post("/api/products", json={
             "display_name": "红冲SN货品", "serialized": True, "default_uom_id": ea["uom_id"], "source_uom_raw": "个",
@@ -151,6 +152,29 @@ class ReverseSerialGuardTests(DbTestCase):
         }).json()
         assert self.sales.post(f"/api/documents/{doc['document_id']}/post", json={}).status_code == 200
         return doc["document_id"]
+
+    def _return(self, serial: str) -> int:
+        doc = self.sales.post("/api/documents", json={
+            "doc_type": "SALES_RETURN", "party_id": self.customer_id,
+            "lines": [{"product_id": self.product_id, "quantity": 1, "serial_numbers": [serial],
+                       "destination_location_id": self.loc1}],
+        }).json()
+        response = self.sales.post(f"/api/documents/{doc['document_id']}/post", json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        return doc["document_id"]
+
+    def _transfer(self, serial: str, source: int, destination: int) -> int:
+        doc = self.warehouse.post("/api/documents", json={
+            "doc_type": "STOCK_TRANSFER",
+            "lines": [{"product_id": self.product_id, "quantity": 1, "serial_numbers": [serial],
+                       "source_location_id": source, "destination_location_id": destination}],
+        }).json()
+        response = self.warehouse.post(f"/api/documents/{doc['document_id']}/post", json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        return doc["document_id"]
+
+    def _serial_state(self, serial: str) -> dict:
+        return self.admin.get("/api/serial-ledger", params={"q": serial}).json()["items"][0]
 
     def test_reverse_delivery_blocked_when_sn_already_returned(self) -> None:
         """红冲出库单=SN 回库；若 SN 已被退货单回库，再红冲会重复计入。"""
@@ -177,6 +201,71 @@ class ReverseSerialGuardTests(DbTestCase):
         delivery_id = self._delivery("RSG-3")
         self.assertEqual(self.sales.post(f"/api/documents/{delivery_id}/reverse").status_code, 200)
         self.assertEqual(self.warehouse.post(f"/api/documents/{receipt_id}/reverse").status_code, 200)
+
+    def test_same_retired_state_after_later_sale_does_not_allow_old_reverse(self) -> None:
+        self._receipt("RSG-CYCLE-SALE")
+        original_delivery = self._delivery("RSG-CYCLE-SALE")
+        returned = self._return("RSG-CYCLE-SALE")
+        later_delivery = self._delivery("RSG-CYCLE-SALE")
+        rejected = self.sales.post(f"/api/documents/{original_delivery}/reverse")
+        self.assertEqual(rejected.status_code, 422, rejected.text)
+        self.assertIn("后续事件", rejected.json()["detail"])
+        self.assertEqual(self._serial_state("RSG-CYCLE-SALE")["status_code"], "retired")
+        self.assertEqual(self.sales.get(f"/api/documents/{original_delivery}").json()["status"], "POSTED")
+        self.assertEqual(self.sales.post(f"/api/documents/{later_delivery}/reverse").status_code, 200)
+        self.assertEqual(self.sales.post(f"/api/documents/{returned}/reverse").status_code, 200)
+        self.assertEqual(self.sales.post(f"/api/documents/{original_delivery}/reverse").status_code, 200)
+        self.assertEqual(self._serial_state("RSG-CYCLE-SALE")["status_code"], "active")
+
+    def test_transfer_round_trip_requires_later_transfers_to_be_reversed_first(self) -> None:
+        receipt = self._receipt("RSG-CYCLE-TRANSFER")
+        first = self._transfer("RSG-CYCLE-TRANSFER", self.loc1, self.loc2)
+        second = self._transfer("RSG-CYCLE-TRANSFER", self.loc2, self.loc1)
+        rejected = self.warehouse.post(f"/api/documents/{receipt}/reverse")
+        self.assertEqual(rejected.status_code, 422, rejected.text)
+        self.assertEqual(self._serial_state("RSG-CYCLE-TRANSFER")["current_location_id"], self.loc1)
+        self.assertEqual(self.warehouse.post(f"/api/documents/{second}/reverse").status_code, 200)
+        self.assertEqual(self._serial_state("RSG-CYCLE-TRANSFER")["current_location_id"], self.loc2)
+        self.assertEqual(self.warehouse.post(f"/api/documents/{first}/reverse").status_code, 200)
+        self.assertEqual(self.warehouse.post(f"/api/documents/{receipt}/reverse").status_code, 200)
+
+    def test_multiple_transfers_in_one_document_are_reversed_in_event_order(self) -> None:
+        receipt = self._receipt("RSG-SAME-DOC")
+        doc = self.warehouse.post("/api/documents", json={
+            "doc_type": "STOCK_TRANSFER",
+            "lines": [{"product_id": self.product_id, "quantity": 1, "serial_numbers": ["RSG-SAME-DOC"],
+                       "source_location_id": source, "destination_location_id": destination}
+                      for source, destination in ((self.loc1, self.loc2), (self.loc2, self.loc1))],
+        }).json()
+        document_id = doc["document_id"]
+        response = self.warehouse.post(f"/api/documents/{document_id}/post", json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        reversed_doc = self.warehouse.post(f"/api/documents/{document_id}/reverse")
+        self.assertEqual(reversed_doc.status_code, 200, reversed_doc.text)
+        self.assertEqual(self._serial_state("RSG-SAME-DOC")["current_location_id"], self.loc1)
+        self.assertEqual(self.warehouse.post(f"/api/documents/{receipt}/reverse").status_code, 200)
+
+    def test_later_sn_failure_rolls_back_all_inverse_movements_and_events(self) -> None:
+        doc = self.warehouse.post("/api/documents", json={
+            "doc_type": "PURCHASE_RECEIPT", "party_id": self.supplier_id,
+            "lines": [{"product_id": self.product_id, "quantity": 1, "serial_numbers": [serial],
+                       "destination_location_id": self.loc1}
+                      for serial in ("RSG-ATOMIC-A", "RSG-ATOMIC-B")],
+        }).json()
+        receipt_id = doc["document_id"]
+        self.assertEqual(self.warehouse.post(f"/api/documents/{receipt_id}/post", json={}).status_code, 200)
+        self._transfer("RSG-ATOMIC-A", self.loc1, self.loc2)
+        response = self.warehouse.post(f"/api/documents/{receipt_id}/reverse")
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.warehouse.get(f"/api/documents/{receipt_id}").json()["status"], "POSTED")
+        state = self._serial_state("RSG-ATOMIC-B")
+        self.assertEqual((state["status_code"], state["current_location_id"]), ("active", self.loc1))
+        from api.db import connection, fetch_one
+        with connection() as conn:
+            inverse = fetch_one(conn, """SELECT count(*) AS n FROM inventory_movement rev
+                                         JOIN inventory_movement orig ON orig.inventory_movement_id=rev.reversal_of_movement_id
+                                        WHERE orig.document_id=%s""", (receipt_id,))
+        self.assertEqual(inverse["n"], 0)
 
 
 if __name__ == "__main__":

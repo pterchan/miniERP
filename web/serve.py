@@ -66,10 +66,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.send_error(413, "request body too large")
                 return
             body = self.rfile.read(int(length))
+        # 保留浏览器的 Host（包括公开端口），使 API 的同源校验与 Nginx 一致。
         headers = {
             key: value
             for key, value in self.headers.items()
-            if key.lower() not in {"host", "content-length", *HOP_BY_HOP}
+            if key.lower() not in {"content-length", *HOP_BY_HOP}
         }
         app_path = self._app_path()
         upstream_path = "/healthz" if app_path == "/api/healthz" else app_path

@@ -47,6 +47,7 @@ class RequestLineIn(BaseModel):
     source_location_id: int | None = None
     destination_location_id: int | None = None
     notes: str | None = None
+    serial_numbers: list[str] | None = Field(default=None, max_length=2000)  # 可选 SN；填写后放行时按件校验
 
     _q = field_validator("quantity")(_qty_scale)
 

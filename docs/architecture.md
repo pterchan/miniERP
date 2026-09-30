@@ -43,12 +43,13 @@ API 容器 :8000 ─────────────────────
 
 ## 后端（`api/`，FastAPI + 原生 psycopg2）
 
-无 ORM：`api/db.py` 用 `ThreadedConnectionPool(0, 30)` 直接执行参数化 SQL；连接在借出时探活（`SELECT 1`），池内闲置期间被静默断开的连接会被替换而不是让请求 500。容器内 uvicorn 以 `--workers 2` 运行，连接预算为 2 × 30 = 60，低于 PostgreSQL 默认 `max_connections=100`（再上调 worker 数时需同步调大数据库连接上限）。启动时 `ensure_bootstrap_users()` 保证初始账号存在（事务级咨询锁串行化多 worker 并发建号）、`ensure_bucket()` 保证 MinIO 桶存在；两者失败都不阻断 API 启动（compose 中 `ERP_BOOTSTRAP_STRICT=1` 时 bootstrap 失败才中止）。
+无 ORM：`api/db.py` 用 `ThreadedConnectionPool` 直接执行参数化 SQL，默认最小 `1`、最大 `30`，分别由 `ERP_DB_POOL_MIN` / `ERP_DB_POOL_MAX` 配置。默认归还后保留一条闲置连接用于复用；最小值 `0` 明确表示归还即关闭。连接在借出时探活（`SELECT 1`），失效连接会被替换；构造建连失败或池耗尽等运行期故障返回 503。容器内 uvicorn 保持 `--workers 2`，默认连接预算为 2 × 30 = 60。启动先校验连接池配置，再由 `ensure_bootstrap_users()` 保证初始账号存在（事务级咨询锁串行化多 worker 并发建号）、`ensure_bucket()` 保证 MinIO 桶存在；非法池配置始终中止启动，Compose 中 `ERP_BOOTSTRAP_STRICT=1` 时 bootstrap 失败也中止。远端发布先构建、暂停 API/Web、等待数据库并迁移，成功后才启动新版应用。
 
 | 模块 | 职责 |
 |---|---|
 | `main.py` | 应用装配、CORS、Cookie 路径、`/healthz`、认证（`/api/auth/*`）、货品、库存余额/清点、单位/库位、用户管理、申请审批（`/api/stock-requests/*`）、冲突中心（`/api/conflicts/*`）、审计查询、OCR 薄代理挂载 |
 | `documents.py` | 通用业务单据引擎：采购/销售/库存三大组共 11 种 `doc_type` 的列表/创建/修改/提交/**过账**/**红冲**/附件；过账写不可变 `inventory_movement` 与 `ar_ap_entry` |
+| `inventory_posting.py` | 业务单据、OA 放行、快速清点和红冲共用的库存守卫、审计与数量/SN 流水写入 |
 | `master.py` | 主数据：商品分类、客户、供应商、价格档、部门 |
 | `reports.py` | 报表：采购对账、应收应付汇总/明细、库存成本 |
 | `workspace.py` | 工作台只读汇总与全局分组搜索，沿用各业务域的角色权限与申请所有权 |
@@ -75,6 +76,10 @@ API 容器 :8000 ─────────────────────
 - 过账是唯一产生库存/往来影响的动作；余额视图只计算已过账流水。
 - 已过账单据不可编辑或删除，纠错走红冲。
 - 申请单（stock_request）是独立 OA 流：submit → withdraw/approve/reject → release。
+
+所有库存入口在同一事务内先按货品 ID 升序加锁，再逐条读取余额、检查并写入，后续明细可看到本单前面的库存变化。默认允许负库存；开启 `ERP_FORBID_NEGATIVE_STOCK=1` 后，业务单据、OA、清点减少和红冲的来源侧均检查余额。任一明细失败时，库存、SN 事件、往来台账及单据状态整单回滚。
+
+SN 仍可选；一旦填写，校验追踪开关、归一化重复、整数数量及登记数量，减少或调拨还核对当前库位、成色和流水单位，不做跨单位换算。OA 明细通过 011 迁移保存可空的 SN 数组。红冲按原库存流水倒序处理，原 SN 事件必须是最新有效事件；后续事件逆序撤销后才能继续红冲，反向事件恢复原事件前的状态。历史已过账数据不自动回写。
 
 ### 审计
 

@@ -9,19 +9,60 @@ vi.mock('./api', () => ({
   invalidateInventory: vi.fn(), invalidateWorkbench: vi.fn(), setApiUser: vi.fn(), setUnauthorizedHandler: vi.fn(),
   default: {
     uoms: vi.fn(), categories: vi.fn(), locations: vi.fn(), stockRequest: vi.fn(), product: vi.fn(),
-    createProduct: vi.fn(), updateRequest: vi.fn(), createUser: vi.fn(), createLocation: vi.fn(),
+    createProduct: vi.fn(), createRequest: vi.fn(), updateRequest: vi.fn(), createUser: vi.fn(), createLocation: vi.fn(),
   },
 }))
 const user = { user_id: 1, role: 'ADMIN' }
-function mount(path) {
+function mount(path, query = new URLSearchParams()) {
   const navigate = vi.fn()
-  render(<RouterContext.Provider value={{ navigate, currentPath: path, location: { pathname: path, search: '', hash: '' }, user }}><ToastProvider>{routeView(path, user, new URLSearchParams())}</ToastProvider></RouterContext.Provider>)
+  render(<RouterContext.Provider value={{ navigate, currentPath: path, location: { pathname: path, search: '', hash: '' }, user }}><ToastProvider>{routeView(path, user, query)}</ToastProvider></RouterContext.Provider>)
   return navigate
 }
 beforeEach(() => {
   vi.clearAllMocks()
   api.uoms.mockResolvedValue([{ uom_id: 1, code: '个', display_name: '个' }]); api.categories.mockResolvedValue([]); api.locations.mockResolvedValue([])
   api.stockRequest.mockResolvedValue({ stock_request_id: 3, requester_user_id: 1, status: 'DRAFT', version: 2, request_type: 'RECEIPT', reason: '保留申请说明', lines: [] })
+})
+
+describe('OA 可选序列号录入', () => {
+  const line = {
+    stock_request_line_id: 5, product_id: 7, product_name: '追踪货品', serialized: true,
+    serial_numbers: ['000123', 'ABC-2'], quantity: '2', uom_id: 1, uom_code: '个', condition_id: 3,
+  }
+  function loadRequest(lines) {
+    api.stockRequest.mockResolvedValue({
+      stock_request_id: 3, request_no: 'OA-003', requester_user_id: 1, status: 'DRAFT',
+      version: 2, request_type: 'RECEIPT', lines,
+    })
+  }
+  it('重载草稿时保留 SN 和成色，编辑后按字符串数组保存', async () => {
+    loadRequest([line])
+    api.updateRequest.mockResolvedValue({ stock_request_id: 3 })
+    mount('/requests/3/edit')
+    const serials = await screen.findByRole('textbox', { name: '序列号登记（可选）' })
+    expect(serials).toHaveValue('000123\nABC-2')
+    fireEvent.change(serials, { target: { value: '000123\n XYZ-3 \n' } })
+    fireEvent.submit(screen.getByRole('button', { name: '保存草稿' }).closest('form'))
+    await waitFor(() => expect(api.updateRequest).toHaveBeenCalledWith('3', expect.objectContaining({
+      version: 2, lines: [expect.objectContaining({ serial_numbers: ['000123', 'XYZ-3'], condition_id: 3 })],
+    })))
+  })
+  it('从货品新建申请复用登记组件，未填写 SN 时保持可选语义', async () => {
+    api.product.mockResolvedValue({ product_id: 7, display_name: '追踪货品', serialized: true, uom_id: 1 })
+    api.createRequest.mockResolvedValue({ stock_request_id: 3 })
+    mount('/requests/new', new URLSearchParams({ product_id: '7' }))
+    expect(await screen.findByRole('textbox', { name: '序列号登记（可选）' })).toHaveValue('')
+    fireEvent.submit(screen.getByRole('button', { name: '保存草稿' }).closest('form'))
+    await waitFor(() => expect(api.createRequest).toHaveBeenCalledWith(expect.objectContaining({
+      lines: [expect.objectContaining({ product_id: 7, serial_numbers: null })],
+    })))
+  })
+  it('详情展示草稿 SN，旧记录的空值不产生额外内容', async () => {
+    loadRequest([line, { ...line, stock_request_line_id: 6, product_name: '旧货品', serialized: false, serial_numbers: null }])
+    mount('/requests/3')
+    expect(await screen.findByText('SN：000123、ABC-2')).toBeInTheDocument()
+    expect(screen.getByText('旧货品').closest('.detail-line')).not.toHaveTextContent('SN：')
+  })
 })
 afterEach(cleanup)
 

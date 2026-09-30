@@ -30,6 +30,7 @@
 | `009_price_tier_uq.sql` | 批发档 (product_id, min_quantity) 唯一索引：同一起订数量两档并存会让命中价不确定。幂等。 |
 | `006_serial_tracking.sql` | SN/UUID 流向追踪：激活 001 的资产域。`product.serialized` 是货品级软开关（登记可选，不填 SN 仍可过账）；单件以 `asset` + `asset_identifier(product_serial)` 建档，流向记 `asset_event`，经 `inventory_movement_asset` 关联流水；SN 按货品唯一（复用 001 的部分唯一索引）。重定义 `v_asset_current_state`、新增 `v_serial_ledger` 视图——注意 `CREATE OR REPLACE VIEW` 只能追加列，不能改变既有列顺序。 |
 | `010_perf_indexes.sql` | 性能修复（2026-09 压测结论）：`product(display_name)` 排序 btree；搜索左值物化为 STORED 生成列（`product.search_display_name/search_manufacturer/search_specification`、`product_identifier.search_value`、`product_name_alias.search_alias`，表达式与原查询左值一致）+ 列上 trgm GIN，取代并删除 005 的表达式索引；登录热路径 GC 索引（`app_session(expires_at)`、`login_attempt(attempted_at)`）。幂等；新增 STORED 列会重写上述三张表，建立索引也需时间，大库低峰补跑。 |
+| `011_oa_serial_numbers.sql` | OA 明细新增可空 `serial_numbers TEXT[]`，沿用业务单据可选 SN 登记语义；旧记录保持 NULL，不回填历史。放行时库存流水与 SN 事件在同一事务登记。 |
 
 ## 核心对象速览
 

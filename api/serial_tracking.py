@@ -91,21 +91,32 @@ def _asset_by_sn(conn: Any, product_id: int, sn: str) -> dict[str, Any] | None:
     return fetch_one(
         conn,
         """SELECT s.asset_id, s.status_id, s.condition_id, s.status_code,
-                  s.current_location_id, s.latest_event_type
+                  s.current_location_id, s.latest_event_type, im.uom_id AS current_uom_id
              FROM v_asset_current_state s
              JOIN asset_identifier ai ON ai.asset_id = s.asset_id
+             LEFT JOIN inventory_movement im ON im.inventory_movement_id=s.latest_inventory_movement_id
             WHERE ai.namespace=%s AND ai.identifier_type=%s AND ai.value_normalized=%s
               AND ai.is_verified AND ai.is_exclusive""",
         (f"{SN_IDENT_TYPE}.{product_id}", SN_IDENT_TYPE, normalize_sn(sn)),
     )
 
 
-def _require_in_stock(asset: dict[str, Any] | None, sn: str, action: str) -> int:
+def _require_in_stock(asset: dict[str, Any] | None, sn: str, action: str, *,
+                      location_id: int | None, condition_id: int, uom_id: int | None) -> int:
     """出库/调拨/清点出库共用的在库校验；返回 asset_id。"""
     if not asset:
         raise HTTPException(status_code=422, detail=f"SN {sn} 未在库中登记，无法{action}")
     if asset["status_code"] != "active":
         raise HTTPException(status_code=422, detail=f"SN {sn} 当前状态为 {asset['status_code']}（不在库），无法{action}")
+    if asset["current_location_id"] != location_id:
+        raise HTTPException(status_code=422,
+                            detail=f"SN {sn} 当前库位为 {asset['current_location_id']}，与{action}来源库位 {location_id} 不一致")
+    if asset["condition_id"] != condition_id:
+        raise HTTPException(status_code=422, detail=f"SN {sn} 当前成色与{action}明细成色不一致")
+    if uom_id is None or asset.get("current_uom_id") is None:
+        raise HTTPException(status_code=422, detail=f"SN {sn} 缺少可核对的当前库存单位，无法{action}；请先核对原入库记录")
+    if asset["current_uom_id"] != uom_id:
+        raise HTTPException(status_code=422, detail=f"SN {sn} 当前库存单位与{action}明细单位不一致；系统不进行单位换算")
     return int(asset["asset_id"])
 
 
@@ -170,7 +181,7 @@ def _validate_integer_quantity(quantity: Decimal, count: int) -> None:
 def apply_line_serials(conn: Any, user: dict[str, Any] | None, req_meta: dict[str, Any],
                        movement_id: int, product_id: int, serial_numbers: list[str] | None,
                        stock_effect: str, source: int | None, dest: int | None,
-                       quantity: Decimal, condition_id: int | None) -> None:
+                       quantity: Decimal, condition_id: int | None, uom_id: int | None = None) -> None:
     """单据过账后按行登记 SN：IN 建档/received，OUT issued，TRANSFER transferred。"""
     sns = [normalize_sn(s) for s in (serial_numbers or []) if (s or "").strip()]
     if not sns:
@@ -190,11 +201,11 @@ def apply_line_serials(conn: Any, user: dict[str, Any] | None, req_meta: dict[st
             asset_id = asset["asset_id"] if asset else _create_asset(conn, user, req_meta, product_id, sn, cond_id)
             _write_event(conn, user, req_meta, asset_id, movement_id, "received", "active", cond_id, None, dest)
         elif stock_effect == "OUT":
-            asset_id = _require_in_stock(asset, sn, "出库")
+            asset_id = _require_in_stock(asset, sn, "出库", location_id=source, condition_id=cond_id, uom_id=uom_id)
             _write_event(conn, user, req_meta, asset_id, movement_id, "issued", "retired",
-                         cond_id, source, None)
+                         cond_id, source, dest)
         elif stock_effect == "TRANSFER":
-            asset_id = _require_in_stock(asset, sn, "调拨")
+            asset_id = _require_in_stock(asset, sn, "调拨", location_id=source, condition_id=cond_id, uom_id=uom_id)
             _write_event(conn, user, req_meta, asset_id, movement_id, "transferred", "active",
                          cond_id, source, dest)
         else:
@@ -202,48 +213,99 @@ def apply_line_serials(conn: Any, user: dict[str, Any] | None, req_meta: dict[st
         _link(conn, user, req_meta, movement_id, asset_id)
 
 
-def reverse_movement_serials(conn: Any, user: dict[str, Any] | None, req_meta: dict[str, Any],
-                             orig_movement: dict[str, Any], rev_movement_id: int) -> None:
-    """红冲：原流水挂的资产写反向事件（IN↔issued、OUT↔received、TRANSFER 反向）。
+def _event_location(event: dict[str, Any]) -> int | None:
+    """与 v_asset_current_state 使用相同的事件库位口径。"""
+    if event["event_type"] in ("issued", "retired", "lost"):
+        return event["to_location_id"]
+    return event["to_location_id"] or event["from_location_id"]
 
-    写反向事件前校验资产当前状态兼容：红冲是机械反演，若 SN 已被后续单据
-    改变在库状态，再反演会造成台账矛盾——拒绝并提示走人工冲销。
+
+def validate_reverse_movement_serials(conn: Any, orig_movement: dict[str, Any], *,
+                                      ignore_reversal_movement_id: int | None = None) -> list[dict[str, Any]]:
+    """在插入反向流水前校验 SN，并捕获反向事件应恢复的状态。
+
+    后续原流水与其已过账红冲事件相互抵消；最新未抵消事件必须是待红冲流水。
+    因此允许按逆序撤销，却拒绝仅仅绕回同一状态的后续出入库或调拨。
     """
     links = fetch_all(conn, "SELECT asset_id FROM inventory_movement_asset WHERE inventory_movement_id=%s",
                       (orig_movement["inventory_movement_id"],))
-    if not links:
-        return
     s = orig_movement.get("source_location_id")
     d = orig_movement.get("destination_location_id")
     cond = _condition_id(conn, orig_movement.get("condition_id"))
+    prepared: list[dict[str, Any]] = []
     for link in links:
-        asset = fetch_one(conn, "SELECT status_code FROM v_asset_current_state WHERE asset_id=%s", (link["asset_id"],))
-        state = asset["status_code"] if asset else None
-        if d is not None and s is None:      # 原 IN → 反向出：资产应仍在库
-            if state != "active":
-                raise HTTPException(status_code=422,
-                                    detail=f"红冲失败：SN 资产（id={link['asset_id']}）当前状态为 {state or '未建档'}，"
-                                           "反向出库会造成台账矛盾；请先冲销后续出库单或走人工冲销流程")
-            _write_event(conn, user, req_meta, link["asset_id"], rev_movement_id, "issued", "retired", cond, d, None)
-        elif s is not None and d is None:    # 原 OUT → 反向入：资产应不在库
-            if state == "active":
-                raise HTTPException(status_code=422,
-                                    detail=f"红冲失败：SN 资产（id={link['asset_id']}）已通过其它单据回到在库状态，"
-                                           "反向入库会重复计入；请先冲销后续入库单或走人工冲销流程")
-            _write_event(conn, user, req_meta, link["asset_id"], rev_movement_id, "received", "active", cond, None, s)
-        else:                                # TRANSFER → 反向调拨：资产应在库
-            if state != "active":
-                raise HTTPException(status_code=422,
-                                    detail=f"红冲失败：SN 资产（id={link['asset_id']}）当前状态为 {state or '未建档'}，"
-                                           "反向调拨会造成台账矛盾；请走人工冲销流程")
-            _write_event(conn, user, req_meta, link["asset_id"], rev_movement_id, "transferred", "active", cond, d, s)
-        _link(conn, user, req_meta, rev_movement_id, link["asset_id"])
+        asset_id = link["asset_id"]
+        asset = fetch_one(conn, """SELECT status_code,condition_id,current_location_id
+                                    FROM v_asset_current_state WHERE asset_id=%s""", (asset_id,))
+        events = fetch_all(conn, """SELECT ae.*,rs.code AS status_code,
+                                          COALESCE(ae.condition_id,a.condition_id) AS effective_condition_id
+                                     FROM asset_event ae JOIN asset a ON a.asset_id=ae.asset_id
+                                     LEFT JOIN inventory_movement im ON im.inventory_movement_id=ae.inventory_movement_id
+                                     LEFT JOIN record_status ims ON ims.status_id=im.status_id
+                                     LEFT JOIN record_status rs ON rs.status_id=COALESCE(ae.status_id,a.status_id)
+                                    WHERE ae.asset_id=%s
+                                      AND (im.inventory_movement_id IS NULL OR
+                                           (im.reversal_of_movement_id IS NULL AND ims.code='posted'))
+                                      AND NOT EXISTS (
+                                          SELECT 1 FROM inventory_movement rev
+                                          JOIN record_status revs ON revs.status_id=rev.status_id AND revs.code='posted'
+                                          WHERE rev.reversal_of_movement_id=ae.inventory_movement_id
+                                            AND (%s IS NULL OR rev.inventory_movement_id<>%s))
+                                    ORDER BY ae.event_date DESC,ae.asset_event_id DESC LIMIT 1""",
+                           (asset_id, ignore_reversal_movement_id, ignore_reversal_movement_id))
+        if not events or events[0]["inventory_movement_id"] != orig_movement["inventory_movement_id"]:
+            raise HTTPException(status_code=422,
+                                detail=f"红冲失败：SN 资产（id={asset_id}）存在未冲销的后续事件；请先按逆序红冲后续单据")
+        current = events[0]
+        if (not asset or asset["status_code"] != current["status_code"]
+                or asset["condition_id"] != current["effective_condition_id"]
+                or asset["current_location_id"] != _event_location(current)
+                or asset["condition_id"] != cond):
+            raise HTTPException(status_code=422,
+                                detail=f"红冲失败：SN 资产（id={asset_id}）当前状态、库位或成色与原流水不一致；请先核对后续单据")
+        # 恢复的是原事件发生前的真实状态，需包括当时已发生的红冲事件。
+        # 有效事件仅用于撤销顺序检查，不能拿它的前一项替代真实历史前态。
+        previous = fetch_one(conn, """SELECT ae.*,rs.code AS status_code,
+                                            COALESCE(ae.condition_id,a.condition_id) AS effective_condition_id
+                                       FROM asset_event ae JOIN asset a ON a.asset_id=ae.asset_id
+                                       LEFT JOIN record_status rs ON rs.status_id=COALESCE(ae.status_id,a.status_id)
+                                      WHERE ae.asset_id=%s AND (ae.event_date,ae.asset_event_id)<(%s,%s)
+                                      ORDER BY ae.event_date DESC,ae.asset_event_id DESC LIMIT 1""",
+                             (asset_id, current["event_date"], current["asset_event_id"]))
+        was_in = s is None and d is not None
+        restore_location = _event_location(previous) if previous else (None if was_in else s)
+        from_location = d
+        if from_location == restore_location:
+            from_location = None
+        prepared.append({
+            "asset_id": asset_id,
+            "event_type": "issued" if was_in else ("received" if d is None else "transferred"),
+            "status_code": previous["status_code"] if previous else ("retired" if was_in else "active"),
+            "condition_id": previous["effective_condition_id"] if previous else cond,
+            "from_location_id": from_location,
+            "to_location_id": restore_location,
+        })
+    return prepared
+
+
+def reverse_movement_serials(conn: Any, user: dict[str, Any] | None, req_meta: dict[str, Any],
+                             orig_movement: dict[str, Any], rev_movement_id: int, *,
+                             validated_assets: list[dict[str, Any]] | None = None) -> None:
+    """写入已预校验的 SN 反向事件；兼容旧调用时忽略刚插入的反向流水。"""
+    if validated_assets is None:
+        validated_assets = validate_reverse_movement_serials(
+            conn, orig_movement, ignore_reversal_movement_id=rev_movement_id)
+    for asset in validated_assets:
+        _write_event(conn, user, req_meta, asset["asset_id"], rev_movement_id,
+                     asset["event_type"], asset["status_code"], asset["condition_id"],
+                     asset["from_location_id"], asset["to_location_id"])
+        _link(conn, user, req_meta, rev_movement_id, asset["asset_id"])
 
 
 def apply_adjustment_serials(conn: Any, user: dict[str, Any] | None, req_meta: dict[str, Any],
                              movement_id: int, product: dict[str, Any],
                              serial_numbers: list[str] | None, delta: Decimal,
-                             condition_id: int, location_id: int) -> None:
+                             condition_id: int, location_id: int, uom_id: int | None = None) -> None:
     """快速清点（adjust_inventory）：delta>0 建档 received，delta<0 出库 issued。"""
     sns = [normalize_sn(s) for s in (serial_numbers or []) if (s or "").strip()]
     if not sns:
@@ -263,7 +325,7 @@ def apply_adjustment_serials(conn: Any, user: dict[str, Any] | None, req_meta: d
             asset_id = asset["asset_id"] if asset else _create_asset(conn, user, req_meta, product["product_id"], sn, cond_id)
             _write_event(conn, user, req_meta, asset_id, movement_id, "received", "active", cond_id, None, location_id)
         else:
-            asset_id = _require_in_stock(asset, sn, "清点出库")
+            asset_id = _require_in_stock(asset, sn, "清点出库", location_id=location_id, condition_id=cond_id, uom_id=uom_id)
             _write_event(conn, user, req_meta, asset_id, movement_id, "issued", "retired", cond_id, location_id, None)
         _link(conn, user, req_meta, movement_id, asset_id)
 

@@ -23,9 +23,12 @@ def purchase_reconciliation(supplier_id: int | None = None, start_date: _date | 
                             q: str = Query(default="", max_length=200), f: list[str] = Query(default=[]),
                             sort: str = "", order: str = "desc", fmt: str = "", ids: str = "",
                             user: dict[str, Any] = Depends(require_roles("FINANCE", "ADMIN"))) -> Any:
-    sql = """SELECT s.supplier_id,s.name AS supplier_name,d.document_id,d.doc_type,d.doc_no,d.doc_date,d.total_amount,d.posted_by
+    # 有效采购净额：红冲原单与反向单排除，退货抵减；所有读列表路径共用有符号金额。
+    sql = """SELECT s.supplier_id,s.name AS supplier_name,d.document_id,d.doc_type,d.doc_no,d.doc_date,
+                    CASE WHEN d.doc_type='PURCHASE_RETURN' THEN -d.total_amount ELSE d.total_amount END AS total_amount,d.posted_by
                FROM business_document d JOIN supplier s ON s.supplier_id=d.party_id
-              WHERE d.doc_type='PURCHASE_RECEIPT' AND d.status='POSTED'"""
+              WHERE d.doc_type IN ('PURCHASE_RECEIPT','PURCHASE_RETURN') AND d.status='POSTED'
+                AND d.reversal_of_document_id IS NULL"""
     params: list[Any] = []
     for condition, value in (("d.party_id=%s", supplier_id), ("d.doc_date>=%s", start_date), ("d.doc_date<=%s", end_date)):
         if value is not None:

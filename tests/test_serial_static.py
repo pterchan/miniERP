@@ -6,6 +6,8 @@ ROOT = Path(__file__).parents[1]
 MIGRATION = (ROOT / "db/migrations/006_serial_tracking.sql").read_text(encoding="utf-8")
 SERIAL = (ROOT / "api/serial_tracking.py").read_text(encoding="utf-8")
 DOCUMENTS = (ROOT / "api/documents.py").read_text(encoding="utf-8")
+POSTING = (ROOT / "api/inventory_posting.py").read_text(encoding="utf-8")
+OA_MIGRATION = (ROOT / "db/migrations/011_oa_serial_numbers.sql").read_text(encoding="utf-8")
 SCHEMAS = (ROOT / "api/schemas.py").read_text(encoding="utf-8")
 API = (ROOT / "api/main.py").read_text(encoding="utf-8")
 SERIAL_JSX = (ROOT / "web/src/serial.jsx").read_text(encoding="utf-8")
@@ -46,19 +48,21 @@ class SerialContractTests(unittest.TestCase):
             self.assertIn(token, SERIAL)
 
     def test_document_engine_sn_hooks(self):
+        self.assertIn("post_inventory_movement(", DOCUMENTS)
         for token in (
             "RETURNING inventory_movement_id",
             "apply_line_serials(",
             "reverse_movement_serials(",
             "serial_numbers",
         ):
-            self.assertIn(token, DOCUMENTS)
+            self.assertIn(token, POSTING)
 
     def test_schemas_and_routes(self):
         for token in ("serialized", "serial_numbers", "SerialParseIn"):
             self.assertIn(token, SCHEMAS)
-        for token in ("serial_tracking.router", '@app.post("/api/inventory/adjust")', "apply_adjustment_serials"):
+        for token in ("serial_tracking.router", '@app.post("/api/inventory/adjust")', "post_inventory_movement("):
             self.assertIn(token, API)
+        self.assertIn("ALTER TABLE stock_request_line ADD COLUMN IF NOT EXISTS serial_numbers TEXT[]", OA_MIGRATION)
 
     def test_frontend_serial_contract(self):
         for token in ("SerialLedger", "SerialDetail", "SerialEntry", "序列台账"):

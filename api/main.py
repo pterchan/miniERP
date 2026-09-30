@@ -13,15 +13,15 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, s
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import documents, images, master, reports, serial_tracking, workspace
-from .db import PoolExhaustedError, audit, connection, ensure_bootstrap_users, fetch_all, fetch_one
+from .db import PoolExhaustedError, audit, connection, ensure_bootstrap_users, fetch_all, fetch_one, validate_pool_settings
 from .export import MAX_EXPORT_ROWS, export_response, export_rows_by_ids
 from .list_params import clamp_page, clamp_page_size, like_escape, parse_composite_ids, parse_filters, parse_ids, parse_sort
-from .helpers import _condition_id, _line_uom_id, _movement_id, _normalize_identifier, _normalize_query, _request_meta, _status_id, lock_products
+from .helpers import _condition_id, _line_uom_id, _normalize_identifier, _normalize_query, _request_meta, _status_id, lock_products
 from .ocr_client import OCRProxyError, forward_ocr
 from .permissions import CSRF_COOKIE, SESSION_COOKIE, _csrf, require_roles, require_user
 from .read_lists import read_list
 from .search import fuzzy_search, normalize_search
-from .serial_tracking import apply_adjustment_serials
+from .inventory_posting import post_inventory_movement
 from .schemas import (
     ChangePasswordIn,
     ConflictCreateProductIn,
@@ -78,8 +78,8 @@ app.include_router(workspace.router)
 
 @asynccontextmanager
 async def lifespan(_app):
-    # Compose starts the API after postgres health is ready. The try keeps the
-    # API usable for migrations run after container startup.
+    # 配置错误必须阻止启动，不能被初始账号创建的容错分支吞掉。
+    validate_pool_settings()
     try:
         ensure_bootstrap_users()
     except Exception:
@@ -743,12 +743,7 @@ def inventory_balance_detail(product_id: int, location_id: int, condition_id: in
 
 @app.post("/api/inventory/adjust")
 def adjust_inventory(payload: InventoryAdjustIn, request: Request, user: dict[str, Any] = Depends(require_roles("WAREHOUSE", "ADMIN"))) -> dict[str, Any]:
-    """Override a product's on-hand at one location by posting an ADJUSTMENT.
-
-    A positive delta lands as a destination-side receipt, a negative delta as a
-    source-side issue, so the ledger CHECK (quantity > 0) always holds while the
-    balance view still nets to the counted value (negatives are allowed).
-    """
+    """按实盘数写入调整流水；减少库存沿用所有出库入口的严格库存守卫。"""
     _csrf(request)
     meta = _request_meta(request)
     with connection() as conn:
@@ -767,27 +762,22 @@ def adjust_inventory(payload: InventoryAdjustIn, request: Request, user: dict[st
                             (payload.product_id, payload.location_id, condition_id, payload.uom_id))
         current_qty = Decimal(balance["on_hand_quantity"]) if balance else Decimal(0)
         delta = payload.counted_quantity - current_qty
+        if delta == 0 and any(sn.strip() for sn in (payload.serial_numbers or [])):
+            raise HTTPException(status_code=422, detail="清点差额为零，不会产生可登记 SN 的库存流水，请清空序列号后提交")
         movement_posted = False
         if delta != 0:
             movement_posted = True
             quantity = abs(delta)
             destination_location = payload.location_id if delta > 0 else None
             source_location = None if delta > 0 else payload.location_id
-            audit(conn, user, "ADJUST", "inventory_movement",
-                  after={"product_id": payload.product_id, "location_id": payload.location_id,
-                         "uom_id": payload.uom_id, "quantity": str(quantity), "delta": str(delta)},
-                  request_id=meta["request_id"], ip_address=meta["ip_address"], user_agent=meta["user_agent"])
-            movement_id = None
-            with conn.cursor() as cur:
-                cur.execute("""INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,source_uom_raw,notes,posted_at,posted_by,posted_by_user_id)
-                             VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s,%s) RETURNING inventory_movement_id""",
-                            (_movement_id(conn, "ADJUSTMENT"), _status_id(conn, "posted"), payload.product_id,
-                             quantity, payload.uom_id, condition_id, source_location, destination_location,
-                             payload.source_uom_raw, payload.notes, user["username"], user["user_id"]))
-                movement_id = cur.fetchone()[0]
-            if payload.serial_numbers:
-                apply_adjustment_serials(conn, user, meta, movement_id, product,
-                                         payload.serial_numbers, delta, condition_id, payload.location_id)
+            post_inventory_movement(
+                conn, user, meta, movement_code="ADJUSTMENT", product_id=payload.product_id,
+                quantity=quantity, uom_id=payload.uom_id, condition_id=condition_id,
+                source_location_id=source_location, destination_location_id=destination_location,
+                stock_effect="IN" if delta > 0 else "OUT", source_uom_raw=payload.source_uom_raw,
+                notes=payload.notes, serial_numbers=payload.serial_numbers, adjustment_delta=delta,
+                audit_action="ADJUST", audit_after={"location_id": payload.location_id, "delta": str(delta)},
+            )
         if payload.change_default_unit and product["default_uom_id"] != payload.uom_id:
             audit(conn, user, "EDIT", "product", target_id=payload.product_id,
                   before={"default_uom_id": product["default_uom_id"]}, after={"default_uom_id": payload.uom_id},
@@ -1082,7 +1072,7 @@ def stock_request_detail(request_id: int, user: dict[str, Any] = Depends(require
                                   WHERE sr.stock_request_id=%s""", (request_id,))
         if not row or (user["role"] not in {"WAREHOUSE", "ADMIN"} and row["requester_user_id"] != user["user_id"]):
             raise HTTPException(status_code=404, detail="申请单不存在")
-        row["lines"] = fetch_all(conn, """SELECT l.*,p.display_name AS product_name,p.manufacturer,p.specification,
+        row["lines"] = fetch_all(conn, """SELECT l.*,p.display_name AS product_name,p.manufacturer,p.specification,p.serialized,
                                                     u.code AS uom_code,u.display_name AS uom_display_name,
                                                     sl.code AS source_location_code,sl.name AS source_location_name,
                                                     dl.code AS destination_location_code,dl.name AS destination_location_name,
@@ -1118,9 +1108,9 @@ def _create_request(payload: StockRequestIn, request: Request, user: dict[str, A
             cur.execute("INSERT INTO stock_request_action(stock_request_id,actor_user_id,action,to_status,comment) VALUES (%s,%s,'CREATE','DRAFT',%s)", (request_id, user["user_id"], payload.reason))
             for line in payload.lines:
                 uom_id = _line_uom_id(conn, line)
-                audit(conn, user, "CREATE", "stock_request_line", target_id=None, after={"stock_request_id": request_id, "product_id": line.product_id, "quantity": str(line.quantity)}, request_id=meta["request_id"])
-                cur.execute("""INSERT INTO stock_request_line(stock_request_id,product_id,quantity,uom_id,source_uom_raw,condition_id,source_location_id,destination_location_id,notes)
-                             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (request_id, line.product_id, line.quantity, uom_id, line.source_uom_raw, _condition_id(conn, line.condition_id), line.source_location_id or payload.source_location_id, line.destination_location_id or payload.destination_location_id, line.notes))
+                audit(conn, user, "CREATE", "stock_request_line", target_id=None, after={"stock_request_id": request_id, "product_id": line.product_id, "quantity": str(line.quantity), "serial_numbers": line.serial_numbers or None}, request_id=meta["request_id"])
+                cur.execute("""INSERT INTO stock_request_line(stock_request_id,product_id,quantity,uom_id,source_uom_raw,condition_id,source_location_id,destination_location_id,notes,serial_numbers)
+                             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (request_id, line.product_id, line.quantity, uom_id, line.source_uom_raw, _condition_id(conn, line.condition_id), line.source_location_id or payload.source_location_id, line.destination_location_id or payload.destination_location_id, line.notes, line.serial_numbers or None))
     return stock_request_detail(request_id, user)
 
 
@@ -1158,9 +1148,9 @@ def edit_stock_request(request_id: int, payload: StockRequestPatch, request: Req
                     cur.execute("DELETE FROM stock_request_line WHERE stock_request_line_id=%s", (old["stock_request_line_id"],))
                 for line in payload.lines:
                     uom_id = _line_uom_id(conn, line)
-                    audit(conn, user, "CREATE", "stock_request_line", after={"stock_request_id": request_id, "product_id": line.product_id, "quantity": str(line.quantity)}, request_id=meta["request_id"])
-                    cur.execute("""INSERT INTO stock_request_line(stock_request_id,product_id,quantity,uom_id,source_uom_raw,condition_id,source_location_id,destination_location_id,notes)
-                                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (request_id, line.product_id, line.quantity, uom_id, line.source_uom_raw, _condition_id(conn, line.condition_id), line.source_location_id or payload.source_location_id, line.destination_location_id or payload.destination_location_id, line.notes))
+                    audit(conn, user, "CREATE", "stock_request_line", after={"stock_request_id": request_id, "product_id": line.product_id, "quantity": str(line.quantity), "serial_numbers": line.serial_numbers or None}, request_id=meta["request_id"])
+                    cur.execute("""INSERT INTO stock_request_line(stock_request_id,product_id,quantity,uom_id,source_uom_raw,condition_id,source_location_id,destination_location_id,notes,serial_numbers)
+                                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (request_id, line.product_id, line.quantity, uom_id, line.source_uom_raw, _condition_id(conn, line.condition_id), line.source_location_id or payload.source_location_id, line.destination_location_id or payload.destination_location_id, line.notes, line.serial_numbers or None))
     return stock_request_detail(request_id, user)
 
 
@@ -1221,8 +1211,10 @@ def _transition(request_id: int, target: str, request: Request, user: dict[str, 
             audit(conn, user, action_name, "stock_request_action", after={"stock_request_id": request_id, "action": action_name, "from_status": current, "to_status": target}, request_id=meta["request_id"])
             cur.execute("INSERT INTO stock_request_action(stock_request_id,actor_user_id,action,from_status,to_status,comment) VALUES (%s,%s,%s,%s,%s,%s)", (request_id, user["user_id"], action_name, current, db_target, comment))
             if target == "RELEASED":
-                lines = fetch_all(conn, "SELECT * FROM stock_request_line WHERE stock_request_id=%s", (request_id,))
-                posted = _status_id(conn, "posted")
+                # 与单据、清点共用货品锁，随后逐行检查最新余额。
+                lines = fetch_all(conn, "SELECT * FROM stock_request_line WHERE stock_request_id=%s ORDER BY stock_request_line_id", (request_id,))
+                lock_products(conn, [line["product_id"] for line in lines])
+                _validate_submission(conn, row)
                 main_location = _main_location_id(conn)
                 for line in lines:
                     movement_type = row["request_type"]
@@ -1231,16 +1223,22 @@ def _transition(request_id: int, target: str, request: Request, user: dict[str, 
                     if movement_type == "RECEIPT":
                         source_location, destination_location = None, destination_location or main_location
                     elif movement_type in {"ISSUE_OTHER", "ISSUE_SALE", "ISSUE_CONSUMPTION", "ISSUE_GIFT", "ISSUE_SCRAP"}:
-                        source_location = source_location or main_location
+                        source_location, destination_location = source_location or main_location, None
                     elif movement_type == "RETURN":
                         source_location, destination_location = None, destination_location or main_location
                     elif movement_type == "TRANSFER" and (source_location is None or destination_location is None):
                         raise HTTPException(status_code=422, detail="调货放行前必须指定来源和目的库位")
                     if movement_type in {"RECEIPT", "RETURN"} and destination_location is None:
                         raise HTTPException(status_code=422, detail="入库/退回放行前必须存在目的库位")
-                    audit(conn, user, "RELEASE", "inventory_movement", after={"stock_request_id": request_id, "product_id": line["product_id"], "quantity": str(line["quantity"])}, request_id=meta["request_id"])
-                    cur.execute("""INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,source_uom_raw,notes,posted_at,posted_by,posted_by_user_id)
-                                 VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s,%s)""", (_movement_id(conn, row["request_type"]), posted, line["product_id"], line["quantity"], line["uom_id"], line["condition_id"], source_location, destination_location, line["source_uom_raw"], f"OA申请 {row['request_no']}", user["username"], user["user_id"]))
+                    stock_effect = "IN" if movement_type in {"RECEIPT", "RETURN"} else "TRANSFER" if movement_type == "TRANSFER" else "OUT"
+                    post_inventory_movement(
+                        conn, user, meta, movement_code=movement_type, product_id=line["product_id"],
+                        quantity=line["quantity"], uom_id=line["uom_id"], condition_id=line["condition_id"],
+                        source_location_id=source_location, destination_location_id=destination_location,
+                        stock_effect=stock_effect, source_uom_raw=line["source_uom_raw"],
+                        notes=f"OA申请 {row['request_no']}", serial_numbers=line.get("serial_numbers"),
+                        audit_action="RELEASE", audit_after={"stock_request_id": request_id},
+                    )
     return stock_request_detail(request_id, user)
 
 

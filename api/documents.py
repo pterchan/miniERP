@@ -7,7 +7,6 @@ posts the inverse movements/entries so the ledger nets to zero.
 
 from __future__ import annotations
 
-import os
 from datetime import date
 from decimal import Decimal
 from typing import Any
@@ -19,10 +18,10 @@ from .db import audit, connection, fetch_all, fetch_one
 from .export import MAX_EXPORT_ROWS, attachment_disposition, export_response
 from .image_utils import ImageTooLargeError, _reencode_to_cap, _sniff_image_type
 from .list_params import clamp_page, clamp_page_size, like_escape, parse_filters, parse_ids, parse_sort
-from .helpers import _condition_id, _line_uom_id, _movement_id, _request_meta, _status_id, lock_products
+from .helpers import _condition_id, _line_uom_id, _request_meta, lock_products
+from .inventory_posting import post_inventory_movement
 from .permissions import DOC_TYPE_META, GROUP_META, _can_post, _csrf, require_user
 from .schemas import DocCreateIn, DocSubmitIn, DocUpdateIn
-from .serial_tracking import apply_adjustment_serials, apply_line_serials, reverse_movement_serials
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 attachments_router = APIRouter(prefix="/api/attachments", tags=["documents"])
@@ -152,25 +151,6 @@ def _doc_detail(conn: Any, document_id: int, user: dict[str, Any]) -> dict[str, 
     return row
 
 
-def _forbid_negative_stock() -> bool:
-    """ERP_FORBID_NEGATIVE_STOCK=1 时出库/调拨/红冲反向移动前校验余额（默认允许负库存）。"""
-    return os.environ.get("ERP_FORBID_NEGATIVE_STOCK", "0") == "1"
-
-
-def _require_sufficient_stock(conn: Any, line: dict[str, Any], location_id: int | None, quantity: Decimal) -> None:
-    """开关开启时校验 (product, location, condition, uom) 余额足够，不足 422。"""
-    if not _forbid_negative_stock() or location_id is None:
-        return
-    condition_id = _condition_id(conn, line.get("condition_id"))
-    row = fetch_one(conn, """SELECT on_hand_quantity FROM v_inventory_balance
-                              WHERE product_id=%s AND location_id=%s AND condition_id=%s AND uom_id=%s""",
-                    (line["product_id"], location_id, condition_id, line["uom_id"]))
-    on_hand = Decimal(row["on_hand_quantity"]) if row else Decimal(0)
-    if on_hand < quantity:
-        raise HTTPException(status_code=422,
-                            detail=f"库存不足：货品在库位 {location_id} 现存量 {on_hand}，本次需要 {quantity}（已启用禁止超卖）")
-
-
 def _resolve_locations(conn: Any, doc: dict[str, Any], line: dict[str, Any], meta: dict[str, Any]) -> tuple[int | None, int | None]:
     """Return (source_location_id, destination_location_id) for posting a line."""
     source = line["source_location_id"] or doc["source_location_id"]
@@ -202,18 +182,17 @@ def _resolve_locations(conn: Any, doc: dict[str, Any], line: dict[str, Any], met
 
 def _insert_movement(conn: Any, user: dict[str, Any], req_meta: dict[str, Any], movement_code: str,
                      doc: dict[str, Any], line: dict[str, Any], quantity: Decimal,
-                     source: int | None, dest: int | None, reversal_of: int | None = None, document_id: int | None = None) -> int:
-    audit(conn, user, "POST", "inventory_movement",
-          after={"document_id": doc["document_id"], "product_id": line["product_id"], "quantity": str(quantity),
-                 "movement_type": movement_code, "reversal_of": reversal_of},
-          request_id=req_meta["request_id"], ip_address=req_meta["ip_address"], user_agent=req_meta["user_agent"])
-    with conn.cursor() as cur:
-        cur.execute("""INSERT INTO inventory_movement(movement_type_id,status_id,movement_date,product_id,quantity,uom_id,condition_id,source_location_id,destination_location_id,document_id,reversal_of_movement_id,notes,posted_at,posted_by,posted_by_user_id)
-                     VALUES (%s,%s,current_date,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s,%s) RETURNING inventory_movement_id""",
-                    (_movement_id(conn, movement_code), _status_id(conn, "posted"), line["product_id"], quantity,
-                     line["uom_id"], _condition_id(conn, line["condition_id"]), source, dest,
-                     document_id or doc["document_id"], reversal_of, doc["notes"], user["username"], user["user_id"]))
-        return int(cur.fetchone()[0])
+                     source: int | None, dest: int | None,
+                     reversal_of: dict[str, Any] | None = None, document_id: int | None = None,
+                     adjustment_delta: Decimal | None = None) -> int:
+    stock_effect = "TRANSFER" if source is not None and dest is not None else ("IN" if dest is not None else "OUT")
+    return post_inventory_movement(
+        conn, user, req_meta, movement_code=movement_code, product_id=line["product_id"],
+        quantity=quantity, uom_id=line["uom_id"], condition_id=line["condition_id"],
+        source_location_id=source, destination_location_id=dest, stock_effect=stock_effect,
+        document_id=document_id or doc["document_id"], notes=doc["notes"],
+        reversal_of_movement=reversal_of, audit_after={"document_id": doc["document_id"]},
+        serial_numbers=line.get("serial_numbers"), adjustment_delta=adjustment_delta)
 
 
 def _insert_arap(conn: Any, user: dict[str, Any], req_meta: dict[str, Any], party_type: str, party_id: int,
@@ -246,30 +225,22 @@ def _post_line(conn: Any, user: dict[str, Any], req_meta: dict[str, Any], doc: d
         with conn.cursor() as cur:
             cur.execute("UPDATE business_document_line SET book_quantity=%s WHERE document_line_id=%s", (book, line["document_line_id"]))
         delta = counted - book
+        if delta == 0 and any((sn or "").strip() for sn in (line.get("serial_numbers") or [])):
+            raise HTTPException(status_code=422, detail="盘点无库存差额时不能登记 SN；请清空序列号后重试")
         if delta != 0:
-            if delta < 0:
-                _require_sufficient_stock(conn, line, source, abs(delta))
-            adjustment_id = _insert_movement(conn, user, req_meta, "ADJUSTMENT", doc, line, abs(delta),
-                                             source if delta < 0 else None, source if delta > 0 else None)
-            # 盘点登记的 SN 与数量台账同步（schemas 注释承诺的语义）
-            product_row = fetch_one(conn, "SELECT product_id, display_name, serialized FROM product WHERE product_id=%s", (line["product_id"],))
-            apply_adjustment_serials(conn, user, req_meta, adjustment_id, product_row,
-                                     line.get("serial_numbers"), delta, condition_id, source)
+            _insert_movement(conn, user, req_meta, "ADJUSTMENT", doc, line, abs(delta),
+                             source if delta < 0 else None, source if delta > 0 else None,
+                             adjustment_delta=delta)
         return
     if stock in ("IN", "OUT", "TRANSFER"):
         movement_code = MOVEMENT_FOR_DOC[doc["doc_type"]]
         qty = line["quantity"]
-        if stock in ("OUT", "TRANSFER"):
-            _require_sufficient_stock(conn, line, source, qty)
         if stock == "IN":
-            movement_id = _insert_movement(conn, user, req_meta, movement_code, doc, line, qty, None, dest)
+            _insert_movement(conn, user, req_meta, movement_code, doc, line, qty, None, dest)
         elif stock == "OUT":
-            movement_id = _insert_movement(conn, user, req_meta, movement_code, doc, line, qty, source, None)
+            _insert_movement(conn, user, req_meta, movement_code, doc, line, qty, source, None)
         else:
-            movement_id = _insert_movement(conn, user, req_meta, movement_code, doc, line, qty, source, dest)
-        # 序列号登记（软约束：serial_numbers 为空则跳过；填了则硬校验一致性）
-        apply_line_serials(conn, user, req_meta, movement_id, line["product_id"], line.get("serial_numbers"),
-                           stock, source, dest, qty, line.get("condition_id"))
+            _insert_movement(conn, user, req_meta, movement_code, doc, line, qty, source, dest)
     ap = meta["ap_effect"]
     if ap in ("PAYABLE_UP", "PAYABLE_DOWN"):
         amount = (line["quantity"] * line["price"]).quantize(Decimal("0.01"))
@@ -320,14 +291,10 @@ def _reverse_document(conn: Any, document_id: int, user: dict[str, Any], req_met
         raise HTTPException(status_code=409, detail="红冲单据不能再红冲")
     _can_post(user, doc, False)
     movements = fetch_all(conn, """SELECT * FROM inventory_movement
-                                    WHERE document_id=%s AND status_id=(SELECT status_id FROM record_status WHERE code='posted')""", (document_id,))
-    # 红冲前先锁货品行并（开关开启时）校验反向出库侧余额，避免打出无解释的负库存
+                                    WHERE document_id=%s AND status_id=(SELECT status_id FROM record_status WHERE code='posted')
+                                    ORDER BY inventory_movement_id DESC""", (document_id,))
+    # 先锁全部货品；反向流水倒序逐条检查，兼顾累计余额和 SN 后续事件。
     lock_products(conn, [m["product_id"] for m in movements])
-    if _forbid_negative_stock():
-        for m in movements:
-            reverse_source = m["destination_location_id"]
-            if reverse_source is not None:
-                _require_sufficient_stock(conn, m, reverse_source, m["quantity"])
     # 原单标记红冲
     audit(conn, user, "REVERSE", "business_document", target_id=document_id,
           before={"status": "POSTED"}, after={"status": "REVERSED"},
@@ -361,11 +328,9 @@ def _reverse_document(conn: Any, document_id: int, user: dict[str, Any], req_met
     for m in movements:
         code = mtype_codes.get(int(m["movement_type_id"]), "ADJUSTMENT")
         inv = INVERSE_MOVEMENT.get(code, code)
-        rev_movement_id = _insert_movement(conn, user, req_meta, inv, doc, m, m["quantity"],
-                                           m["destination_location_id"], m["source_location_id"],
-                                           reversal_of=int(m["inventory_movement_id"]), document_id=rev_doc_id)
-        # 红冲原流水关联的资产：写反向事件（IN↔issued、OUT↔received、TRANSFER 反向）
-        reverse_movement_serials(conn, user, req_meta, m, rev_movement_id)
+        _insert_movement(conn, user, req_meta, inv, doc, m, m["quantity"],
+                         m["destination_location_id"], m["source_location_id"],
+                         reversal_of=m, document_id=rev_doc_id)
     # 反向应收应付：direction 翻转
     entries = fetch_all(conn, "SELECT * FROM ar_ap_entry WHERE document_id=%s", (document_id,))
     for e in entries:

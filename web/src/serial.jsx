@@ -3,6 +3,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import api from './api'
 import DataTable, { toServerFilters } from './data-table'
 import { prepareImage } from './image-utils'
+import { appendSerialCandidates, prepareSerialOcrCandidates } from './serial-utils'
 import { conditionLabel, documentTypeLabel } from './business-labels'
 import { Back, Badge, StatusBadge, Button, Empty, ErrorBox, Loading, PageHeading, useFetchOne } from './ui'
 
@@ -20,39 +21,103 @@ export function SerialEntry({ productId, value = '', onChange, quantity, label =
   const [busy, setBusy] = useState(false)
   const [hint, setHint] = useState('')
   const [err, setErr] = useState(null)
+  const [candidates, setCandidates] = useState([])
   const ocrRef = useRef(null); const excelRef = useRef(null)
+  const latestRef = useRef({ productId, value, onChange })
+  latestRef.current = { productId, value, onChange }
+  const mountedRef = useRef(false)
+  const operationRef = useRef(0)
+  const controllerRef = useRef(null)
+  const pendingRef = useRef(null)
   const count = value ? value.split('\n').map(s => s.trim()).filter(Boolean).length : 0
   const mismatch = quantity != null && quantity !== '' && count !== 0 && Number(quantity) !== count
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      operationRef.current += 1
+      controllerRef.current?.abort()
+      pendingRef.current = null
+    }
+  }, [])
+  useEffect(() => {
+    operationRef.current += 1
+    controllerRef.current?.abort()
+    pendingRef.current = null
+    setCandidates([]); setHint(''); setErr(null); setBusy(false)
+  }, [productId])
+
+  function beginOperation(message) {
+    controllerRef.current?.abort()
+    const operation = { id: ++operationRef.current, productId: latestRef.current.productId, controller: new AbortController() }
+    controllerRef.current = operation.controller
+    pendingRef.current = null
+    setCandidates([]); setBusy(true); setErr(null); setHint(message)
+    return operation
+  }
+  function isCurrent(operation) {
+    return mountedRef.current && operation.id === operationRef.current &&
+      operation.productId === latestRef.current.productId
+  }
 
   async function ocrSelected(e) {
     const file = e.target.files?.[0]; e.target.value = ''
     if (!file) return
-    setBusy(true); setErr(null); setHint('识别中…')
+    const operation = beginOperation('识别中…')
     try {
       const image = await prepareImage(file)
-      const result = await api.ocrExtract(image)
-      const serials = [...(result.fields?.serial_number || []), ...(result.fields?.lot_number || [])]
-        .map(x => x.value_raw).filter(Boolean)
-      if (!serials.length) { setHint('未识别到序列号，请重拍或手工输入'); return }
-      onChange([value, serials.join('\n')].filter(Boolean).join('\n'))
-      setHint(`识别到 ${serials.length} 个 SN`)
-    } catch (err) { setErr(err) } finally { setBusy(false) }
+      if (!isCurrent(operation)) return
+      const result = await api.ocrExtract(image, operation.controller.signal)
+      if (!isCurrent(operation)) return
+      const prepared = prepareSerialOcrCandidates(result)
+      pendingRef.current = prepared.candidates.length ? operation : null
+      setCandidates(prepared.candidates)
+      setHint(prepared.message)
+    } catch (err) {
+      if (isCurrent(operation) && err.name !== 'AbortError') { setErr(err); setHint('') }
+    } finally {
+      if (isCurrent(operation)) setBusy(false)
+    }
+  }
+  function confirmCandidates() {
+    const operation = pendingRef.current
+    if (!operation || !isCurrent(operation)) return
+    const selected = candidates.filter(x => x.selected).map(x => x.value)
+    if (!selected.length) return
+    const appended = appendSerialCandidates(latestRef.current.value, selected)
+    pendingRef.current = null
+    setCandidates([])
+    if (appended.added) latestRef.current.onChange(appended.text)
+    setHint(appended.added
+      ? `已添加 ${appended.added} 个 SN${appended.duplicates ? `，跳过 ${appended.duplicates} 个重复项` : ''}`
+      : '所选序列号已在输入列表中，无需重复添加')
+  }
+  function cancelCandidates() {
+    operationRef.current += 1
+    controllerRef.current?.abort()
+    pendingRef.current = null
+    setCandidates([]); setHint('已取消本次识别候选')
   }
   async function excelSelected(e) {
     const file = e.target.files?.[0]; e.target.value = ''
     if (!file) return
-    setBusy(true); setErr(null); setHint('解析中…')
+    const operation = beginOperation('解析中…')
     try {
-      const r = await api.importSerialsFile(file)
-      onChange([value, (r.items || []).join('\n')].filter(Boolean).join('\n'))
+      const r = await api.importSerialsFile(file, { signal: operation.controller.signal })
+      if (!isCurrent(operation)) return
+      latestRef.current.onChange([latestRef.current.value, (r.items || []).join('\n')].filter(Boolean).join('\n'))
       setHint(`导入 ${r.count || 0} 个 SN`)
-    } catch (err) { setErr(err) } finally { setBusy(false) }
+    } catch (err) {
+      if (isCurrent(operation) && err.name !== 'AbortError') { setErr(err); setHint('') }
+    } finally { if (isCurrent(operation)) setBusy(false) }
   }
   async function validate() {
     if (!value.trim()) { setErr(new Error('请先填写序列号')); return }
-    setBusy(true); setErr(null); setHint('校验中…')
+    const operation = beginOperation('校验中…')
     try {
       const r = await api.parseSerials({ product_id: productId, text: value })
+      if (!isCurrent(operation)) return
       const items = r.items || []
       const missing = items.filter(x => !x.exists)
       const active = items.filter(x => x.exists && x.status === 'active')
@@ -62,9 +127,11 @@ export function SerialEntry({ productId, value = '', onChange, quantity, label =
       } else if (active.length === items.length) {
         setHint('全部已登记且未出库（入库会提示重复）')
       } else {
-        setHint(`全部已登记；其中 ${items.length - active.length} 个可出库/调拨`)
+        setHint(`全部已登记；其中 ${active.length} 个在库，${items.length - active.length} 个不在库`)
       }
-    } catch (err) { setErr(err) } finally { setBusy(false) }
+    } catch (err) {
+      if (isCurrent(operation) && err.name !== 'AbortError') { setErr(err); setHint('') }
+    } finally { if (isCurrent(operation)) setBusy(false) }
   }
 
   return <div className="line-serial">
@@ -75,11 +142,19 @@ export function SerialEntry({ productId, value = '', onChange, quantity, label =
         <Button type="button" className="secondary" disabled={busy} onClick={() => ocrRef.current?.click()}>⌾ OCR 识别</Button>
         <Button type="button" className="secondary" disabled={busy} onClick={() => excelRef.current?.click()}>⇪ Excel</Button>
         <Button type="button" className="secondary" disabled={busy} onClick={validate}>校验</Button>
-        <input ref={ocrRef} hidden type="file" accept="image/*" capture="environment" onChange={ocrSelected} />
+        <input ref={ocrRef} hidden type="file" accept="image/*" capture="environment" aria-label="OCR 识别图片" onChange={ocrSelected} />
         <input ref={excelRef} hidden type="file" accept=".xlsx,.xlsm,.xls,.csv" onChange={excelSelected} />
       </span>
     </div>
-    <textarea rows="3" value={value} onChange={e => onChange(e.target.value)} placeholder="扫码/粘贴，一行一个（回车换行）" disabled={busy} />
+    <textarea rows="3" value={value} onChange={e => onChange(e.target.value)} placeholder="扫码/粘贴，一行一个（回车换行）" aria-label={label} disabled={busy} />
+    {candidates.length > 0 && <div className="action-confirm" role="region" aria-label="确认 OCR 序列号">
+      <strong>请核对序列号后确认添加</strong>
+      {candidates.map(candidate => <label className="check-field" key={candidate.key}>
+        <input type="checkbox" checked={candidate.selected} onChange={e => { const selected = e.target.checked; setCandidates(items => items.map(item => item.key === candidate.key ? { ...item, selected } : item)) }} />
+        <span>{candidate.value} <small>（置信度 {Math.round(candidate.confidence * 100)}%{candidate.reasons.length ? `；${candidate.reasons.join('；')}` : ''}）</small></span>
+      </label>)}
+      <div className="actions"><Button type="button" className="primary" onClick={confirmCandidates} disabled={!candidates.some(x => x.selected)}>确认添加</Button><Button type="button" className="secondary" onClick={cancelCandidates}>取消本次识别</Button></div>
+    </div>}
     {hint && <p className="muted">{hint}</p>}
     {err && <ErrorBox error={err} />}
   </div>

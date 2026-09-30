@@ -41,9 +41,22 @@ class PoolExhaustedError(RuntimeError):
     """连接池耗尽：映射为 503 让客户端退避重试，而不是 500/挂死。"""
 
 
-def _get_pool() -> Any:
-    """惰性创建连接池：minconn=0 避免启动即连库。
+def validate_pool_settings() -> tuple[int, int]:
+    """校验每进程连接池配置，不建立数据库连接。"""
+    try:
+        min_connections = int(os.environ.get("ERP_DB_POOL_MIN", "1"))
+        max_connections = int(os.environ.get("ERP_DB_POOL_MAX", "30"))
+    except ValueError as exc:
+        raise RuntimeError("ERP_DB_POOL_MIN 和 ERP_DB_POOL_MAX 必须为整数") from exc
+    if max_connections < 1 or min_connections < 0 or min_connections > max_connections:
+        raise RuntimeError("连接池配置必须满足 0 ≤ ERP_DB_POOL_MIN ≤ ERP_DB_POOL_MAX，且最大值至少为 1")
+    return min_connections, max_connections
 
+
+def _get_pool() -> Any:
+    """惰性创建连接池，默认保留一条可复用的闲置连接。
+
+    minconn=0 明确表示归还即关闭，不保留闲置连接。
     connect_timeout 限制建连等待；statement_timeout 兜底慢查询（30s），
     防止个别慢语句长期占用池内连接。
     """
@@ -52,9 +65,15 @@ def _get_pool() -> Any:
         # 多线程首请求并发建池会创建两个池（其一泄漏、连接上限翻倍）
         with _pool_lock:
             if _pool is None:
-                _pool = _pg_pool.ThreadedConnectionPool(
-                    0, 30, database_url(), connect_timeout=5, options="-c statement_timeout=30000",
-                )
+                min_connections, max_connections = validate_pool_settings()
+                try:
+                    _pool = _pg_pool.ThreadedConnectionPool(
+                        min_connections, max_connections, database_url(),
+                        connect_timeout=5, options="-c statement_timeout=30000",
+                    )
+                except psycopg2.OperationalError as exc:
+                    # minconn 非零时构造器会立即建连，失败也应映射为 503。
+                    raise PoolExhaustedError("数据库连接不可用，请稍后重试") from exc
     return _pool
 
 
