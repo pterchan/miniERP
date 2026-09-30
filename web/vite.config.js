@@ -8,6 +8,7 @@ export default defineConfig(({ mode }) => {
   return {
     base,
     plugins: [react()],
-    server: { port: 5173, proxy: { '/api': 'http://localhost:8000' } },
+    // 登录校验要求 Origin 与 Host 一致，开发代理保留浏览器原始 Host。
+    server: { port: 5173, proxy: { '/api': { target: 'http://localhost:8000', changeOrigin: false } } },
   }
 })

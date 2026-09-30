@@ -43,7 +43,7 @@ API 容器 :8000 ─────────────────────
 
 ## 后端（`api/`，FastAPI + 原生 psycopg2）
 
-无 ORM：`api/db.py` 用 `ThreadedConnectionPool(0, 30)` 直接执行参数化 SQL。启动时 `ensure_bootstrap_users()` 保证初始账号存在、`ensure_bucket()` 保证 MinIO 桶存在；两者失败都不阻断 API 启动（compose 中 `ERP_BOOTSTRAP_STRICT=1` 时 bootstrap 失败才中止）。
+无 ORM：`api/db.py` 用 `ThreadedConnectionPool(0, 30)` 直接执行参数化 SQL；连接在借出时探活（`SELECT 1`），池内闲置期间被静默断开的连接会被替换而不是让请求 500。容器内 uvicorn 以 `--workers 2` 运行，连接预算为 2 × 30 = 60，低于 PostgreSQL 默认 `max_connections=100`（再上调 worker 数时需同步调大数据库连接上限）。启动时 `ensure_bootstrap_users()` 保证初始账号存在（事务级咨询锁串行化多 worker 并发建号）、`ensure_bucket()` 保证 MinIO 桶存在；两者失败都不阻断 API 启动（compose 中 `ERP_BOOTSTRAP_STRICT=1` 时 bootstrap 失败才中止）。
 
 | 模块 | 职责 |
 |---|---|
@@ -51,6 +51,8 @@ API 容器 :8000 ─────────────────────
 | `documents.py` | 通用业务单据引擎：采购/销售/库存三大组共 11 种 `doc_type` 的列表/创建/修改/提交/**过账**/**红冲**/附件；过账写不可变 `inventory_movement` 与 `ar_ap_entry` |
 | `master.py` | 主数据：商品分类、客户、供应商、价格档、部门 |
 | `reports.py` | 报表：采购对账、应收应付汇总/明细、库存成本 |
+| `workspace.py` | 工作台只读汇总与全局分组搜索，沿用各业务域的角色权限与申请所有权 |
+| `read_lists.py` | 报表和审计的共享查询：筛选、排序、分页、完整结果合计及 CSV/XLSX 导出 |
 | `serial_tracking.py` | SN/UUID 台账：列表/导出/详情/解析/文件导入（`/api/serial-ledger/*`），复用 001 迁移中休眠的 `asset` 资产域 |
 | `images.py` / `image_utils.py` | 货品图片：字节存 MinIO、元数据存 `product_image` 表 |
 | `storage.py` | MinIO 客户端封装 |
@@ -58,7 +60,9 @@ API 容器 :8000 ─────────────────────
 | `permissions.py` | 5 种角色、`DOC_TYPE_META` 单据权限矩阵、会话/CSRF 校验依赖 |
 | `security.py` | 密码哈希（argon2）、随机令牌与令牌哈希 |
 | `db.py` | 连接池、审计上下文（`set_config('app.actor_id', ...)`）、`audit()` 写 `audit_event` |
-| `schemas.py` / `export.py` / `list_params.py` / `search.py` / `helpers.py` | 请求模型、CSV 导出、分页/排序/过滤参数、模糊搜索、公共助手 |
+| `schemas.py` / `export.py` / `list_params.py` / `search.py` / `helpers.py` | 请求模型、CSV/XLSX 导出、分页/排序/过滤参数、模糊搜索、公共助手 |
+
+货品普通分页先查询本页货品，再仅对返回的货品批量补库存汇总，避免为被 OFFSET 跳过的行重复聚合；导出复用该取数方式。模糊候选池仍使用 LATERAL 汇总。搜索通过 010 迁移的 STORED 生成列与 trgm 索引匹配，保留原有文本规范化及模糊回退语义。连接借出探活或扩容建连中断时最多尝试三次，连接仍不可用或池耗尽时返回 503 和 `Retry-After: 5`；业务事务本身不会自动重试。
 
 ### 单据生命周期与过账模型
 
@@ -74,7 +78,7 @@ API 容器 :8000 ─────────────────────
 
 ### 审计
 
-每次连接在事务内通过 `set_config('app.actor_id', ...)` 声明操作者；代码层 `audit()` 与数据库层 `require_audit_context` 触发器（002 迁移挂载）双保险——没有审计上下文的写事务会直接失败。`audit_event` 记录 before/after 与字段级 diff。
+写操作通过 `audit()` 在事务内设置 `set_config('app.actor_id', ...)` 审计上下文；`connection()` 本身不声明操作者。代码层审计与数据库层 `require_audit_context` 触发器（002 迁移挂载）共同约束写入，没有审计上下文的业务写事务会直接失败。`audit_event` 记录 before/after 与字段级 diff。
 
 ## 鉴权与权限
 
@@ -84,9 +88,12 @@ API 容器 :8000 ─────────────────────
 
 ## 前端（`web/`，React 19 + Vite 8）
 
-- **无路由库、无状态库**：`ui.jsx` 提供 `RouterContext`/`Link`，`main.jsx` 的 `routeView()` 按路径前缀手写映射到页面组件；状态全部是组件内 hooks。
-- `api.js`：fetch 封装（自动附 CSRF 头、15 秒超时）、XHR 带进度的附件/图片上传（面向 2Mbps 弱网上行）、会话级库存余额缓存（过账类操作后失效）。
-- 页面模块：`main.jsx`（总览/货品/扫码拣货/申请/清点/冲突/审计/管理）、`documents.jsx`（业务单据）、`master-data.jsx`、`reports.jsx`、`serial.jsx`（SN 台账）、`scan-ui.jsx`（OCR 扫码）、`product-gallery.jsx`、`data-table.jsx`（通用表格 + 服务端导出）。
+- **无路由库、无状态库**：`ui.jsx` 提供 `RouterContext`/`Link`，`main.jsx` 的 `routeView()` 按路径前缀手写映射到页面组件。筛选用 `replaceState`、页面导航用 `pushState`，详情保留来源列表的筛选；组件状态使用 hooks。
+- `workspace.jsx`：八模块导航、按角色可处理待办、异常深链、快捷新建与全局搜索；财务的销售入口仅开放客户档案。
+- `api.js`：fetch 封装（自动附 CSRF 头、15 秒超时）、XHR 上传进度、60 秒库存与工作台缓存。换账号清空缓存，成功业务写操作刷新工作台；请求记录会话代际，旧会话迟到的 401 不退出当前账号。
+- `data-table.jsx` / `table-state.js`：客户端与服务端列表、URL 筛选/排序/分页/列显隐、按用户与角色隔离的本机保存视图、固定表头和导出。报表分页合计覆盖当前筛选的全部结果。
+- `ui.jsx` / `status.js`：统一状态文案和色彩、确认条、菜单、Tabs、Drawer、Toast、骨架、详情加载与字段差异；表单保留脏保护和防重复提交。
+- 页面模块：`main.jsx`（库存余额/货品/扫码拣货/申请/清点/冲突/审计/管理）、`documents.jsx`（业务单据与操作历史）、`master-data.jsx`（客户/供应商共用完整编辑和抽屉表单）、`reports.jsx`、`serial.jsx`（SN 台账）、`scan-ui.jsx`（OCR 扫码）、`product-gallery.jsx`。
 - **两种 Web 容器变体**（`WEB_DOCKERFILE` 选择）：
   - `Dockerfile`：多阶段 Node 构建 → nginx:1.27（`web/nginx.conf`，含 `/erp/` 前缀回退处理）；
   - `Dockerfile.remote`：直接拷贝预构建 `dist/` → 零依赖 Python 静态服务器 `web/serve.py`（自带同源 `/api` 反代与 `/erp` 前缀剥离），用于无法访问 Docker Hub / 不便跑 Node 构建的目标机。

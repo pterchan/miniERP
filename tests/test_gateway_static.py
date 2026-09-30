@@ -86,13 +86,15 @@ class GatewayContractTests(unittest.TestCase):
 
     def test_frontend_build_and_runtime_paths(self):
         self.assertIn("env.VITE_BASE_PATH || '/erp/'", VITE)
+        # 开发代理也保留 Host，以通过登录的同源校验。
+        self.assertIn("changeOrigin: false", VITE)
         self.assertIn("makePathHelpers", APP_PATH)
         self.assertIn("withBasePath(`/api${path}`)", API_JS)
         self.assertIn("withBasePath(to)", UI)
         self.assertIn("withBasePath(url)", TABLE)
         # 行链接必须走共享 Link（含基路径+点击拦截），禁止裸 <a href={link}>
-        self.assertIn('<Link className="dt-cell-link" to={link}>', TABLE)
-        self.assertIn("withBasePath(to)", (ROOT / "web/src/dense-lists.jsx").read_text(encoding="utf-8"))
+        self.assertIn('<Link className="dt-cell-link" to={href}', TABLE)
+        self.assertIn("returnTo", TABLE)
 
     def test_cookie_path_is_configurable_for_erp_mount(self):
         self.assertIn('COOKIE_PATH = os.environ.get("ERP_COOKIE_PATH", "/")', API)

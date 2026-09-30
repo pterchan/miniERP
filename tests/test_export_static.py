@@ -8,6 +8,7 @@ MASTER = (ROOT / "api/master.py").read_text(encoding="utf-8")
 EXPORT = (ROOT / "api/export.py").read_text(encoding="utf-8")
 LIST_PARAMS = (ROOT / "api/list_params.py").read_text(encoding="utf-8")
 DATATABLE = (ROOT / "web/src/data-table.jsx").read_text(encoding="utf-8")
+TABLE_STATE = (ROOT / "web/src/table-state.js").read_text(encoding="utf-8")
 
 
 class ExportContractTests(unittest.TestCase):
@@ -74,7 +75,8 @@ class ExportContractTests(unittest.TestCase):
         self.assertIn("parse_composite_ids", MAIN)
 
     def test_datatable_supports_export_and_page_size_500(self):
-        self.assertIn("pageSizeOptions = [10, 25, 50, 100, 200, 500]", DATATABLE)
+        self.assertIn("pageSizeOptions = DEFAULT_PAGE_SIZES", DATATABLE)
+        self.assertIn("DEFAULT_PAGE_SIZES = [10, 25, 50, 100, 200, 500]", TABLE_STATE)
         self.assertIn("doExport", DATATABLE)
         self.assertIn("allScope", DATATABLE)
         self.assertIn("rowKey", DATATABLE)

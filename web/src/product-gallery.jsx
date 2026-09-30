@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import api from './api'
 import { prepareUploadFile } from './image-utils'
-import { Button, Empty, ErrorBox } from './ui'
+import { ActionConfirm, Button, Empty, ErrorBox, useToast } from './ui'
 
 function fmtSize(bytes) {
   if (bytes < 1024) return `${bytes} B`
@@ -15,6 +15,8 @@ export default function ProductGallery({ productId, canEdit }) {
   const [busy, setBusy] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(null)
   const [preview, setPreview] = useState(null)
+  const [removing, setRemoving] = useState(null)
+  const toast = useToast()
   const fileRef = useRef(null)
 
   const load = useCallback(() => {
@@ -40,9 +42,9 @@ export default function ProductGallery({ productId, canEdit }) {
   }
 
   async function remove(image) {
-    if (!window.confirm(`删除图片「${image.filename || image.image_id}」？`)) return
     setError(null)
-    try { await api.deleteProductImage(image.image_id); await load() } catch (err) { setError(err) }
+    setBusy(true)
+    try { await api.deleteProductImage(image.image_id); setRemoving(null); await load(); toast('图片已删除') } catch (err) { setError(err) } finally { setBusy(false) }
   }
 
   async function move(image, dir) {
@@ -71,13 +73,14 @@ export default function ProductGallery({ productId, canEdit }) {
       {uploadProgress !== null && <progress value={uploadProgress} max="100" aria-label="上传进度" />}
       <span className="muted">{images.length} 张</span>
     </div>
+    {removing && <ActionConfirm title="删除图片" description={`删除「${removing.filename || '此图片'}」后将无法恢复。`} onConfirm={() => remove(removing)} onCancel={() => setRemoving(null)} busy={busy} confirmLabel="确认删除" />}
     {sorted.length ? <div className="gallery-grid">{sorted.map(image => <figure className="gallery-tile" key={image.image_id}>
       <button type="button" className="gallery-thumb" onClick={() => setPreview(image)} aria-label={`预览 ${image.filename || `图片 ${image.image_id}`}`}><img src={api.productImageContent(image.image_id, 'thumb')} alt={image.filename || `图片 ${image.image_id}`} loading="lazy" /></button>
       <figcaption><span title={image.filename}>{image.filename || `图片 ${image.image_id}`}</span><small>{fmtSize(image.size)}</small></figcaption>
       {canEdit && <div className="gallery-actions">
         <button type="button" onClick={() => move(image, -1)} disabled={sorted[0].image_id === image.image_id} aria-label="前移">↑</button>
         <button type="button" onClick={() => move(image, 1)} disabled={sorted[sorted.length - 1].image_id === image.image_id} aria-label="后移">↓</button>
-        <button type="button" className="danger-link" onClick={() => remove(image)}>删除</button>
+        <button type="button" className="danger-link" disabled={busy} onClick={() => setRemoving(image)}>删除</button>
       </div>}
     </figure>)}</div> : <Empty>暂无图片</Empty>}
     {preview && <Lightbox preview={preview} onClose={() => setPreview(null)} />}

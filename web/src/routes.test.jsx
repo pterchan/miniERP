@@ -1,6 +1,6 @@
 import React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 
 const { makeApi } = vi.hoisted(() => {
   const dflt = value => async () => value
@@ -10,7 +10,7 @@ const { makeApi } = vi.hoisted(() => {
     product_name: '货品A', location_name: '仓库1', condition_code: 'new', uom_code: 'EA',
     on_hand_quantity: 10, identifier: 'A-1', manufacturer: '厂家', specification: '规格',
   }
-  const PRODUCT_ROW = { ...BALANCE_ROW }
+  const PRODUCT_ROW = { ...BALANCE_ROW, display_name: '货品A' }
   const PRODUCT_DETAIL = {
     product_id: 1, display_name: '货品A', manufacturer: '厂家', specification: '规格',
     default_uom_id: 1, uom_code: 'EA', uom_display_name: '个', source_uom_raw: '个',
@@ -33,7 +33,7 @@ const { makeApi } = vi.hoisted(() => {
   const DOCUMENT_DETAIL = { document_id: 1, doc_no: 'CG-1', doc_type: 'PURCHASE_RECEIPT', status: 'DRAFT', doc_date: '2026-08-06', party_name: '供应商A', creator_name: '张三', total_amount: 100, deposit_amount: 0, lines: [], attachments: [], ar_ap_entries: [], created_by: 1 }
 
   const makeApi = () => ({
-    request: dflt({}),
+    request: dflt({}), workbench: dflt({ pending_documents: [], my_draft_documents: 0, my_draft_documents_by_group: [], my_draft_requests: 0, pending_requests: 0, approved_requests: 0, zero_stock_products: 0 }), search: dflt({ groups: [] }), documentHistory: dflt([]),
     login: dflt({}), logout: dflt({}), me: dflt(ADMIN), changePassword: dflt({}),
     inventory: dflt([BALANCE_ROW]),
     inventoryByProduct: dflt([BALANCE_ROW]),
@@ -66,22 +66,24 @@ const { makeApi } = vi.hoisted(() => {
     priceTiers: dflt([]), createPriceTier: dflt({}), updatePriceTier: dflt({}), deletePriceTier: dflt({}),
     departments: dflt([]), createDepartment: dflt({}),
     reports: {
-      purchase: dflt({ rows: [] }),
-      arAp: dflt({ customers: [], suppliers: [] }),
-      receivables: dflt([]), payables: dflt([]), inventoryCost: dflt([]),
+      purchase: dflt({ items: [], total: 0, summary: {} }),
+      arAp: dflt({ items: [], total: 0, summary: {} }),
+      receivables: dflt({ items: [], total: 0, summary: {} }), payables: dflt({ items: [], total: 0, summary: {} }), inventoryCost: dflt({ items: [], total: 0, summary: {} }),
     },
-    audit: dflt([]), auditEvent: dflt(AUDIT_DETAIL),
+    audit: dflt({ items: [], total: 0 }), auditEvent: dflt(AUDIT_DETAIL),
     ocrExtract: dflt({ status: 'ok', search_terms: [] }),
   })
 
   return { makeApi }
 })
 
-vi.mock('./api', () => ({ default: makeApi(), setUnauthorizedHandler: () => {}, invalidateInventory: () => {} }))
+vi.mock('./api', () => ({ default: makeApi(), setUnauthorizedHandler: () => {}, invalidateInventory: () => {}, invalidateWorkbench: () => {}, setApiUser: () => {} }))
 
-import { App } from './main'
+import { App, AppRouter } from './main'
+import api from './api'
+import { withBasePath, stripBasePath } from './app-path'
 
-afterEach(cleanup)
+afterEach(() => { cleanup(); vi.restoreAllMocks(); window.localStorage.clear() })
 
 const ROUTES = [
   ['/ 库存总览', '/'],
@@ -125,11 +127,107 @@ describe('所有路由渲染不应白屏', () => {
     const { container } = render(<App />)
     // 等待 api.me() 与页面数据请求 resolve 后的最终渲染完成。
     await waitFor(() => {
-      expect(container.innerHTML).not.toBe('')
+      expect(container.querySelector('.app-shell')).not.toBeNull()
+      expect(container.textContent).not.toContain('页面渲染出错')
     }, { timeout: 2000 })
     // 白屏的判定：React 在无错误边界时若渲染抛错会卸载整棵树，container 会变为空。
     expect(container.innerHTML).not.toBe('')
     // 不应出现加载态永远卡住的空白
     expect(container.textContent).toMatch(/.+/)
+    expect(container.textContent).not.toContain('页面渲染出错')
+  })
+})
+
+const user = role => ({ user_id: 1, role, username: 'test', display_name: '测试用户' })
+function openAs(path, role = 'ADMIN') {
+  window.history.replaceState({}, '', path)
+  return render(<AppRouter user={user(role)} onLogout={() => {}} />)
+}
+
+describe('重设计入口与路由行为', () => {
+  it('工作台显示可行动待办，普通员工审批中不计角标', async () => {
+    vi.spyOn(api, 'workbench').mockResolvedValue({ pending_documents: [], pending_requests: 3, my_draft_requests: 2, my_draft_documents_by_group: [], zero_stock_products: 0 })
+    openAs('/', 'COLLEAGUE')
+    await screen.findByRole('link', { name: '待办 2 项' })
+    expect(await screen.findByRole('heading', { name: '审批中' })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /3 条申请等待审批/ })).toHaveAttribute('href', withBasePath('/requests?f.status=SUBMITTED'))
+  })
+  it('财务销售模块落到客户，管理落到审计且不请求用户管理数据', async () => {
+    const users = vi.spyOn(api, 'users')
+    openAs('/sales', 'FINANCE')
+    expect(await screen.findByRole('heading', { name: '客户档案' })).toBeInTheDocument()
+    const navigation = screen.getByRole('navigation', { name: '主导航' })
+    fireEvent.click(within(navigation).getByRole('link', { name: /管理/ }))
+    expect(await screen.findByRole('heading', { name: '操作审计' })).toBeInTheDocument()
+    expect(users).not.toHaveBeenCalled()
+  })
+  it('同事可以访问库存余额和基础资料库位，库位不请求账号列表', async () => {
+    const users = vi.spyOn(api, 'users')
+    openAs('/inventory', 'COLLEAGUE')
+    expect(await screen.findByRole('heading', { name: '库存余额', level: 1 })).toBeInTheDocument()
+    fireEvent.click(within(screen.getByRole('navigation', { name: '主导航' })).getByRole('link', { name: /基础资料/ }))
+    fireEvent.click(screen.getByRole('tab', { name: '库位' }))
+    expect(await screen.findByRole('heading', { name: '库位', level: 1 })).toBeInTheDocument()
+    expect(users).not.toHaveBeenCalled()
+  })
+  it('筛选后进入详情再返回，保留刚输入的搜索条件', async () => {
+    openAs('/inventory')
+    const input = await screen.findByPlaceholderText('搜索…')
+    fireEvent.change(input, { target: { value: '货品A' } })
+    const rowLink = await screen.findByRole('link', { name: '货品A' })
+    fireEvent.click(rowLink)
+    expect(await screen.findByRole('heading', { name: '货品A', level: 1 })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('link', { name: /返回/ }))
+    await screen.findByRole('heading', { name: '库存余额', level: 1 })
+    expect(new URLSearchParams(window.location.search).get('q')).toBe('货品A')
+    expect(screen.getByPlaceholderText('搜索…')).toHaveValue('货品A')
+  })
+  it('脏表单取消由统一路由守卫保护，只询问一次', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    openAs('/requests/new')
+    fireEvent.change(await screen.findByLabelText('原因/备注'), { target: { value: '待保存的申请' } })
+    fireEvent.click(screen.getByRole('button', { name: '取消' }))
+    expect(window.location.pathname).toBe('/requests/new')
+    expect(confirm).toHaveBeenCalledTimes(1)
+    confirm.mockReturnValue(true)
+    fireEvent.click(screen.getByRole('button', { name: '取消' }))
+    await screen.findByRole('heading', { name: '审批队列' })
+    expect(confirm).toHaveBeenCalledTimes(2)
+  })
+  it('详情历史表修改筛选与切换分区后仍返回原始列表', async () => {
+    const returnTo = '/master/customers?q=客户&f.is_active=true'
+    window.history.replaceState({ returnTo }, '', withBasePath('/master/customers/1#history'))
+    render(<AppRouter user={user('ADMIN')} onLogout={() => {}} />)
+    fireEvent.change(await screen.findByLabelText('筛选单号'), { target: { value: 'SO-1' } })
+    await waitFor(() => expect(new URLSearchParams(window.location.search).get('f.doc_no')).toBe('SO-1'))
+    expect(window.history.state.returnTo).toBe(returnTo)
+    fireEvent.click(screen.getByRole('tab', { name: '档案', exact: true }))
+    expect(window.location.hash).toBe('#profile')
+    expect(window.history.state.returnTo).toBe(returnTo)
+    fireEvent.click(screen.getByRole('link', { name: /返回/ }))
+    await screen.findByRole('heading', { name: '客户档案', level: 1 })
+    expect(new URLSearchParams(window.location.search).get('q')).toBe('客户')
+  })
+  it('详情返回来源不会串到其他模块的新建页', async () => {
+    window.history.replaceState({ returnTo: '/master/customers?q=客户' }, '', withBasePath('/master/customers/1'))
+    render(<AppRouter user={user('ADMIN')} onLogout={() => {}} />)
+    await screen.findByRole('heading', { name: '客户A', level: 1 })
+    fireEvent.click(within(screen.getByRole('navigation', { name: '主导航' })).getByRole('link', { name: /申请/ }))
+    await screen.findByRole('heading', { name: '审批队列' })
+    expect(window.history.state.returnTo).toBeUndefined()
+    fireEvent.click(screen.getByRole('button', { name: '＋ 新建申请' }))
+    await screen.findByRole('heading', { name: '新建申请', level: 1 })
+    expect(screen.getByRole('link', { name: /返回/ })).toHaveAttribute('href', withBasePath('/requests'))
+  })
+  it('保存成功不再弹出未保存提示，并保留乐观锁字段', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const save = vi.spyOn(api, 'updateRequest').mockResolvedValue({ stock_request_id: 1 })
+    openAs('/requests/1/edit')
+    const input = await screen.findByLabelText('原因/备注')
+    fireEvent.change(input, { target: { value: '修订备注' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存草稿' }))
+    await waitFor(() => expect(stripBasePath(window.location.pathname)).toBe('/requests/1'))
+    expect(save).toHaveBeenCalledWith('1', expect.objectContaining({ version: 1 }))
+    expect(confirm).not.toHaveBeenCalled()
   })
 })

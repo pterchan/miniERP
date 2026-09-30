@@ -12,4 +12,6 @@ USER appuser
 EXPOSE 8000
 # --proxy-headers：容器内 API 只从 compose 网络收到 web/网关代理流量，
 # 信任 X-Forwarded-For/Proto 让审计记录真实客户端 IP 而不是代理容器地址。
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# --workers 2：单进程同步端点受 GIL 限制（压测 ~120 RPS 封顶），双 worker 实测
+# 吞吐 +62%；每进程独立连接池 30，合计 60 连接 < PostgreSQL 默认 max_connections=100。
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--proxy-headers", "--forwarded-allow-ips", "*"]

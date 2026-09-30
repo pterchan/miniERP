@@ -19,24 +19,56 @@
 |---|---|---|---|
 | 健康 | `/healthz` | GET | 探活（含一次 DB 查询）；Web 容器把 `/api/healthz` 特判到这里 |
 | 认证 | `/api/auth` | `login`、`logout`、`me`、`change-password` | |
+| 工作台 | `/api/workbench/summary` | GET | 当前用户可处理事项、本人申请进度及异常统计 |
+| 全局搜索 | `/api/search` | GET `q`/`limit` | 按角色与所有权裁剪的分组搜索 |
 | OCR | `/api/ocr` | POST `extract` | 转发到独立 OCR 服务的薄代理（内部令牌鉴权） |
 | 货品 | `/api/products` | 列表 `q`/模糊搜索、`stock`、`export`、详情、POST、PUT | 搜索命中不佳时回退模糊匹配（`api/search.py`） |
 | 库存 | `/api/inventory` | GET `balance`、`balance/export`、`balance/{product}/{location}/{condition}/{uom}`、POST `adjust` | 清点=按实盘数覆写，写调整流水 |
 | 单位/库位 | `/api/uoms`、`/api/locations` | 列表/导出/详情/增改 | |
-| 业务单据 | `/api/documents` | 列表、`export`、详情、POST、PUT、`submit`、`withdraw`、`reject`、`post`、`reverse`、`attachments` | 采购/销售/库存 11 种 `doc_type` 通用引擎；过账写不可变流水 + 往来台账，红冲净额归零 |
+| 业务单据 | `/api/documents` | 列表、`export`、详情、`{id}/history`、POST、PUT、`submit`、`withdraw`、`reject`、`post`、`reverse`、`attachments` | 采购/销售/库存 11 种 `doc_type` 通用引擎；过账写不可变流水 + 往来台账，红冲净额归零 |
 | 附件 | `/api/attachments/{id}` | GET 下载 | 单据附件 BYTEA 存库；上传走单据的 `attachments` 端点 |
 | 货品图片 | `/api/products/{id}/images`、`/api/product-images/{image_id}` | 列表/上传/取图/改排序/删除 | 字节存 MinIO，单图 ≤20MB |
 | 主数据 | `/api` | `categories`、`customers`、`suppliers`、`departments`、`products/{id}/price-tiers` | 各带导出/增改 |
 | 申请审批 | `/api/stock-requests` | 列表、`export`、详情、POST、PUT、`submit`/`withdraw`/`approve`/`reject`/`release` | OA 流 |
 | 冲突中心 | `/api/conflicts` | 列表、`export`、详情、`link-product`/`create-product`/`edit-product`/`resolve` | 导入冲突的人工裁决 |
 | SN 台账 | `/api/serial-ledger` | 列表、`export`、详情、POST `parse`、POST `import-file` | SN/UUID 流向（复用 asset 域） |
-| 报表 | `/api/reports` | `purchase-reconciliation`、`ar-ap-summary`、`receivables`、`payables`、`inventory-cost` | |
+| 报表 | `/api/reports` | `purchase-reconciliation`、`ar-ap-summary`、`receivables`、`payables`、`inventory-cost` | FINANCE/ADMIN；原 GET 路径支持分页和导出 |
 | 用户管理 | `/api/admin/users` | 列表、`export`、详情、增改、重置密码 | ADMIN |
 | 审计 | `/api/audit` | 列表、`export`、详情 | ADMIN/FINANCE |
 
-## 通用约定
+## 列表、报表与导出
 
-- **列表分页**：`page`（默认 1）、`page_size`（默认 30，上限 500）、`sort`/`order`（列名白名单）；响应统一为 `{items, page, page_size, total}`。
-- **筛选**：`f` 参数，格式 `列:操作:值`，可重复；操作符 `contains`（ILIKE 模糊）/`eq`/`ne`/`gt`/`gte`/`lt`/`lte`/`in`（逗号分隔）。列名与操作符全部走白名单，值一律绑定参数，杜绝注入（`api/list_params.py`）。
-- **导出与视图一致**：每个 `/export` 端点复用列表接口的同一套筛选/排序构造器，"当前视图 = 导出结果"；CSV 带 utf-8-sig BOM（Excel 中文不乱码），也支持 XLSX（openpyxl），单次导出上限 5 万行（`api/export.py`）。
-- **写操作全量审计**：CREATE/EDIT/DELETE 连同 before/after 与字段 diff 写入 `audit_event`（见[数据模型](data-model.md#审计机制)）。
+- **现有分页列表**：货品、单据、SN 台账接受 `page`（默认 1）、`page_size`（默认 30，上限 500）、`sort`/`order`，返回 `{items, page, page_size, total}`。其他原有数组列表保持兼容，不自动改为分页。
+- **搜索与筛选**：`q` 为搜索词；单据列表及导出搜索单号或往来方名称，并支持 `mine=true` 仅保留本人创建的记录。支持筛选的端点使用可重复的 `f=列:操作:值`；操作符包括 `contains`、`eq`、`ne`、`gt`、`gte`、`lt`、`lte`、`in`（逗号分隔），以各端点白名单为准。排序列也使用白名单，筛选值全部绑定参数。
+- **报表与审计分页**：五个报表 GET 和 `/api/audit` 增加 `paginated=true`，接受 `page`、`page_size`、`q`、`f`、`sort`、`order`，返回 `{items, total, page, page_size, summary}`。`summary` 覆盖完整筛选结果，审计为 `{}`；审计的 `q` 匹配操作人、角色、动作、目标表或请求编号，列表与详情均返回 `actor_name`。
+- **兼容响应**：未启用分页时，采购对账仍返回 `{rows}`，应收应付汇总仍返回 `{customers, suppliers}`，应收明细、应付明细、库存成本与审计仍返回数组。审计旧 `limit` 默认 100、最多 500；分页模式忽略 `limit`。应收应付汇总旧模式仍返回双方完整汇总，分页或导出时使用 `party_type=customer|supplier`（默认 `customer`）选择一方。
+- **导出**：报表直接在原 GET 路径传 `fmt=csv|xlsx`；审计沿用 `/api/audit/export`，单据沿用 `/api/documents/export`。这些端点复用列表筛选及排序，不受当前页限制；可用 `ids` 限定选中记录，库存成本使用 `product_id:uom_id` 复合键。原有客户端数组列表导出通过 `ids` 传递筛选后的记录。CSV 带 UTF-8 BOM，也支持 XLSX，单次上限 5 万行。
+
+| 报表 | 完整筛选合计 | 补充查询参数 |
+|---|---|---|
+| `purchase-reconciliation` | `total_amount` | `supplier_id`、`start_date`、`end_date` |
+| `ar-ap-summary` | `receivable_balance` 或 `payable_balance` | `party_type` |
+| `receivables` / `payables` | `amount`、`amount_up`、`amount_down`、`balance`（增加减减少） | `party_id`、`start_date`、`end_date` |
+| `inventory-cost` | `cost_value` | — |
+
+采购对账、应收应付明细与客户/供应商详情的历史交易补充 `document_id`，用于按权限下钻；往来方历史仍只返回最近 50 条。申请详情补充表头的 `source_location_name`、`destination_location_name`。
+
+## 新增只读接口
+
+本次仅新增以下三个 GET；均需登录，不改变原有业务状态机或角色权限。
+
+| 接口 | 响应与权限 |
+|---|---|
+| `/api/workbench/summary` | 返回工作台统计对象；单据待办按当前角色的 `post_roles` 裁剪，申请审批和放行限 WAREHOUSE/ADMIN |
+| `/api/search?q=...&limit=5` | 返回 `{q, groups: [{kind, label, items}]}`；每项包含 `id`、`title`、`subtitle`、`href`，适用时包含 `status` |
+| `/api/documents/{document_id}/history` | 沿用对应单据类型的 `view_roles`；返回按时间、事件编号正序排列的事件数组 |
+
+**工作台口径**：`pending_documents` 按单据类型返回 `{doc_type, group, label, count}`；`my_draft_documents` 与 `my_draft_documents_by_group: [{group, count}]` 统计本人可查看的草稿。`pending_requests` 对仓管/管理员统计全部待审批申请，其他角色统计本人审批中的申请，后者不应计入可处理待办角标；`approved_requests` 仅对仓管/管理员统计待放行申请；`my_draft_requests` 为本人草稿。`pending_conflicts` 仅 ADMIN 返回，`over_credit_customers` 仅 FINANCE/ADMIN 返回（信用上限大于 0 且应收超过上限）。`zero_stock_products` 对所有角色返回，按任一库存余额行 ≤0 的货品去重，不跨单位抵消。
+
+**搜索口径**：`q` 使用 NFKC、去空白及大小写归一化，空查询返回空分组；每组默认 5 条、最多 10 条。货品复用现有精确/模糊搜索；单据按类型查看权限裁剪；申请仅本人及 WAREHOUSE/ADMIN 可见；客户限 SALES/FINANCE/ADMIN，供应商限 WAREHOUSE/FINANCE/ADMIN，序列号搜索限 WAREHOUSE/ADMIN。未授权组不返回，单据及申请编号前缀命中优先。
+
+**历史口径**：事件包含 `audit_event_id`、`action`、中文 `label`、`actor_name`、`created_at` 与 `field_diff`。除直接关联事件，还按唯一单号补关联旧创建事件，并关联附件上传事件。旧编辑审计未保存业务变化时，`field_diff` 保持空对象，不将版本号变化展示为业务变更。
+
+## 写入约定
+
+- **写操作全量审计**：CREATE/EDIT/DELETE 写入 `audit_event`，按现有操作保存 before/after 与字段 diff（见[数据模型](data-model.md#审计机制)）。历史字段不足时只展示已记录事实。

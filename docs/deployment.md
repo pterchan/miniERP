@@ -10,6 +10,8 @@ miniERP 提供 Docker Compose 本地部署和可选的远程 SSH 部署。也可
 
 浏览器入口为 http://127.0.0.1:18080/erp/。PostgreSQL 首次初始化会按文件名顺序执行数据库迁移。升级已有数据库时，按[数据模型](data-model.md)说明幂等补跑新增迁移。
 
+升级到包含货品搜索性能修复的版本时，需先补跑 `010_perf_indexes.sql`，再启动新 API；新查询直接读取该迁移的生成列。迁移涉及 `product`、`product_identifier` 和 `product_name_alias` 三张表的生成列及索引，大库应安排低峰维护窗口。
+
 开发热更模式可单独启动依赖服务，再运行 API 与 Vite：
 
     docker compose up -d postgres minio ocr
@@ -55,5 +57,7 @@ deploy/gateway/nginx.conf 演示如何把 /erp/ 转发到 Web 容器的回环高
 | API 不通 | 检查 Web 到 API 的 /api 反代，并访问 http://127.0.0.1:18080/api/healthz |
 | OCR 未就绪 | 查看 docker compose logs ocr；服务在模型加载完成后才通过 /readyz |
 | 登录后立即 401 | ERP_COOKIE_PATH 必须与浏览器访问前缀一致；/erp/ 对应 /erp |
+| Vite 开发登录提示来源不一致 | `/api` 代理需保留 `changeOrigin: false`，使原始 Host 与浏览器 Origin 一致 |
 | 图片上传失败 | 检查 MinIO 健康状态、访问密钥和桶名 |
-| 数据库缺少迁移 | 按数据模型文档补跑幂等迁移 |
+| 数据库缺少迁移 | 按数据模型文档补跑幂等迁移（010 的生成列涉及 product、product_identifier、product_name_alias 三张表，大库需安排低峰维护窗口） |
+| 数据库连接数逼近上限 | API 以 2 worker × 30 连接运行（合计 60）；再上调 worker 数前先调大 postgres `max_connections` |

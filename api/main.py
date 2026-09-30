@@ -12,13 +12,14 @@ from urllib.parse import urlparse
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import documents, images, master, reports, serial_tracking
+from . import documents, images, master, reports, serial_tracking, workspace
 from .db import PoolExhaustedError, audit, connection, ensure_bootstrap_users, fetch_all, fetch_one
 from .export import MAX_EXPORT_ROWS, export_response, export_rows_by_ids
 from .list_params import clamp_page, clamp_page_size, like_escape, parse_composite_ids, parse_filters, parse_ids, parse_sort
 from .helpers import _condition_id, _line_uom_id, _movement_id, _normalize_identifier, _normalize_query, _request_meta, _status_id, lock_products
 from .ocr_client import OCRProxyError, forward_ocr
 from .permissions import CSRF_COOKIE, SESSION_COOKIE, _csrf, require_roles, require_user
+from .read_lists import read_list
 from .search import fuzzy_search, normalize_search
 from .serial_tracking import apply_adjustment_serials
 from .schemas import (
@@ -72,6 +73,7 @@ app.include_router(images.router)
 app.include_router(master.router)
 app.include_router(reports.router)
 app.include_router(serial_tracking.router)
+app.include_router(workspace.router)
 
 
 @asynccontextmanager
@@ -361,15 +363,17 @@ def _product_where(q: str, filters: list[str]) -> tuple[str, list]:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     if q.strip():
         # 模式 %needle% 并入绑定参数，SQL 里不再出现字面量 %（psycopg2 会把 % 当占位符）。
+        # 匹配左值是 010 迁移的物化生成列（与 005 时代的查询表达式逐字节一致），
+        # 免去扫描期逐行 NFKC+正则求值，并让 trgm GIN 直接打在列上。
         needle = "%" + _like_escape(normalize_search(q)) + "%"
         clauses.append(
-            "(lower(regexp_replace(pg_catalog.normalize(coalesce(p.display_name,''),'NFKC'), '[[:space:]]', '', 'g')) LIKE %s ESCAPE '\\'"
-            " OR lower(regexp_replace(pg_catalog.normalize(coalesce(p.manufacturer,''),'NFKC'), '[[:space:]]', '', 'g')) LIKE %s ESCAPE '\\'"
-            " OR lower(regexp_replace(pg_catalog.normalize(coalesce(p.specification,''),'NFKC'), '[[:space:]]', '', 'g')) LIKE %s ESCAPE '\\'"
+            "(p.search_display_name LIKE %s ESCAPE '\\'"
+            " OR p.search_manufacturer LIKE %s ESCAPE '\\'"
+            " OR p.search_specification LIKE %s ESCAPE '\\'"
             " OR EXISTS (SELECT 1 FROM product_identifier pi WHERE pi.product_id=p.product_id"
-            "            AND regexp_replace(pi.value_normalized, '[[:space:]]', '', 'g') LIKE %s ESCAPE '\\')"
+            "            AND pi.search_value LIKE %s ESCAPE '\\')"
             " OR EXISTS (SELECT 1 FROM product_name_alias pa WHERE pa.product_id=p.product_id"
-            "            AND regexp_replace(pa.alias_normalized, '[[:space:]]', '', 'g') LIKE %s ESCAPE '\\'))"
+            "            AND pa.search_alias LIKE %s ESCAPE '\\'))"
         )
         params.extend([needle] * 5)
     clauses.extend(filter_parts)
@@ -382,17 +386,18 @@ def _fuzzy_pool_where(needle: str) -> tuple[str, list]:
 
     覆盖丢前缀/错位等非子串情形，再交由 search.fuzzy_search 的 SequenceMatcher
     打分，保证结果语义与原先全池扫描一致，只是候选集合被索引界住。
+    左值用 010 迁移的物化生成列，避免扫描期逐行 NFKC+正则。
     """
     esc = "%" + _like_escape(needle) + "%"
     where = (
-        "lower(regexp_replace(pg_catalog.normalize(coalesce(p.display_name,''),'NFKC'), '[[:space:]]', '', 'g')) %% %s"
-        " OR lower(regexp_replace(pg_catalog.normalize(coalesce(p.manufacturer,''),'NFKC'), '[[:space:]]', '', 'g')) %% %s"
-        " OR lower(regexp_replace(pg_catalog.normalize(coalesce(p.specification,''),'NFKC'), '[[:space:]]', '', 'g')) %% %s"
-        " OR lower(regexp_replace(pg_catalog.normalize(coalesce(p.display_name,''),'NFKC'), '[[:space:]]', '', 'g')) LIKE %s ESCAPE '\\'"
+        "p.search_display_name %% %s"
+        " OR p.search_manufacturer %% %s"
+        " OR p.search_specification %% %s"
+        " OR p.search_display_name LIKE %s ESCAPE '\\'"
         " OR EXISTS (SELECT 1 FROM product_identifier pi WHERE pi.product_id=p.product_id"
-        "            AND regexp_replace(pi.value_normalized, '[[:space:]]', '', 'g') LIKE %s ESCAPE '\\')"
+        "            AND pi.search_value LIKE %s ESCAPE '\\')"
         " OR EXISTS (SELECT 1 FROM product_name_alias pa WHERE pa.product_id=p.product_id"
-        "            AND regexp_replace(pa.alias_normalized, '[[:space:]]', '', 'g') LIKE %s ESCAPE '\\')"
+        "            AND pa.search_alias LIKE %s ESCAPE '\\')"
     )
     return where, [needle, needle, needle, esc, esc, esc]
 
@@ -408,18 +413,42 @@ _STOCK_SUMMARY_LATERAL = """LEFT JOIN LATERAL (
 
 
 def _products_query(where: str, order_by: str) -> str:
+    """两段式第一段：只取货品行本身，不含库存汇总。
+
+    原来的 stock LATERAL 会随 ORDER BY+OFFSET 对被跳过的行逐行聚合
+    （5000 货品时约 420ms）；汇总改由 _attach_stock_summary 第二段
+    只对最终返回的行批量计算。
+    """
     return f"""SELECT p.product_id, p.display_name, p.manufacturer, p.specification, p.status_id, p.category_id,
                       p.serialized, p.created_at, p.updated_at,
                       u.uom_id, u.code AS uom_code, p.source_uom_raw,
-                      ident.value_raw AS identifier, ident.value_normalized AS identifier_normalized,
-                      COALESCE(stock.stock_summary, '[]'::jsonb) AS stock_summary
+                      ident.value_raw AS identifier, ident.value_normalized AS identifier_normalized
                  FROM product p
                  LEFT JOIN uom u ON u.uom_id = p.default_uom_id
                  LEFT JOIN LATERAL (SELECT value_raw, value_normalized FROM product_identifier p0
                                      WHERE p0.product_id = p.product_id AND p0.is_primary
                                      ORDER BY p0.product_identifier_id LIMIT 1) ident ON TRUE
-                 {_STOCK_SUMMARY_LATERAL}
                 WHERE {where} ORDER BY {order_by}"""
+
+
+_STOCK_SUMMARY_BY_IDS = """SELECT g.product_id, jsonb_agg(jsonb_build_object('uom_code', g.uom_code, 'quantity', g.quantity)
+                                    ORDER BY g.uom_code) AS stock_summary
+                             FROM (SELECT b.product_id, b.uom_code, SUM(b.on_hand_quantity)::NUMERIC(18,3) AS quantity
+                                     FROM v_inventory_balance b
+                                    WHERE b.product_id = ANY(%s)
+                                    GROUP BY b.product_id, b.uom_code) g
+                            GROUP BY g.product_id"""
+
+
+def _attach_stock_summary(conn: Any, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """两段式第二段：为返回的行批量补库存汇总（无流水的货品为空数组）。"""
+    if not rows:
+        return rows
+    summaries = fetch_all(conn, _STOCK_SUMMARY_BY_IDS, ([int(r["product_id"]) for r in rows],))
+    by_id = {int(s["product_id"]): s["stock_summary"] for s in summaries}
+    for row in rows:
+        row["stock_summary"] = by_id.get(int(row["product_id"]), [])
+    return _hydrate_stock_summary(rows)
 
 
 _FUZZY_POOL_QUERY = f"""SELECT p.product_id, p.display_name, p.manufacturer, p.specification, p.status_id, p.category_id,
@@ -463,6 +492,7 @@ def products(q: str = "", page: int = 1, page_size: int = 30, sort: str = "", or
     with connection() as conn:
         rows = fetch_all(conn, _products_query(where, order_by) + " LIMIT %s OFFSET %s", tuple(params + [page_size, (page - 1) * page_size]))
         total = fetch_one(conn, f"SELECT count(*) AS n FROM product p WHERE {where}", tuple(params))
+        rows = _attach_stock_summary(conn, rows)
     total_n = int(total["n"])
     if not rows and q.strip() and not f:
         fuzzy_query = normalize_search(q)
@@ -477,7 +507,6 @@ def products(q: str = "", page: int = 1, page_size: int = 30, sort: str = "", or
                 _hydrate_stock_summary(fuzzy_items)
                 return {"items": fuzzy_items, "page": 1, "page_size": len(fuzzy_items),
                         "total": len(fuzzy_items), "fuzzy": True}
-    _hydrate_stock_summary(rows)
     return {"items": rows, "page": page, "page_size": page_size, "total": total_n}
 
 
@@ -519,6 +548,7 @@ def products_export(q: str = "", sort: str = "", order: str = "asc", f: list[str
     where = where or "TRUE"
     with connection() as conn:
         rows = fetch_all(conn, _products_query(where, order_by) + " LIMIT %s", tuple(params + [MAX_EXPORT_ROWS + 1]))
+        rows = _attach_stock_summary(conn, rows)
     return export_response(rows, _PRODUCT_COLUMNS, "货品", fmt)
 
 
@@ -1045,7 +1075,11 @@ def stock_requests_export(ids: str = "", fmt: str = "xlsx", user: dict[str, Any]
 @app.get("/api/stock-requests/{request_id}")
 def stock_request_detail(request_id: int, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
     with connection() as conn:
-        row = fetch_one(conn, "SELECT * FROM stock_request WHERE stock_request_id=%s", (request_id,))
+        row = fetch_one(conn, """SELECT sr.*,sl.name AS source_location_name,dl.name AS destination_location_name
+                                   FROM stock_request sr
+                                   LEFT JOIN location sl ON sl.location_id=sr.source_location_id
+                                   LEFT JOIN location dl ON dl.location_id=sr.destination_location_id
+                                  WHERE sr.stock_request_id=%s""", (request_id,))
         if not row or (user["role"] not in {"WAREHOUSE", "ADMIN"} and row["requester_user_id"] != user["user_id"]):
             raise HTTPException(status_code=404, detail="申请单不存在")
         row["lines"] = fetch_all(conn, """SELECT l.*,p.display_name AS product_name,p.manufacturer,p.specification,
@@ -1475,16 +1509,34 @@ def resolve_conflict(case_id: int, payload: ConflictResolveIn, request: Request,
     return conflict_detail(case_id, user)
 
 
+_AUDIT_SQL = """SELECT e.audit_event_id,e.actor_user_id,e.actor_role,e.action,e.target_table,e.target_id,
+                       e.request_id,e.before_data,e.after_data,e.field_diff,e.created_at,
+                       COALESCE(NULLIF(u.display_name,''),u.username,e.actor_role,'系统') AS actor_name
+                  FROM audit_event e LEFT JOIN app_user u ON u.user_id=e.actor_user_id"""
+_AUDIT_FIELDS = {name: ("eq", "contains", "in") for name in ("actor_name", "actor_role", "action", "target_table", "request_id")}
+_AUDIT_FIELDS.update({"audit_event_id": ("eq", "in"), "actor_user_id": ("eq", "in"), "target_id": ("eq", "in"),
+                      "created_at": ("eq", "gte", "lte")})
+
+
+def _audit_read(**options):
+    return read_list(_AUDIT_SQL, [], fields=_AUDIT_FIELDS,
+                     search_fields=("actor_name", "actor_role", "action", "target_table", "request_id"),
+                     default_sort="created_at", key_fields=("audit_event_id",), columns=_AUDIT_COLUMNS,
+                     filename="审计日志", numeric_fields=("audit_event_id", "actor_user_id", "target_id"),
+                     date_fields=("created_at",), **options)
+
+
 @app.get("/api/audit")
-def audit_log(limit: int = 100, user: dict[str, Any] = Depends(require_roles("ADMIN", "FINANCE"))) -> list[dict[str, Any]]:
-    limit = min(500, max(1, limit))
-    with connection() as conn:
-        return fetch_all(conn, "SELECT audit_event_id,actor_user_id,actor_role,action,target_table,target_id,request_id,before_data,after_data,field_diff,created_at FROM audit_event ORDER BY created_at DESC LIMIT %s", (limit,))
+def audit_log(limit: int = 100, paginated: bool = False, page: int = 1, page_size: int = 30,
+              q: str = Query(default="", max_length=200), f: list[str] = Query(default=[]),
+              sort: str = "", order: str = "desc", user: dict[str, Any] = Depends(require_roles("ADMIN", "FINANCE"))) -> Any:
+    return _audit_read(legacy_limit=min(500, max(1, limit)), paginated=paginated, page=page, page_size=page_size,
+                       q=q, f=f, sort=sort, order=order)
 
 
 _AUDIT_COLUMNS = [
     ("审计ID", lambda r: r["audit_event_id"]),
-    ("操作者", lambda r: r["actor_user_id"] or r["actor_role"] or ""),
+    ("操作者", lambda r: r["actor_name"]),
     ("角色", lambda r: r["actor_role"] or ""),
     ("动作", lambda r: r["action"]),
     ("目标表", lambda r: r["target_table"] or ""),
@@ -1494,28 +1546,16 @@ _AUDIT_COLUMNS = [
 
 
 @app.get("/api/audit/export")
-def audit_export(ids: str = "", fmt: str = "xlsx", user: dict[str, Any] = Depends(require_roles("ADMIN", "FINANCE"))) -> Response:
-    if ids:
-        try:
-            id_list = parse_ids(ids)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from None
-        with connection() as conn:
-            rows = fetch_all(conn, """SELECT audit_event_id,actor_user_id,actor_role,action,target_table,target_id,request_id,before_data,after_data,field_diff,created_at
-                                         FROM audit_event
-                                        WHERE audit_event_id = ANY(%s)
-                                         ORDER BY array_position(%s::bigint[], audit_event_id)""", (id_list, id_list))
-    else:
-        with connection() as conn:
-            rows = fetch_all(conn, """SELECT audit_event_id,actor_user_id,actor_role,action,target_table,target_id,request_id,before_data,after_data,field_diff,created_at
-                                        FROM audit_event ORDER BY created_at DESC LIMIT %s""", (MAX_EXPORT_ROWS + 1,))
-    return export_response(rows, _AUDIT_COLUMNS, "审计日志", fmt)
+def audit_export(ids: str = "", fmt: str = "xlsx", q: str = Query(default="", max_length=200),
+                 f: list[str] = Query(default=[]), sort: str = "", order: str = "desc",
+                 user: dict[str, Any] = Depends(require_roles("ADMIN", "FINANCE"))) -> Response:
+    return _audit_read(ids=ids, fmt=fmt, q=q, f=f, sort=sort, order=order)
 
 
 @app.get("/api/audit/{audit_event_id}")
 def audit_detail(audit_event_id: int, user: dict[str, Any] = Depends(require_roles("ADMIN", "FINANCE"))) -> dict[str, Any]:
     with connection() as conn:
-        row = fetch_one(conn, "SELECT audit_event_id,actor_user_id,actor_role,action,target_table,target_id,request_id,ip_address,user_agent,before_data,after_data,field_diff,created_at FROM audit_event WHERE audit_event_id=%s", (audit_event_id,))
+        row = fetch_one(conn, _AUDIT_SQL.replace("e.request_id,", "e.request_id,e.ip_address,e.user_agent,") + " WHERE e.audit_event_id=%s", (audit_event_id,))
         if not row:
             raise HTTPException(status_code=404, detail="审计记录不存在")
         return row

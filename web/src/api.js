@@ -13,16 +13,54 @@ const invalidateInventory = () => { inventoryPromise = null; inventoryCachedAt =
 const cachedInventory = () => {
   if (!inventoryPromise || Date.now() - inventoryCachedAt > INVENTORY_CACHE_TTL_MS) {
     inventoryCachedAt = Date.now()
-    inventoryPromise = api.request('/inventory/balance').catch(err => { invalidateInventory(); throw err })
+    const pending = api.request('/inventory/balance')
+    inventoryPromise = pending
+    pending.catch(() => { if (inventoryPromise === pending) invalidateInventory() })
   }
   return inventoryPromise
+}
+
+// 工作台按登录身份缓存；成功写入通知已挂载的角标与工作台同步刷新。
+let workbenchPromise = null
+let workbenchCachedAt = 0
+let sessionIdentity = null
+let sessionGeneration = 0
+export function invalidateWorkbench() {
+  workbenchPromise = null
+  workbenchCachedAt = 0
+  window.dispatchEvent(new Event('erp:workbench-invalidated'))
+}
+export function setApiUser(user) {
+  const identity = user ? `${user.user_id}:${user.role}` : null
+  if (sessionIdentity !== identity) {
+    sessionIdentity = identity
+    sessionGeneration += 1
+    invalidateInventory()
+    invalidateWorkbench()
+  }
+}
+function cachedWorkbench() {
+  if (!workbenchPromise || Date.now() - workbenchCachedAt >= 60_000) {
+    workbenchCachedAt = Date.now()
+    const pending = api.request('/workbench/summary')
+    workbenchPromise = pending
+    pending.catch(() => { if (workbenchPromise === pending) { workbenchPromise = null; workbenchCachedAt = 0 } })
+  }
+  return workbenchPromise
+}
+function mutationSucceeded(path, method) {
+  if (method && !['GET', 'HEAD'].includes(method.toUpperCase()) && !path.startsWith('/auth/') && !path.startsWith('/ocr/') && !path.includes('/parse') && !path.includes('/import-file')) {
+    invalidateWorkbench()
+    window.dispatchEvent(new CustomEvent('erp:mutation', { detail: { path, method } }))
+  }
 }
 
 // 会话过期（401）全局处理：App 注册回调后统一回到登录页，避免每个页面各自报错。
 let unauthorizedHandler = null
 export function setUnauthorizedHandler(fn) { unauthorizedHandler = fn }
-function handleUnauthorized(path) {
-  if (unauthorizedHandler && !path.startsWith('/auth/')) unauthorizedHandler()
+function handleUnauthorized(path, requestGeneration) {
+  // 同一账号重新登录也属于新会话，旧请求的迟到 401 不能退出当前会话。
+  if (requestGeneration === sessionGeneration && !path.startsWith('/auth/')) { setApiUser(null); if (unauthorizedHandler) unauthorizedHandler() }
 }
 
 // pydantic 422 校验消息的中文化映射（常见类型错误兜底为中文提示）
@@ -55,6 +93,7 @@ export function buildListQuery(query = {}) {
 
 const api = {
   async request(path, options = {}) {
+    const requestGeneration = sessionGeneration
     const { timeoutMs = 15000, signal, ...rest } = options
     // FormData 由浏览器自动带 multipart boundary，不能再设 JSON Content-Type。
     const isFormData = typeof FormData !== 'undefined' && rest.body instanceof FormData
@@ -83,20 +122,22 @@ const api = {
       clearTimeout(timeoutId)
       if (signal) signal.removeEventListener('abort', onExternalAbort)
     }
-    if (response.status === 204) return null
+    if (response.status === 204) { mutationSucceeded(path, rest.method); return null }
     const body = await response.json().catch(() => ({}))
     if (!response.ok) {
-      if (response.status === 401) handleUnauthorized(path)
+      if (response.status === 401) handleUnauthorized(path, requestGeneration)
       const detail = Array.isArray(body.detail)
         ? localizeValidationDetail(body.detail.map(x => x.msg || x.message)).join('；')
         : (body.detail || body.message)
       throw new ApiError(detail || `请求失败 (${response.status})`, response.status, response.headers.get('Retry-After'))
     }
+    mutationSucceeded(path, rest.method)
     return body
   },
   // multipart 上传专用：fetch 没有上传进度，慢水管（2Mbps）下改用 XHR + onprogress。
   // 外部 signal abort 以 AbortError 拒绝，沿用调用方 err.name !== 'AbortError' 守卫。
   requestUpload(path, formData, { onProgress, timeoutMs = 120000, signal } = {}) {
+    const requestGeneration = sessionGeneration
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest()
       xhr.open('POST', withBasePath(`/api${path}`))
@@ -116,10 +157,10 @@ const api = {
       }
       xhr.onload = () => {
         cleanup()
-        if (xhr.status === 204) { resolve(null); return }
+        if (xhr.status === 204) { mutationSucceeded(path, 'POST'); resolve(null); return }
         const body = xhr.response || {}
-        if (xhr.status >= 200 && xhr.status < 300) { resolve(body); return }
-        if (xhr.status === 401) handleUnauthorized(path)
+        if (xhr.status >= 200 && xhr.status < 300) { mutationSucceeded(path, 'POST'); resolve(body); return }
+        if (xhr.status === 401) handleUnauthorized(path, requestGeneration)
         const detail = Array.isArray(body.detail)
           ? localizeValidationDetail(body.detail.map(x => x.msg || x.message)).join('；')
           : (body.detail || body.message)
@@ -141,16 +182,15 @@ const api = {
   me: () => api.request('/auth/me'),
   changePassword: (payload) => api.request('/auth/change-password', { method: 'POST', body: JSON.stringify(payload) }),
   inventory: cachedInventory,
+  workbench: cachedWorkbench,
+  search: (params = {}) => { const { signal, ...query } = params; return api.request(`/search?${buildListQuery(query)}`, { signal }) },
+  documentHistory: (id) => api.request(`/documents/${id}/history`),
   inventoryByProduct: (productId) => api.request(`/inventory/balance?product_id=${encodeURIComponent(productId)}`),
   inventoryDetail: (x) => api.request(`/inventory/balance/${x.product_id}/${x.location_id}/${x.condition_id}/${x.uom_id}`),
   adjustInventory: async (payload) => { const r = await api.request('/inventory/adjust', { method: 'POST', body: JSON.stringify(payload) }); invalidateInventory(); return r },
-  products: (q = '', page = 1, pageSize = 30, options = {}) => {
-    // 兼容旧调用 products(q)/products(q,page,size)；传对象时按 DataTable 参数构造。
-    if (typeof q === 'object' && q !== null) {
-      const { signal, ...query } = q
-      return api.request(`/products?${buildListQuery(query)}`, { signal })
-    }
-    return api.request(`/products?q=${encodeURIComponent(q)}&page=${page}&page_size=${pageSize}`, options)
+  products: (params = {}) => {
+    const { signal, timeoutMs, ...query } = params
+    return api.request(`/products?${buildListQuery(query)}`, { signal, timeoutMs })
   },
   productStocks: (ids) => api.request(`/products/stock?ids=${encodeURIComponent(ids)}`),
   product: (id) => api.request(`/products/${id}`),
@@ -222,15 +262,15 @@ const api = {
   deletePriceTier: (productId, tierId) => api.request(`/products/${productId}/price-tiers/${tierId}`, { method: 'DELETE' }),
   departments: () => api.request('/departments'),
   createDepartment: (payload) => api.request('/departments', { method: 'POST', body: JSON.stringify(payload) }),
-  // 报表
+  // 报表与审计统一接受列表参数，保留取消请求的能力。
   reports: {
-    purchase: (params = {}) => api.request(`/reports/purchase-reconciliation?${new URLSearchParams(Object.entries(params).filter(([, v]) => v !== '' && v != null)).toString()}`),
-    arAp: () => api.request('/reports/ar-ap-summary'),
-    receivables: (partyId) => api.request(`/reports/receivables?${partyId ? `party_id=${partyId}` : ''}`),
-    payables: (partyId) => api.request(`/reports/payables?${partyId ? `party_id=${partyId}` : ''}`),
-    inventoryCost: () => api.request('/reports/inventory-cost'),
+    purchase: (params = {}) => listRequest('/reports/purchase-reconciliation', params),
+    arAp: (params = {}) => listRequest('/reports/ar-ap-summary', params),
+    receivables: (params = {}) => listRequest('/reports/receivables', params),
+    payables: (params = {}) => listRequest('/reports/payables', params),
+    inventoryCost: (params = {}) => listRequest('/reports/inventory-cost', params),
   },
-  audit: () => api.request('/audit?limit=100'),
+  audit: (params = {}) => listRequest('/audit', params),
   auditEvent: (id) => api.request(`/audit/${id}`),
   ocrExtract: (payload, signal) => api.request('/ocr/extract', { method: 'POST', body: JSON.stringify(payload), signal, timeoutMs: 60000 }),
   // 序列台账（SN 追踪）
@@ -241,6 +281,11 @@ const api = {
   serialAsset: (id) => api.request(`/serial-ledger/${id}`),
   parseSerials: (payload) => api.request('/serial-ledger/parse', { method: 'POST', body: JSON.stringify(payload) }),
   importSerialsFile: (file, options = {}) => { const form = new FormData(); form.append('file', file); return api.requestUpload('/serial-ledger/import-file', form, options) },
+}
+
+function listRequest(path, params) {
+  const { signal, timeoutMs, ...query } = params
+  return api.request(`${path}?${buildListQuery(query)}`, { signal, timeoutMs })
 }
 
 export default api

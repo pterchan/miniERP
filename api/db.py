@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from datetime import date, datetime
 from decimal import Decimal
 from contextlib import contextmanager
@@ -57,13 +58,44 @@ def _get_pool() -> Any:
     return _pool
 
 
+def _checkout(pool: Any) -> Any:
+    """从池里取一条经过探活的连接。
+
+    池耗尽仍映射 PoolExhaustedError（→503）。连接中断有两类形态，都需重试
+    而不是让请求 500：池内闲置/使用中被静默断开（OperationalError:
+    server closed the connection unexpectedly）与池扩容建连瞬断
+    （getconn 内部 connect 被端口转发层丢弃，同样抛 OperationalError）。
+    """
+    last_error: Exception | None = None
+    for attempt in range(3):
+        if attempt:
+            time.sleep(0.05 * attempt)  # 建连瞬断的短退避，给转发层恢复窗口
+        try:
+            conn = pool.getconn()
+        except _pg_pool.PoolError as exc:
+            raise PoolExhaustedError("数据库连接池已耗尽，请稍后重试") from exc
+        except psycopg2.OperationalError as exc:
+            last_error = exc
+            continue
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            # 探活会开启一个空事务；回滚掉，让调用方拿到事务状态干净的连接
+            conn.rollback()
+            return conn
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+            last_error = exc
+            try:
+                pool.putconn(conn, close=True)
+            except psycopg2.Error:
+                pass
+    raise PoolExhaustedError("数据库连接不可用，请稍后重试") from last_error
+
+
 @contextmanager
 def connection() -> Iterator[Any]:
     pool = _get_pool()
-    try:
-        conn = pool.getconn()
-    except _pg_pool.PoolError as exc:
-        raise PoolExhaustedError("数据库连接池已耗尽，请稍后重试") from exc
+    conn = _checkout(pool)
     conn.autocommit = False
     try:
         yield conn
@@ -145,6 +177,10 @@ def ensure_bootstrap_users() -> None:
 
     with connection() as conn:
         with conn.cursor() as cur:
+            # 多 worker（uvicorn --workers 2）启动时各进程并发执行本函数，
+            # 用事务级咨询锁串行化「查空-建号」窗口；ON CONFLICT 兜底防唯一冲突
+            # 打穿 ERP_BOOTSTRAP_STRICT=1 的启动流程。
+            cur.execute("SELECT pg_advisory_xact_lock(872341)")
             cur.execute("SELECT count(*) FROM app_user")
             if cur.fetchone()[0]:
                 return
@@ -152,5 +188,6 @@ def ensure_bootstrap_users() -> None:
         colleague_name = os.environ.get("BOOTSTRAP_REQUESTER_USERNAME") or os.environ.get("ERP_REQUESTER_USERNAME", "colleague")
         audit(conn, None, "BOOTSTRAP_CREATE", "app_user", after={"usernames": [admin_name, colleague_name]})
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO app_user(username,display_name,role,password_hash) VALUES (%s,%s,'ADMIN',%s),(%s,%s,'COLLEAGUE',%s)",
+            cur.execute("INSERT INTO app_user(username,display_name,role,password_hash) VALUES (%s,%s,'ADMIN',%s),(%s,%s,'COLLEAGUE',%s)"
+                        " ON CONFLICT (username) DO NOTHING",
                         (admin_name, "系统管理员", hash_password(admin_password), colleague_name, "同事", hash_password(colleague_password)))

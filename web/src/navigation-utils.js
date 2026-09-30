@@ -26,8 +26,20 @@ export function isNavigationItemActive(currentPath, to) {
   const destination = normalizePath(to)
 
   if (destination === '/') {
-    return current === '/' || current === '/inventory' || current.startsWith('/inventory/')
+    return current === '/'
   }
 
   return current === destination || current.startsWith(`${destination}/`)
+}
+
+/** 旧路径保留，模块归属不依赖共同路径前缀。 */
+export function moduleForPath(path) {
+  const p = normalizePath(path)
+  if (p === '/') return 'home'
+  if (p.startsWith('/master/customers')) return 'sales'
+  if (p.startsWith('/master/suppliers')) return 'purchase'
+  if (p.startsWith('/admin/locations') || p.startsWith('/products') || p.startsWith('/master')) return 'master'
+  if (p.startsWith('/count') || p.startsWith('/serials') || p.startsWith('/inventory')) return 'inventory'
+  if (p.startsWith('/conflicts') || p.startsWith('/audit') || p.startsWith('/admin')) return 'admin'
+  return p.split('/')[1]
 }

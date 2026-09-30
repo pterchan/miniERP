@@ -119,7 +119,7 @@ def customer_detail(customer_id: int, user: dict[str, Any] = Depends(require_rol
         if not row:
             raise HTTPException(status_code=404, detail="客户不存在")
         row["history"] = fetch_all(conn, """SELECT e.ar_ap_entry_id,e.entry_type,e.direction,e.amount,e.created_at,
-                                                   d.doc_no,d.doc_type,d.doc_date
+                                                   d.document_id,d.doc_no,d.doc_type,d.doc_date
                                               FROM ar_ap_entry e JOIN business_document d ON d.document_id=e.document_id
                                              WHERE e.party_type='CUSTOMER' AND e.party_id=%s
                                              ORDER BY e.created_at DESC LIMIT 50""", (customer_id,))
@@ -202,7 +202,7 @@ def supplier_detail(supplier_id: int, user: dict[str, Any] = Depends(require_rol
         if not row:
             raise HTTPException(status_code=404, detail="供应商不存在")
         row["history"] = fetch_all(conn, """SELECT e.ar_ap_entry_id,e.entry_type,e.direction,e.amount,e.created_at,
-                                                   d.doc_no,d.doc_type,d.doc_date
+                                                   d.document_id,d.doc_no,d.doc_type,d.doc_date
                                               FROM ar_ap_entry e JOIN business_document d ON d.document_id=e.document_id
                                              WHERE e.party_type='SUPPLIER' AND e.party_id=%s
                                              ORDER BY e.created_at DESC LIMIT 50""", (supplier_id,))

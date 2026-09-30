@@ -1,57 +1,99 @@
-import React, { useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import api from './api'
+import DataTable from './data-table'
+import { DOC_TYPE_CONFIG } from './documents'
 import { formatMoney, formatQuantity } from './list-utils'
 import { canView } from './roles'
-import { Back, Empty, ErrorBox, Field, Forbidden, Loading, PageHeading } from './ui'
+import { Back, ErrorBox, Field, Forbidden, Link, PageHeading, Tabs, useRouter } from './ui'
 
-function PurchaseReconciliation() {
-  const [rows, setRows] = useState([])
+const DATE_QUERY = ['start_date', 'end_date']
+const PURCHASE_QUERY = ['supplier_id', ...DATE_QUERY]
+const LEDGER_QUERY = ['party_id', ...DATE_QUERY]
+const moneyColumn = (key, label) => ({ key, label, align: 'end', render: row => `¥ ${formatMoney(row[key])}` })
+
+// 财务可以读取台账，但来源单据的下钻仍遵守对应业务模块权限。
+function documentHref(row, user) {
+  const cfg = DOC_TYPE_CONFIG[row.doc_type]
+  const permission = cfg?.group === 'inventory' ? 'inventoryDocs' : cfg?.group
+  return row.document_id && cfg && canView(user, permission) ? `/${cfg.group}/${row.doc_type.toLowerCase()}/${row.document_id}` : undefined
+}
+
+function DateFilters({ query, setQuery }) {
+  return <><Field label="开始日期"><input type="date" value={query.start_date || ''} onChange={event => setQuery('start_date', event.target.value)} /></Field><Field label="结束日期"><input type="date" value={query.end_date || ''} onChange={event => setQuery('end_date', event.target.value)} /></Field></>
+}
+function Summary({ data, fields }) {
+  if (!data?.summary) return null
+  return <div className="actions"><span className="muted">当前筛选全部合计</span>{fields.map(([key, label]) => <strong className="num" key={key}>{label}：¥ {formatMoney(data.summary[key])}</strong>)}</div>
+}
+
+function PurchaseReconciliation({ user }) {
   const [suppliers, setSuppliers] = useState([])
-  const [supplierId, setSupplierId] = useState('')
-  const [startDate, setStartDate] = useState('')
-  const [endDate, setEndDate] = useState('')
   const [error, setError] = useState(null)
-  const load = () => api.reports.purchase({ supplier_id: supplierId, start_date: startDate, end_date: endDate }).then(r => setRows(r.rows || [])).catch(setError)
-  useEffect(() => { api.suppliers().then(setSuppliers).catch(() => {}); load() }, [])
-  const total = rows.reduce((sum, r) => sum + Number(r.total_amount || 0), 0)
-  return <section><PageHeading eyebrow="财务" title="采购对账" description="按供应商汇总本期已过账采购入库金额。" /><div className="panel"><div className="actions"><Field label="供应商"><select value={supplierId} onChange={e => setSupplierId(e.target.value)}><option value="">全部</option>{suppliers.map(s => <option key={s.supplier_id} value={s.supplier_id}>{s.name}</option>)}</select></Field><Field label="开始日期"><input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} /></Field><Field label="结束日期"><input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} /></Field><button className="primary" onClick={load}>查询</button></div><ErrorBox error={error} />{rows.length ? <div className="record-list">{rows.map(r => <div className="record-card" key={`${r.doc_no}-${r.document_id || r.doc_date}`}><div><strong>{r.supplier_name}</strong><span>{r.doc_no} · {r.doc_date} · 过账 {r.posted_by || '—'}</span></div><div className="record-value"><b>¥ {formatMoney(r.total_amount)}</b></div></div>)}</div> : <Empty>暂无数据</Empty>}<div className="actions" style={{ marginTop: 8 }}><strong>合计：¥ {formatMoney(total)}</strong></div></div></section>
+  useEffect(() => { let active = true; api.suppliers().then(data => { if (active) setSuppliers(data) }).catch(err => { if (active) setError(err) }); return () => { active = false } }, [])
+  const fetchData = useCallback((params, signal) => api.reports.purchase({ ...params, paginated: true, signal }), [])
+  const columns = useMemo(() => [
+    { key: 'supplier_name', label: '供应商', filterType: 'search', searchKeys: ['supplier_name', 'doc_no'] },
+    { key: 'doc_no', label: '单号', filterType: 'text' },
+    { key: 'doc_date', label: '单据日期', className: 'nowrap' }, moneyColumn('total_amount', '金额'),
+    { key: 'posted_by', label: '过账人', filterType: 'text' },
+  ], [])
+  return <section><PageHeading eyebrow="财务" title="采购对账" description="按供应商查询已过账采购入库，合计覆盖当前筛选的全部记录。" /><div className="panel"><ErrorBox error={error} /><DataTable tableId="reports.purchase" mode="server" columns={columns} fetchData={fetchData} rowKey={row => String(row.document_id)} rowHref={row => documentHref(row, user)} queryKeys={PURCHASE_QUERY}
+    toolbar={({ query, setQuery }) => <div className="actions"><Field label="供应商"><select value={query.supplier_id || ''} onChange={event => setQuery('supplier_id', event.target.value)}><option value="">全部</option>{suppliers.map(supplier => <option key={supplier.supplier_id} value={supplier.supplier_id}>{supplier.name}</option>)}</select></Field><DateFilters query={query} setQuery={setQuery} /></div>}
+    exportConfig={{ endpoint: '/api/reports/purchase-reconciliation', allScope: 'server' }} footer={data => <Summary data={data} fields={[[ 'total_amount', '采购金额' ]]} />} /></div></section>
 }
 
 function ArApSummary() {
-  const [data, setData] = useState(null)
-  const [error, setError] = useState(null)
-  useEffect(() => { api.reports.arAp().then(setData).catch(setError) }, [])
-  if (!data) return error ? <ErrorBox error={error} /> : <Loading />
-  return <section><PageHeading eyebrow="财务" title="应收应付汇总" description="各客户应收余额、各供应商应付余额。" /><div className="detail-grid"><div className="panel"><h2>应收（客户）</h2>{data.customers?.length ? <div className="record-list">{data.customers.map(c => <div className="record-card" key={c.customer_id}><div><strong>{c.name}</strong></div><div className="record-value"><b>¥ {formatMoney(c.receivable_balance)}</b></div></div>)}</div> : <Empty>暂无客户</Empty>}</div><div className="panel"><h2>应付（供应商）</h2>{data.suppliers?.length ? <div className="record-list">{data.suppliers.map(s => <div className="record-card" key={s.supplier_id}><div><strong>{s.name}</strong></div><div className="record-value"><b>¥ {formatMoney(s.payable_balance)}</b></div></div>)}</div> : <Empty>暂无供应商</Empty>}</div></div></section>
+  const { location, currentPath = '' } = useRouter()
+  const params = new URLSearchParams(location?.search ?? currentPath.split('?')[1] ?? '')
+  const partyType = params.get('party_type') === 'supplier' ? 'supplier' : 'customer'
+  const customer = partyType === 'customer'
+  const partyKey = customer ? 'customer_id' : 'supplier_id'
+  const balanceKey = customer ? 'receivable_balance' : 'payable_balance'
+  const balanceLabel = customer ? '应收余额' : '应付余额'
+  const fetchData = useCallback((query, signal) => api.reports.arAp({ ...query, party_type: partyType, paginated: true, signal }), [partyType])
+  const columns = useMemo(() => [{ key: 'name', label: customer ? '客户' : '供应商', filterType: 'search' }, moneyColumn(balanceKey, balanceLabel)], [customer, balanceKey, balanceLabel])
+  return <section><PageHeading eyebrow="财务" title="应收应付汇总" description="按往来方查看余额，点击记录查看档案与最近交易。"><Link className="button-link secondary" to={`/reports/${customer ? 'receivables' : 'payables'}`}>查看{customer ? '应收' : '应付'}明细</Link></PageHeading><Tabs label="应收应付分类" value={partyType} items={[{ id: 'customer', label: '应收（客户）', to: '/reports/arap?party_type=customer' }, { id: 'supplier', label: '应付（供应商）', to: '/reports/arap?party_type=supplier' }]} /><div className="panel"><DataTable key={partyType} tableId={`reports.arap.${partyType}`} mode="server" columns={columns} fetchData={fetchData} rowKey={row => String(row[partyKey])} rowHref={row => `/master/${customer ? 'customers' : 'suppliers'}/${row[partyKey]}`}
+    exportConfig={{ endpoint: '/api/reports/ar-ap-summary', allScope: 'server', buildParams: ({ q, sortKey, sortDir }) => ({ q, sort: sortKey, order: sortDir, party_type: partyType }) }} footer={data => <Summary data={data} fields={[[balanceKey, balanceLabel]]} />} /></div></section>
 }
 
-function LedgerDetail({ kind }) {
-  const [rows, setRows] = useState([])
+function LedgerDetail({ kind, user }) {
+  const customer = kind === 'receivables'
+  const title = customer ? '应收明细' : '应付明细'
+  const partyKey = customer ? 'customer_id' : 'supplier_id'
   const [parties, setParties] = useState([])
-  const [partyId, setPartyId] = useState('')
   const [error, setError] = useState(null)
-  const load = () => (kind === 'receivables' ? api.reports.receivables(partyId || undefined) : api.reports.payables(partyId || undefined)).then(setRows).catch(setError)
-  useEffect(() => { (kind === 'receivables' ? api.customers() : api.suppliers()).then(setParties).catch(() => {}); load() }, [kind])
-  const title = kind === 'receivables' ? '应收明细' : '应付明细'
-  const partyKey = kind === 'receivables' ? 'customer_id' : 'supplier_id'
-  return <section><Back to="/reports/arap" /><PageHeading eyebrow="财务" title={title} description="应收/应付台账明细（含定金）。" /><div className="panel"><div className="actions"><Field label={kind === 'receivables' ? '客户' : '供应商'}><select value={partyId} onChange={e => setPartyId(e.target.value)}><option value="">全部</option>{parties.map(p => <option key={p[partyKey]} value={p[partyKey]}>{p.name}</option>)}</select></Field><button className="primary" onClick={load}>查询</button></div><ErrorBox error={error} />{rows.length ? <div className="record-list">{rows.map(r => <div className="record-card" key={r.ar_ap_entry_id}><div><strong>{r.party_name || '—'}</strong><span>{r.doc_no} · {r.doc_date || '—'} · {r.entry_type === 'DEPOSIT' ? '定金' : '账期'} · {new Date(r.created_at).toLocaleString()}</span></div><div className="record-value"><b>{r.direction === 'UP' ? '+' : '-'} ¥ {formatMoney(r.amount)}</b></div></div>)}</div> : <Empty>暂无明细</Empty>}</div></section>
+  useEffect(() => { let active = true; setParties([]); setError(null); (customer ? api.customers() : api.suppliers()).then(data => { if (active) setParties(data) }).catch(err => { if (active) setError(err) }); return () => { active = false } }, [customer])
+  const fetchData = useCallback((params, signal) => api.reports[kind]({ ...params, paginated: true, signal }), [kind])
+  const columns = useMemo(() => [
+    { key: 'party_name', label: customer ? '客户' : '供应商', filterType: 'search', searchKeys: ['party_name', 'doc_no'] },
+    { key: 'doc_no', label: '来源单号', filterType: 'text' },
+    { key: 'doc_date', label: '单据日期', className: 'nowrap' },
+    { key: 'entry_type', label: '款项', filterType: 'select', filterOptions: [{ value: 'DEPOSIT', label: '定金' }, { value: 'INVOICE', label: '账期' }], render: row => row.entry_type === 'DEPOSIT' ? '定金' : '账期' },
+    { key: 'direction', label: '方向', filterType: 'select', filterOptions: [{ value: 'UP', label: '增加' }, { value: 'DOWN', label: '减少' }], render: row => row.direction === 'UP' ? '增加' : '减少' },
+    moneyColumn('amount', '金额'), { key: 'created_at', label: '发生日期', render: row => <time dateTime={row.created_at} title={new Date(row.created_at).toLocaleString()}>{String(row.created_at || '').slice(0, 10) || '—'}</time> },
+  ], [customer])
+  return <section><Back to={`/reports/arap?party_type=${customer ? 'customer' : 'supplier'}`} /><PageHeading eyebrow="财务" title={title} description="应收应付台账包含定金；净发生额为当前筛选内的增加金额减去减少金额。" /><div className="panel"><ErrorBox error={error} /><DataTable key={kind} tableId={`reports.${kind}`} mode="server" columns={columns} fetchData={fetchData} rowKey={row => String(row.ar_ap_entry_id)} rowHref={row => documentHref(row, user)} queryKeys={LEDGER_QUERY}
+    toolbar={({ query, setQuery }) => <div className="actions"><Field label={customer ? '客户' : '供应商'}><select value={query.party_id || ''} onChange={event => setQuery('party_id', event.target.value)}><option value="">全部</option>{parties.map(party => <option key={party[partyKey]} value={party[partyKey]}>{party.name}</option>)}</select></Field><DateFilters query={query} setQuery={setQuery} /></div>}
+    exportConfig={{ endpoint: `/api/reports/${kind}`, allScope: 'server' }} footer={data => <Summary data={data} fields={[[ 'amount_up', '增加金额' ], [ 'amount_down', '减少金额' ], [ 'balance', '净发生额' ]]} />} /></div></section>
 }
 
 function InventoryCost() {
-  const [rows, setRows] = useState([])
-  const [error, setError] = useState(null)
-  useEffect(() => { api.reports.inventoryCost().then(setRows).catch(setError) }, [])
-  const total = rows.reduce((sum, r) => sum + Number(r.cost_value || 0), 0)
-  return <section><PageHeading eyebrow="财务" title="库存成本汇总" description="按货品×单位：现库存 × 采购成本价 = 库存成本。" /><div className="panel"><ErrorBox error={error} />{rows.length ? <div className="record-list">{rows.map(r => <div className="record-card" key={`${r.product_id}-${r.uom_id}`}><div><strong>{r.product_name}</strong><span>{r.uom_code} · 现库存 {formatQuantity(r.on_hand_quantity)}</span></div><div className="record-value"><b>¥ {formatMoney(r.cost_value)}</b><small>单价 ¥ {formatMoney(r.cost_price)}</small></div></div>)}</div> : <Empty>暂无库存</Empty>}<div className="actions" style={{ marginTop: 8 }}><strong>合计：¥ {formatMoney(total)}</strong></div></div></section>
+  const fetchData = useCallback((params, signal) => api.reports.inventoryCost({ ...params, paginated: true, signal }), [])
+  const columns = useMemo(() => [
+    { key: 'product_name', label: '货品', filterType: 'search' }, { key: 'uom_code', label: '单位', filterType: 'text' },
+    { key: 'on_hand_quantity', label: '现库存', align: 'end', render: row => formatQuantity(row.on_hand_quantity) },
+    moneyColumn('cost_price', '成本单价'), moneyColumn('cost_value', '库存成本'),
+  ], [])
+  return <section><PageHeading eyebrow="财务" title="库存成本汇总" description="按货品和单位分别计算现库存与采购成本，金额合计覆盖当前筛选全部记录。" /><div className="panel"><DataTable tableId="reports.inventory-cost" mode="server" columns={columns} fetchData={fetchData} rowKey={row => `${row.product_id}:${row.uom_id}`} rowHref={row => `/products/${row.product_id}`} exportConfig={{ endpoint: '/api/reports/inventory-cost', allScope: 'server' }} footer={data => <Summary data={data} fields={[[ 'cost_value', '库存成本' ]]} />} /></div></section>
 }
 
 export function reportRoute(first, parts, query, user) {
   if (!canView(user, 'reports')) return <Forbidden />
   const page = parts[1]
-  if (page === 'purchase') return <PurchaseReconciliation />
+  if (page === 'purchase') return <PurchaseReconciliation user={user} />
   if (page === 'arap') return <ArApSummary />
-  if (page === 'receivables') return <LedgerDetail kind="receivables" />
-  if (page === 'payables') return <LedgerDetail kind="payables" />
+  if (page === 'receivables') return <LedgerDetail kind="receivables" user={user} />
+  if (page === 'payables') return <LedgerDetail kind="payables" user={user} />
   if (page === 'inventory-cost') return <InventoryCost />
   return <Forbidden />
 }

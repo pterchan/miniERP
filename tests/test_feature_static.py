@@ -84,7 +84,7 @@ class FeatureContractTests(unittest.TestCase):
         self.assertIn("serial_numbers", SCHEMAS)
         self.assertIn("serial_tracking.router", API)
         self.assertIn("first === 'serials'", FRONTEND)
-        self.assertIn("序列台账", FRONTEND)
+        self.assertIn("序列台账", (ROOT / "web/src/workspace.jsx").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

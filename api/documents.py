@@ -18,7 +18,7 @@ from psycopg2 import Binary
 from .db import audit, connection, fetch_all, fetch_one
 from .export import MAX_EXPORT_ROWS, attachment_disposition, export_response
 from .image_utils import ImageTooLargeError, _reencode_to_cap, _sniff_image_type
-from .list_params import clamp_page, clamp_page_size, parse_filters, parse_ids, parse_sort
+from .list_params import clamp_page, clamp_page_size, like_escape, parse_filters, parse_ids, parse_sort
 from .helpers import _condition_id, _line_uom_id, _movement_id, _request_meta, _status_id, lock_products
 from .permissions import DOC_TYPE_META, GROUP_META, _can_post, _csrf, require_user
 from .schemas import DocCreateIn, DocSubmitIn, DocUpdateIn
@@ -381,6 +381,7 @@ _DOC_SORT = {
     "total_amount": "d.total_amount",
     "status": "d.status",
     "doc_type": "d.doc_type",
+    "party_name": "coalesce(c.name,s.name,'')",
 }
 
 _DOC_FILTERS = {
@@ -438,9 +439,12 @@ def _resolve_doc_types(doc_type: str, group: str, user: dict[str, Any]) -> list[
     return [t for t, m in DOC_TYPE_META.items() if user["role"] in m["view_roles"]]
 
 
-def _doc_where(allowed: list[str], filters: list[str]) -> tuple[str, list]:
+def _doc_where(allowed: list[str], filters: list[str], q: str = "") -> tuple[str, list]:
     clauses = ["d.doc_type = ANY(%s)"]
     params: list = [list(allowed)]
+    if q.strip():
+        clauses.append("(d.doc_no ILIKE %s OR coalesce(c.name,s.name,'') ILIKE %s)")
+        params.extend(["%" + like_escape(q.strip()) + "%"] * 2)
     try:
         filter_parts, filter_params = parse_filters(filters, _DOC_FILTERS)
     except ValueError as exc:
@@ -452,14 +456,17 @@ def _doc_where(allowed: list[str], filters: list[str]) -> tuple[str, list]:
 
 @router.get("")
 def documents(doc_type: str = "", group: str = "", page: int = 1, page_size: int = 30,
-              sort: str = "", order: str = "asc", f: list[str] = Query(default=[]),
+              sort: str = "", order: str = "asc", f: list[str] = Query(default=[]), mine: bool = False, q: str = Query(default="", max_length=200),
               user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
     page = clamp_page(page)
     page_size = clamp_page_size(page_size, cap=500)
     allowed = _resolve_doc_types(doc_type, group, user)
     if not allowed:
         return {"items": [], "page": page, "page_size": page_size, "total": 0}
-    where, params = _doc_where(allowed, f)
+    where, params = _doc_where(allowed, f, q)
+    if mine:
+        where += " AND d.created_by=%s"
+        params.append(user["user_id"])
     order_by = parse_sort(sort, order, _DOC_SORT, "created_at")
     with connection() as conn:
         rows = fetch_all(conn, _DOC_QUERY.format(where=where, order_by=order_by) + " LIMIT %s OFFSET %s", tuple(params + [page_size, (page - 1) * page_size]))
@@ -471,12 +478,15 @@ def documents(doc_type: str = "", group: str = "", page: int = 1, page_size: int
 
 @router.get("/export")
 def documents_export(doc_type: str = "", group: str = "", sort: str = "", order: str = "asc",
-                     f: list[str] = Query(default=[]), ids: str = "", fmt: str = "xlsx",
+                     f: list[str] = Query(default=[]), ids: str = "", fmt: str = "xlsx", mine: bool = False, q: str = Query(default="", max_length=200),
                      user: dict[str, Any] = Depends(require_user)) -> Response:
     allowed = _resolve_doc_types(doc_type, group, user)
     if not allowed:
         return export_response([], _DOC_COLUMNS, "单据", fmt)
-    where, params = _doc_where(allowed, f)
+    where, params = _doc_where(allowed, f, q)
+    if mine:
+        where += " AND d.created_by=%s"
+        params.append(user["user_id"])
     if ids:
         try:
             id_list = parse_ids(ids)
@@ -497,6 +507,34 @@ def documents_export(doc_type: str = "", group: str = "", sort: str = "", order:
 def get_document(document_id: int, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
     with connection() as conn:
         return _doc_detail(conn, document_id, user)
+
+
+_HISTORY_LABELS = {"CREATE": "创建", "EDIT": "编辑", "SUBMIT": "提交", "POST": "过账",
+                   "REVERSE": "红冲", "REJECT": "驳回", "WITHDRAW": "撤回", "ATTACH": "上传附件", "UPLOAD": "上传附件"}
+
+
+@router.get("/{document_id}/history")
+def document_history(document_id: int, user: dict[str, Any] = Depends(require_user)) -> list[dict[str, Any]]:
+    with connection() as conn:
+        doc = _require_doc_view(conn, document_id, user)
+        rows = fetch_all(conn, """SELECT e.audit_event_id,e.action,e.created_at,e.field_diff,e.before_data,e.after_data,
+                                        COALESCE(NULLIF(u.display_name,''),u.username,'系统') AS actor_name
+                                   FROM audit_event e LEFT JOIN app_user u ON u.user_id=e.actor_user_id
+                                  WHERE (e.target_table='business_document' AND
+                                         (e.target_id=%s OR (e.action='CREATE' AND e.target_id IS NULL AND e.after_data->>'doc_no'=%s)))
+                                     OR (e.target_table='document_attachment' AND
+                                         (e.after_data->>'document_id'=%s OR EXISTS
+                                          (SELECT 1 FROM document_attachment a WHERE a.attachment_id=e.target_id AND a.document_id=%s)))
+                                  ORDER BY e.created_at,e.audit_event_id""", (document_id, doc["doc_no"], str(document_id), document_id))
+    for row in rows:
+        # 旧编辑审计只保存版本号；仅还原确实存在的业务字段变化。
+        before, after = row.pop("before_data") or {}, row.pop("after_data") or {}
+        diff = row.get("field_diff") or {}
+        if not diff:
+            diff = {key: [before[key], after[key]] for key in before.keys() & after.keys() if before[key] != after[key]}
+        row["field_diff"] = {key: value for key, value in diff.items() if key not in {"version", "updated_at"}}
+        row["label"] = _HISTORY_LABELS.get(row["action"], "操作")
+    return rows
 
 
 @router.post("")

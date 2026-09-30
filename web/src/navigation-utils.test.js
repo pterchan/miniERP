@@ -33,10 +33,10 @@ describe('isInventoryDocumentPath', () => {
 })
 
 describe('isNavigationItemActive', () => {
-  it('activates the home item only for home and inventory routes', () => {
+  it('activates the workbench only for home', () => {
     expect(isNavigationItemActive('/', '/')).toBe(true)
-    expect(isNavigationItemActive('/inventory', '/')).toBe(true)
-    expect(isNavigationItemActive('/inventory/stock-42', '/')).toBe(true)
+    expect(isNavigationItemActive('/inventory', '/')).toBe(false)
+    expect(isNavigationItemActive('/inventory/stock-42', '/')).toBe(false)
     expect(isNavigationItemActive('/products', '/')).toBe(false)
   })
 
@@ -59,7 +59,7 @@ describe('isNavigationItemActive', () => {
   it('ignores query strings, hashes, and trailing slashes', () => {
     expect(isNavigationItemActive('/products/?page=2#results', '/products/')).toBe(true)
     expect(isNavigationItemActive('/requests/8/?view=compact', '/requests?scope=all')).toBe(true)
-    expect(isNavigationItemActive('/inventory/42/#history', '/?from=nav')).toBe(true)
+    expect(isNavigationItemActive('/inventory/42/#history', '/?from=nav')).toBe(false)
   })
 })
 
